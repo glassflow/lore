@@ -164,6 +164,7 @@ async fn serve(config: Config) -> Result<()> {
         llm,
         models,
         source_locks: Default::default(),
+        pushes: Default::default(),
         deep_guard: Default::default(),
     };
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);

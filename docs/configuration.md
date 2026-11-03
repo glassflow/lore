@@ -7,7 +7,7 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_DATABASE_URL` | `postgres://lore:lore@localhost:5434/lore` | Postgres connection string |
 | `LORE_LISTEN_ADDR` | `0.0.0.0:8080` | Address the HTTP server binds |
 | `LORE_DATA_DIR` | `./data` | Directory for repos and downloaded models |
-| `LORE_ADMIN_TOKEN` | unset | Admin bearer token. On the server, an empty value counts as unset and the admin API answers 403. The CLI reads it as the default of `--admin-token` |
+| `LORE_ADMIN_TOKEN` | unset | Admin bearer token, for the admin API and the [admin page](usage.md#admin-page) at `/admin`. On the server, an empty value counts as unset and the admin API answers 403. The CLI reads it as the default of `--admin-token` |
 | `LORE_LOG` | `info` | Log filter, in `tracing` `EnvFilter` syntax |
 | `LORE_LOG_FORMAT` | `text` | `text` or `json`. Anything else is a startup error |
 | `LORE_EMBEDDER` | `fastembed` | `fastembed` (bge-small-en-v1.5 on CPU) or `hash` (deterministic, for tests and `make run`). Anything else is a startup error. The first start with `fastembed` downloads about 130 MB into `$LORE_DATA_DIR/models` before the server listens |

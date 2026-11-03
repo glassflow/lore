@@ -1,6 +1,6 @@
 # Using lore
 
-Tenants and keys, indexing, search, traces, documents, answers, the web page and MCP. Every endpoint is also reachable from the `lore` CLI.
+Tenants and keys, indexing, search, traces, documents, answers, the web pages and MCP. Most endpoints are also reachable from the `lore` CLI.
 
 ## Tenants and keys
 
@@ -184,6 +184,32 @@ curl localhost:8080/v1/info    # {"version":"0.1.0","llm":"fake","embedder":"has
 The key stays in the browser's local storage (under `lore.key`) and is sent only to this server, as `Authorization: Bearer <key>`. If the browser blocks local storage, the page still works and you paste the key again on each visit. The answer shows with numbered citations that link to the sources; a source is a link only when its URL starts with `http://` or `https://`. The `deep` option is enabled only when `GET /v1/info` lists `deep` in `modes`.
 
 The page logic is checked by `tests/web.rs`, which also runs `tests/web_pure.js` under node when node is installed.
+
+## Admin page
+
+`GET /admin` serves a page for operators: what the server runs, what it holds, and how far a push has got. Like the ask page it is one self-contained HTML file embedded in the binary and makes no request to any other host. Open `LORE_URL/admin` (`http://localhost:8080/admin` with `make run`) and paste the admin token (`dev-admin` with `make run`). The token is kept in the tab's session storage (under `lore.admin`), so it is gone when the tab closes, and is sent only to this server. A wrong token closes the view and forgets it; **Forget** does the same on purpose.
+
+The page shows:
+
+- **Server**: version, embedder, model provider, the fast and deep models with their effort, the process's memory now and at its peak (Linux only), and the number of tenants, sources, documents and chunks.
+- **Pushes**: the repo pushes that are running, and the last 20 that ended, with their state (`waiting` for another push to the same source, `fetching` the bundle, `indexing`, `done` or `failed`), files done out of the total, chunks written, how many of those were embedded and how many kept their stored vector, the time spent embedding, and why a failed push failed. While a push runs the list refreshes every 3 seconds, otherwise every 30. When a push ends, the counts are read again.
+- **Tenants**: for each tenant its sources (name, kind, indexed commit, documents, chunks, size on disk for repos, and when it was last indexed) and its keys (prefix, scopes, created, revoked). **Create key** makes a key with the ticked scopes and shows it once, with a copy button. **Revoke** asks for a confirmation first.
+- **Storage**: the database size, the repo mirrors and checkouts on disk, each table's data and index bytes, and each index with its kind (the vector index is `hnsw`, the full-text index `gin`).
+
+Push progress is kept in memory, so a restart forgets it, and only repo pushes are tracked. The CLI stops waiting for a push after 15 minutes, but the server finishes it; the page shows when it does.
+
+The page uses these endpoints, which need the admin token like the rest of the admin API:
+
+```bash
+curl -H "Authorization: Bearer $LORE_ADMIN_TOKEN" localhost:8080/v1/admin/overview   # server, storage, tenants
+curl -H "Authorization: Bearer $LORE_ADMIN_TOKEN" localhost:8080/v1/admin/pushes     # running and recent pushes
+```
+
+`GET /v1/admin/overview` answers `{"now", "server", "storage", "tenants"}`. `server` has `version`, `llm`, `embedder`, `modes`, `models` (`fast` and `deep`, each with `model` and `effort`), `memory` (`rss_bytes` and `peak_rss_bytes`, null outside Linux), and the totals `tenants`, `sources`, `documents` and `chunks`. `storage` has `database_bytes`, `repos_bytes`, `tables` (`name`, `rows_estimate`, `data_bytes`, `index_bytes`, `total_bytes`, largest first) and `indexes` (`name`, `table`, `method`, `bytes`). Each tenant has `id`, `name`, `created_at`, `sources` (`id`, `name`, `kind`, `indexed_commit`, `documents`, `chunks`, `last_indexed_at`, `disk_bytes`) and `keys` (`id`, `prefix`, `scopes`, `created_at`, `revoked_at`). `last_indexed_at` is the later of a repo's last push and the source's newest document write, and null until something is indexed; `disk_bytes` is null for sources that are not repos. The database reads share one snapshot, so the totals add up; the repo directories are walked on each call, which takes longer the more files the checkouts hold.
+
+`GET /v1/admin/pushes` answers `{"now", "since", "running", "recent"}`, newest first. `since` is when the server started. A push has `id`, `tenant` (null when the tenant is gone), `tenant_id`, `source`, `source_id`, `commit`, `full`, `state`, `started_at`, `finished_at`, `files_total` (null until the bundle is fetched), `files_done`, `chunks`, `chunks_embedded`, `embed_ms` and `error`. `embed_ms` is wall-clock time in the embedder, including waits while another push uses it. CPU and memory are not measured per push: pushes and searches share one process.
+
+Keys are created and revoked with the existing `POST /v1/admin/tenants/{id}/keys` and `DELETE /v1/admin/keys/{id}`. The page sets `Content-Security-Policy` so it can only talk to its own server and cannot be framed, and `Cache-Control: no-store`. Its logic is checked by `tests/web.rs`, which runs `tests/web_admin_pure.js` under node when node is installed.
 
 ## Use lore from agents
 

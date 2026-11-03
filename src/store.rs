@@ -6,6 +6,7 @@
 //! is `documents.kind` (`code`, `doc`, `session`, `note`).
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use pgvector::Vector;
@@ -493,6 +494,32 @@ pub async fn index_text(
     chunks: Vec<Chunk>,
     title_for_embed: &str,
 ) -> Result<usize> {
+    let stats =
+        index_text_with_stats(state, tenant_id, source, doc, chunks, title_for_embed).await?;
+    Ok(stats.chunks)
+}
+
+/// What one [`index_text_with_stats`] call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexStats {
+    /// Chunks stored.
+    pub chunks: usize,
+    /// Chunks the embedder computed a vector for. The others kept their stored vector.
+    pub embedded: usize,
+    /// Wall-clock time spent embedding, including any wait for the embedder while other pushes
+    /// use it.
+    pub embed_time: Duration,
+}
+
+/// [`index_text`], also saying how many chunks were embedded and how long that took.
+pub async fn index_text_with_stats(
+    state: &AppState,
+    tenant_id: Uuid,
+    source: &Source,
+    doc: NewDocument,
+    chunks: Vec<Chunk>,
+    title_for_embed: &str,
+) -> Result<IndexStats> {
     if source.tenant_id != tenant_id || doc.tenant_id != tenant_id || doc.source_id != source.id {
         bail!("document does not belong to the source and tenant");
     }
@@ -517,12 +544,16 @@ pub async fn index_text(
     let missing: Vec<usize> = (0..chunks.len())
         .filter(|i| embeddings[*i].is_none())
         .collect();
+    let embedded = missing.len();
+    let mut embed_time = Duration::ZERO;
     if !missing.is_empty() {
         let texts: Vec<String> = missing
             .iter()
             .map(|i| embed_text(title_for_embed, &chunks[*i]))
             .collect();
+        let started = Instant::now();
         let fresh = embed_documents_async(state.embedder.clone(), texts).await?;
+        embed_time = started.elapsed();
         if fresh.len() != missing.len() {
             bail!(
                 "embedder returned {} vectors for {} chunks",
@@ -557,7 +588,11 @@ pub async fn index_text(
     let document_id = upsert_document(&mut tx, &doc).await?;
     replace_chunks(&mut tx, tenant_id, document_id, &indexed).await?;
     tx.commit().await?;
-    Ok(indexed.len())
+    Ok(IndexStats {
+        chunks: indexed.len(),
+        embedded,
+        embed_time,
+    })
 }
 
 /// Rows per `INSERT` of spans: 14 binds each stays well under Postgres's 65535 limit.
