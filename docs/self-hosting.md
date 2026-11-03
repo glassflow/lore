@@ -63,7 +63,7 @@ $C up -d --wait
 
 The dump creates the `vector` extension again, so nothing else is needed. `ON_ERROR_STOP=1` makes psql stop at the first error instead of exiting 0 over a half-loaded database.
 
-The `loredata` volume (repo mirrors and the model cache) is not in the dump. After a restore onto a fresh volume, run `lore repo push --full` for each repo. lore also answers `need_full_bundle`, and the CLI then retries with a full bundle on its own.
+The `loredata` volume (repo mirrors and the model cache) is not in the dump. After a restore onto a fresh volume, run `lore repo push --full` for each repo (a repo with a `remote_url` gets its mirror and checkout back on its next sync by itself). lore also answers `need_full_bundle`, and the CLI then retries with a full bundle on its own.
 
 ## Upgrade and roll back
 
