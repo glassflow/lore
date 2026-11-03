@@ -727,11 +727,44 @@ async fn a_deep_question_over_2000_characters_is_a_400_and_uses_no_allowance(poo
 // third one gets the slot. Nothing here touches the database after the pause (no citations).
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_running_question_holds_its_slot_until_it_ends(pool: PgPool) {
+async fn a_running_question_holds_its_slot_and_the_next_one_waits_for_it(pool: PgPool) {
     let probe = Probe::scripted(vec![Step::Hang, answer_text("Second.")]);
     let env = Env::new(pool, probe.clone(), |cfg| {
         cfg.deep_concurrency = 1;
         cfg.deep_budget_secs = 5;
+    })
+    .await;
+
+    tokio::time::pause();
+    let first = {
+        let state = env.state.clone();
+        let tenant = env.tenant;
+        tokio::spawn(async move { ask(&state, tenant, deep_request()).await })
+    };
+    while probe.calls().is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    // The first question's call times out after the budget and the grace (25 s), which frees
+    // the slot well within the 60 s a question waits for one.
+    let started = tokio::time::Instant::now();
+    let res = ask(&env.state, env.tenant, deep_request()).await.unwrap();
+    assert_eq!(res.answer, "Second.");
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(25) && waited < Duration::from_secs(26),
+        "{waited:?}"
+    );
+    let err = first.await.unwrap().unwrap_err();
+    assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_question_that_finds_no_slot_within_60_seconds_is_refused(pool: PgPool) {
+    let probe = Probe::scripted(vec![Step::Hang]);
+    let env = Env::new(pool, probe.clone(), |cfg| {
+        cfg.deep_concurrency = 1;
+        cfg.deep_budget_secs = 120;
     })
     .await;
 
@@ -755,7 +788,7 @@ async fn a_running_question_holds_its_slot_until_it_ends(pool: PgPool) {
     }
     let waited = started.elapsed();
     assert!(
-        waited >= Duration::from_secs(5) && waited < Duration::from_secs(6),
+        waited >= Duration::from_secs(60) && waited < Duration::from_secs(61),
         "{waited:?}"
     );
     assert_eq!(
@@ -763,12 +796,7 @@ async fn a_running_question_holds_its_slot_until_it_ends(pool: PgPool) {
         1,
         "the refused question reached the model"
     );
-
-    // The first question ends (its call times out after the budget and the grace), freeing the slot.
-    let err = first.await.unwrap().unwrap_err();
-    assert!(matches!(err, AppError::Internal(_)), "{err:?}");
-    let res = ask(&env.state, env.tenant, deep_request()).await.unwrap();
-    assert_eq!(res.answer, "Second.");
+    first.abort();
 }
 
 // Citation lookups. Documents are inserted directly: a lookup reads only `documents` and

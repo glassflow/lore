@@ -143,7 +143,8 @@ fn cut_bytes(mut s: String, max: usize) -> String {
     s
 }
 
-/// The first 40 lines of `text`, joined by `\n`. The HTTP route and the MCP tools both use it.
+/// The first 40 lines of `text`, joined by `\n`, for the HTTP route. The MCP `search` tool shows
+/// an excerpt instead (`mcp::excerpt`).
 pub fn snippet(text: &str) -> String {
     text.lines()
         .take(SNIPPET_LINES)

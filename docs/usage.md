@@ -197,10 +197,14 @@ claude mcp add --transport http lore "$LORE_URL/mcp" --header "Authorization: Be
 
 Any other MCP client that speaks streamable HTTP works the same way: register `$LORE_URL/mcp` with the same `Authorization: Bearer <key>` header.
 
+The tools are written for agents. `search` runs no language model, answers in well under a second, and shows a short excerpt of each hit, so an agent can search several times without filling its context. `ask` runs lore's own model (about 5 s fast, 10 to 60 s deep) and suits a person, or an agent without the code at hand; its description says so. With lore connected and nothing else said, Claude Code still mostly uses its own Grep, so add a line to `CLAUDE.md`:
+
+> This repository is indexed in the lore MCP server. Use lore's search tool first: it returns ranked passages (path, line range and the code itself) in well under a second. Answer from those passages when they are enough, and Read a file only when they are not.
+
 | Tool | Input | Returns |
 | --- | --- | --- |
-| `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`) | One text item: a JSON array of hits with `document_id`, `path`, `start_line`, `end_line`, `kind`, `title`, `source`, `score` and `snippet` (the first 40 lines) |
-| `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop) | Two text items: the answer followed by a `Sources:` list with one line per citation, then the full `/v1/ask` response as JSON |
+| `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`), `source` | One text item, `No hits.` or one block per hit: a header `[1] <source> <path>:<start>-<end> (<kind>: <symbols>) id=<document id>` (the title in place of the path for documents without one), then at most 12 lines of the hit, numbered: the window with the most query words, or the whole hit when it is at most 15 lines. Common indentation is removed and lines are cut at 160 characters |
+| `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop), `source` | One text item: the answer, a `Sources:` list with one line per citation, and `(fast mode, <model>, 4.9 s)` (deep mode adds the number of tool calls) |
 | `get_document` | `document_id` (the id of a search hit or a citation) | The document's text under a `# <title>` header with its kind and path, cut to 100,000 characters. An unknown id, or another tenant's, is the tool error `document not found` |
 | `list_sources` | none | One text item: a JSON array of `{name, kind, indexed_commit, documents}` |
 

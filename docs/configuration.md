@@ -27,7 +27,7 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_SESSION_QUIET_SECS` | `60` | Seconds a session must go without a new span before its spans are turned into one searchable document. A session that keeps receiving spans is indexed again after each quiet period. `0` indexes on the next worker run |
 | `LORE_DEEP_BUDGET_SECS` | `30` | Time budget of one deep-mode question, in seconds. Once more than 80% of it has passed, the model is told to answer with what it has. Must be a positive integer |
 | `LORE_DEEP_MAX_ROUNDS` | `12` | Most tool rounds of one deep-mode question. After that the model is told to answer with what it has. Must be a positive integer |
-| `LORE_DEEP_CONCURRENCY` | `2` | How many deep-mode questions one tenant may run at once. A further question waits up to 5 seconds for a free slot, then gets a 429. Must be a positive integer |
+| `LORE_DEEP_CONCURRENCY` | `2` | How many deep-mode questions one tenant may run at once. A further question waits up to 60 seconds for a free slot, then gets a 429. Must be a positive integer |
 | `LORE_DEEP_DAILY_LIMIT` | `100` | How many deep-mode questions one tenant may ask per UTC day. The next one gets a 429 ("daily deep-mode limit reached"). The count is kept in memory, so a restart resets it. Must be a positive integer |
 | `LORE_VERSION` | the crate version | Version string reported by the server |
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |

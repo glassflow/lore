@@ -61,7 +61,52 @@ fn is_error(res: &CallToolResult) -> bool {
     res.is_error == Some(true)
 }
 
-/// The JSON array in the single text item of a `search` or `list_sources` result.
+/// One hit of a `search` result, from its header `[n] <source> <place> (<about>) id=<uuid>` and
+/// the excerpt lines under it.
+#[derive(Debug)]
+struct TextHit {
+    source: String,
+    place: String,
+    kind: String,
+    id: String,
+    lines: Vec<String>,
+}
+
+/// The hits in the single text item of a `search` result; `No hits.` is none.
+fn search_hits(res: &CallToolResult) -> Vec<TextHit> {
+    assert!(!is_error(res), "{:?}", texts(res));
+    let texts = texts(res);
+    assert_eq!(texts.len(), 1);
+    if texts[0] == "No hits." {
+        return vec![];
+    }
+    let mut hits: Vec<TextHit> = Vec::new();
+    let mut previous_blank = true;
+    for line in texts[0].lines() {
+        let header = format!("[{}] ", hits.len() + 1);
+        if previous_blank && line.starts_with(&header) {
+            let (rest, id) = line[header.len()..].rsplit_once(" id=").expect("an id");
+            let (source, rest) = rest.split_once(' ').expect("a source");
+            let (place, about) = rest.rsplit_once(" (").expect("an (about)");
+            let kind = about.trim_end_matches(')').split(':').next().unwrap();
+            hits.push(TextHit {
+                source: source.to_string(),
+                place: place.to_string(),
+                kind: kind.to_string(),
+                id: id.to_string(),
+                lines: vec![],
+            });
+        } else if let Some(hit) = hits.last_mut() {
+            hit.lines.push(line.to_string());
+        } else {
+            panic!("text before the first hit: {}", texts[0]);
+        }
+        previous_blank = line.is_empty();
+    }
+    hits
+}
+
+/// The JSON array in the single text item of a `list_sources` result.
 fn json_items(res: &CallToolResult) -> Vec<Value> {
     assert!(!is_error(res), "{:?}", texts(res));
     let texts = texts(res);
@@ -114,7 +159,7 @@ async fn lists_the_four_tools_and_describes_the_server(pool: PgPool) {
     assert_eq!(
         info.instructions.as_deref(),
         Some(
-            "Search and ask questions about indexed code, documents and agent sessions. Use `ask` for a short answer with citations, `search` to find raw passages, `get_document` to read one in full."
+            "lore indexes code, documents and agent sessions. Start with `search`: it is fast, runs no language model, and returns the matching lines with their paths and line numbers. `get_document` reads one document in full. `ask` has lore's own model write an answer, which takes seconds to a minute: prefer `search` when you can read the code yourself. `list_sources` names what is indexed."
         )
     );
     client.cancel().await.unwrap();
@@ -126,42 +171,28 @@ async fn search_finds_the_plans_file_and_get_document_reads_it(pool: PgPool) {
     let client = connect(&url, &key).await;
 
     let res = call(&client, "search", json!({ "query": "plan limits" })).await;
-    let hits = json_items(&res);
+    let hits = search_hits(&res);
     assert!(!hits.is_empty());
     let hit = hits
         .iter()
-        .find(|h| h["path"] == PLANS)
+        .find(|h| h.place.starts_with(&format!("{PLANS}:")))
         .unwrap_or_else(|| panic!("no hit for {PLANS}: {hits:?}"));
-    for field in [
-        "path",
-        "start_line",
-        "end_line",
-        "kind",
-        "title",
-        "source",
-        "score",
-        "snippet",
-    ] {
-        assert!(!hit[field].is_null(), "{field} is missing: {hit}");
-    }
-    assert_eq!(hit["kind"], "code");
-    assert_eq!(hit["source"], "sample");
-    assert!(hit["start_line"].as_i64().unwrap() >= 1);
-    assert!(hit["snippet"].as_str().unwrap().lines().count() <= 40);
+    assert_eq!(hit.kind, "code");
+    assert_eq!(hit.source, "sample");
+    // `path:start-end`, and the excerpt is numbered from `start`.
+    let (start, end) = hit.place[PLANS.len() + 1..].split_once('-').unwrap();
+    let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse().unwrap());
+    assert!(start >= 1 && end >= start, "{}", hit.place);
+    assert!(!hit.lines.is_empty() && hit.lines.len() <= 15, "{hit:?}");
+    assert!(hit.lines[0].starts_with(&format!("{start}: ")), "{hit:?}");
 
-    let id = hit["document_id"].as_str().expect("document_id");
-    let res = call(&client, "get_document", json!({ "document_id": id })).await;
+    let res = call(&client, "get_document", json!({ "document_id": hit.id })).await;
     assert!(!is_error(&res), "{:?}", texts(&res));
     let texts = texts(&res);
     assert_eq!(texts.len(), 1);
     let doc = &texts[0];
-    assert!(
-        doc.starts_with(&format!(
-            "# {}\ncode · {PLANS}\n\n",
-            hit["title"].as_str().unwrap()
-        )),
-        "{doc}"
-    );
+    assert!(doc.starts_with("# "), "{doc}");
+    assert!(doc.contains(&format!("\ncode · {PLANS}\n\n")), "{doc}");
     assert!(doc.contains("enum Plan"), "{doc}");
     client.cancel().await.unwrap();
 }
@@ -186,11 +217,8 @@ async fn get_document_returns_a_note_exactly_as_it_was_sent(pool: PgPool) {
     assert_eq!(status, axum::http::StatusCode::OK, "{reply}");
 
     let client = connect(&url, &key).await;
-    let hits = json_items(&call(&client, "search", json!({ "query": "second line" })).await);
-    let id = hits.iter().find(|h| h["title"] == "Exact").unwrap()["document_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let hits = search_hits(&call(&client, "search", json!({ "query": "second line" })).await);
+    let id = hits.iter().find(|h| h.place == "Exact").unwrap().id.clone();
     let res = call(&client, "get_document", json!({ "document_id": id })).await;
     assert!(!is_error(&res), "{:?}", texts(&res));
     let doc = &texts(&res)[0];
@@ -203,16 +231,16 @@ async fn search_clamps_k_and_filters_by_kind(pool: PgPool) {
     let (url, key, _) = start(pool).await;
     let client = connect(&url, &key).await;
 
-    let one = json_items(&call(&client, "search", json!({ "query": "plan", "k": 0 })).await);
+    let one = search_hits(&call(&client, "search", json!({ "query": "plan", "k": 0 })).await);
     assert_eq!(one.len(), 1, "k below 1 is raised to 1");
-    let negative = json_items(&call(&client, "search", json!({ "query": "plan", "k": -3 })).await);
+    let negative = search_hits(&call(&client, "search", json!({ "query": "plan", "k": -3 })).await);
     assert_eq!(negative.len(), 1);
-    let two = json_items(&call(&client, "search", json!({ "query": "plan", "k": 2 })).await);
+    let two = search_hits(&call(&client, "search", json!({ "query": "plan", "k": 2 })).await);
     assert_eq!(two.len(), 2);
-    let many = json_items(&call(&client, "search", json!({ "query": "plan", "k": 1000 })).await);
+    let many = search_hits(&call(&client, "search", json!({ "query": "plan", "k": 1000 })).await);
     assert!(many.len() > 2 && many.len() <= 50, "{}", many.len());
 
-    let docs = json_items(
+    let docs = search_hits(
         &call(
             &client,
             "search",
@@ -221,7 +249,25 @@ async fn search_clamps_k_and_filters_by_kind(pool: PgPool) {
         .await,
     );
     assert!(!docs.is_empty());
-    assert!(docs.iter().all(|h| h["kind"] == "doc"), "{docs:?}");
+    assert!(docs.iter().all(|h| h.kind == "doc"), "{docs:?}");
+
+    let sample = search_hits(
+        &call(
+            &client,
+            "search",
+            json!({ "query": "plan", "source": "sample" }),
+        )
+        .await,
+    );
+    assert!(!sample.is_empty());
+    assert!(sample.iter().all(|h| h.source == "sample"), "{sample:?}");
+    let elsewhere = call(
+        &client,
+        "search",
+        json!({ "query": "plan", "source": "nope" }),
+    )
+    .await;
+    assert_eq!(texts(&elsewhere), ["No hits."]);
 
     let bad = call(
         &client,
@@ -239,16 +285,18 @@ async fn search_clamps_k_and_filters_by_kind(pool: PgPool) {
 async fn another_tenant_sees_nothing(pool: PgPool) {
     let (url, key, router) = start(pool).await;
     let client = connect(&url, &key).await;
-    let hits = json_items(&call(&client, "search", json!({ "query": "plan limits" })).await);
-    let id = hits.iter().find(|h| h["path"] == PLANS).unwrap()["document_id"]
-        .as_str()
+    let hits = search_hits(&call(&client, "search", json!({ "query": "plan limits" })).await);
+    let id = hits
+        .iter()
+        .find(|h| h.place.starts_with(PLANS))
         .unwrap()
-        .to_string();
+        .id
+        .clone();
 
     let (_, other_key) = create_tenant_key(&router, "globex", &["read"]).await;
     let other = connect(&url, &other_key).await;
     assert!(
-        json_items(&call(&other, "search", json!({ "query": "plan limits" })).await).is_empty()
+        search_hits(&call(&other, "search", json!({ "query": "plan limits" })).await).is_empty()
     );
     assert!(json_items(&call(&other, "list_sources", json!({})).await).is_empty());
 
@@ -298,7 +346,7 @@ async fn list_sources_has_name_kind_commit_and_count(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn ask_returns_the_answer_with_sources_then_the_json(pool: PgPool) {
+async fn ask_returns_the_answer_with_sources_and_a_footer(pool: PgPool) {
     let (url, key, _) = start(pool).await;
     let client = connect(&url, &key).await;
 
@@ -310,21 +358,16 @@ async fn ask_returns_the_answer_with_sources_then_the_json(pool: PgPool) {
     .await;
     assert!(!is_error(&res), "{:?}", texts(&res));
     let texts = texts(&res);
-    assert_eq!(texts.len(), 2);
+    assert_eq!(texts.len(), 1, "one text item: no JSON copy of the answer");
 
-    let full: Value = serde_json::from_str(&texts[1]).expect("the second item is JSON");
-    assert_eq!(full["mode"], "fast");
-    let answer = full["answer"].as_str().unwrap();
-    assert!(answer.starts_with("Fake answer from"), "{answer}");
-    let citations = full["citations"].as_array().unwrap();
-    assert!(citations.iter().any(|c| c["path"] == PLANS), "{full}");
-
-    let (head, sources) = texts[0]
+    let (answer, rest) = texts[0]
         .split_once("\n\nSources:\n")
         .expect("a Sources: block");
-    assert_eq!(head, answer);
+    assert!(answer.starts_with("Fake answer from"), "{answer}");
+    let (sources, footer) = rest.rsplit_once("\n\n").expect("a footer");
+    assert!(footer.starts_with("(fast mode, "), "{footer}");
+    assert!(footer.ends_with(" s)"), "{footer}");
     let lines: Vec<&str> = sources.lines().collect();
-    assert_eq!(lines.len(), citations.len(), "{sources}");
     assert!(lines[0].starts_with("[1] "), "{sources}");
     assert!(sources.contains(PLANS), "{sources}");
     client.cancel().await.unwrap();
@@ -343,13 +386,16 @@ async fn ask_deep_runs_the_agent_loop_and_a_blank_question_is_an_error(pool: PgP
     .await;
     assert!(!is_error(&res), "{:?}", texts(&res));
     let texts = texts(&res);
-    assert_eq!(texts.len(), 2);
-    let full: Value = serde_json::from_str(&texts[1]).expect("the second item is JSON");
-    assert_eq!(full["mode"], "deep");
-    assert!(full["tool_calls"].as_u64().unwrap() >= 1, "{full}");
-    let citations = full["citations"].as_array().unwrap();
-    assert!(citations.iter().any(|c| c["path"] == PLANS), "{full}");
-    assert!(texts[0].contains(PLANS), "{}", texts[0]);
+    assert_eq!(texts.len(), 1);
+    let (_, sources) = texts[0].split_once("\n\nSources:\n").expect("sources");
+    assert!(sources.contains(PLANS), "{}", texts[0]);
+    let footer = texts[0].rsplit("\n\n").next().unwrap();
+    let calls: u32 = footer
+        .strip_prefix("(deep mode, ")
+        .and_then(|f| f.split_once(" tool calls"))
+        .map(|(n, _)| n.parse().unwrap())
+        .unwrap_or_else(|| panic!("a deep footer: {footer}"));
+    assert!(calls >= 1, "{footer}");
 
     let blank = call(&client, "ask", json!({ "question": " " })).await;
     assert!(is_error(&blank));

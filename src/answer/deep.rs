@@ -29,8 +29,9 @@ const MAX_TOKENS: u32 = 16_000;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Added to the remaining budget for the timeout of a model call.
 const CALL_GRACE: Duration = Duration::from_secs(20);
-/// How long a question waits for a free slot before it is refused with a 429.
-const SLOT_WAIT: Duration = Duration::from_secs(5);
+/// How long a question waits for a free slot before it is refused with a 429. Agents send several
+/// questions at once and a deep answer takes 10 to 60 s, so a wait of a few seconds refused most.
+const SLOT_WAIT: Duration = Duration::from_secs(60);
 /// The most citations resolved for one answer.
 const MAX_CITATIONS: usize = 50;
 

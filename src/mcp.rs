@@ -21,21 +21,39 @@ use rmcp::model::{
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::answer::{self, AskRequest, Citation, Mode};
+use crate::answer::{self, AskRequest, AskResponse, Citation, Mode};
 use crate::auth::{Caller, Scope, caller_from_headers};
 use crate::error::AppError;
 use crate::http::AppState;
-use crate::search::{SearchQuery, search, snippet};
+use crate::search::{Hit, SearchQuery, search};
 use crate::store::{DocumentRow, document_text, list_source_summaries};
 
-/// What the server tells a client about itself.
-const INSTRUCTIONS: &str = "Search and ask questions about indexed code, documents and agent sessions. Use `ask` for a short answer with citations, `search` to find raw passages, `get_document` to read one in full.";
+/// What the server tells a client about itself. Agents read it, so it says what each tool costs:
+/// left alone, an agent tends to call `ask`, which runs a second model, where `search` would do.
+const INSTRUCTIONS: &str = "lore indexes code, documents and agent sessions. Start with `search`: it is fast, runs no language model, and returns the matching lines with their paths and line numbers. `get_document` reads one document in full. `ask` has lore's own model write an answer, which takes seconds to a minute: prefer `search` when you can read the code yourself. `list_sources` names what is indexed.";
 
 /// Hits returned by `search` when `k` is not given.
 const DEFAULT_SEARCH_K: usize = 8;
+
+/// A `search` hit shows at most this many of its lines: those that best match the query. A hit
+/// up to [`EXCERPT_SLACK`] lines longer is shown whole.
+const EXCERPT_LINES: usize = 12;
+const EXCERPT_SLACK: usize = 3;
+/// A shown line is cut to this many characters (seed rows and minified files can be thousands).
+const EXCERPT_LINE_CHARS: usize = 160;
+/// A hit header lists at most this many symbols.
+const HEADER_SYMBOLS: usize = 8;
+
+/// Query words too common to place an excerpt.
+const STOP_WORDS: [&str; 40] = [
+    "the", "and", "for", "are", "what", "which", "how", "does", "with", "from", "this", "that",
+    "can", "there", "their", "when", "where", "who", "why", "into", "its", "our", "use", "used",
+    "any", "all", "each", "has", "have", "was", "were", "will", "would", "should", "could",
+    "about", "many", "much", "some", "get",
+];
 
 /// The longest `get_document` text, in characters, header included.
 pub const MAX_DOCUMENT_CHARS: usize = 100_000;
@@ -98,6 +116,8 @@ pub struct SearchArgs {
     k: Option<i64>,
     /// Only these document kinds: `code`, `doc`, `session` or `note`.
     kind: Option<Vec<String>>,
+    /// Only this source: a repo or document source name, as `list_sources` shows it.
+    source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
@@ -112,28 +132,16 @@ pub enum AskMode {
 pub struct AskArgs {
     /// The question, in plain language.
     question: String,
-    /// `fast` (default) answers from the best passages. `deep` lets the model search, grep and read files for a few seconds; it needs a tool-capable provider.
+    /// `fast` (default, about 5 s) answers from the best passages in one model call. `deep` (10 to 60 s) lets lore's model search, grep and read files; it needs a tool-capable provider.
     mode: Option<AskMode>,
+    /// Only this source: a repo or document source name, as `list_sources` shows it.
+    source: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetDocumentArgs {
     /// The `document_id` of a search hit or an ask citation (a UUID).
     document_id: String,
-}
-
-/// One `search` hit, as the tool returns it.
-#[derive(Debug, Serialize)]
-struct SearchHit {
-    document_id: Uuid,
-    path: Option<String>,
-    start_line: Option<i32>,
-    end_line: Option<i32>,
-    kind: String,
-    title: String,
-    source: String,
-    score: f64,
-    snippet: String,
 }
 
 fn ok(content: Vec<String>) -> Result<CallToolResult, ErrorData> {
@@ -167,7 +175,7 @@ fn caller_of(parts: &Parts) -> Result<Caller, ErrorData> {
 #[tool_router]
 impl LoreMcp {
     #[tool(
-        description = "Find raw passages in the indexed code, documents and agent sessions. Returns a JSON array of hits with path, line range, kind, title, source, score and a snippet (the first 40 lines).",
+        description = "Find code, documents and agent sessions by name and by meaning. Fast: well under a second, no language model. Returns the best hits as text: a header per hit (source, path:lines, kind, symbols, document id), then up to 12 numbered lines of it that best match the query. Often enough to answer; read the file, or call get_document, when you need more.",
         annotations(read_only_hint = true)
     )]
     async fn search(
@@ -179,39 +187,23 @@ impl LoreMcp {
         let k = args.k.map_or(DEFAULT_SEARCH_K, |k| {
             crate::search::clamp_k(usize::try_from(k).unwrap_or(0))
         });
+        let terms = query_terms(&args.query);
         let query = SearchQuery {
             tenant_id: caller.tenant_id,
             q: args.query,
             k,
             kinds: args.kind.filter(|kinds| !kinds.is_empty()),
-            source: None,
+            source: args.source.filter(|s| !s.trim().is_empty()),
         };
         let hits = match search(&self.state.pool, self.state.embedder.clone(), query).await {
             Ok(hits) => hits,
             Err(e) => return app_failed(e),
         };
-        let items: Vec<SearchHit> = hits
-            .into_iter()
-            .map(|h| SearchHit {
-                document_id: h.document_id,
-                path: h.path,
-                start_line: h.start_line,
-                end_line: h.end_line,
-                kind: h.kind,
-                title: h.title,
-                source: h.source,
-                score: h.score,
-                snippet: snippet(&h.text),
-            })
-            .collect();
-        match serde_json::to_string(&items) {
-            Ok(json) => ok(vec![json]),
-            Err(e) => app_failed(AppError::Internal(e.into())),
-        }
+        ok(vec![render_hits(&hits, &terms)])
     }
 
     #[tool(
-        description = "Answer a question about the indexed material in a few sentences, with citations. Returns the answer and its sources, then the full response as JSON.",
+        description = "Have lore's own language model answer a question from the indexed material, with citations. Slow: about 5 s in fast mode and 10 to 60 s in deep mode, and deep questions over the tenant's limit wait for a free slot. If you can search and read the code yourself, `search` is faster and cheaper; use `ask` when you want a written answer instead. Returns the answer, its sources and a line with the mode, model and time.",
         annotations(read_only_hint = true)
     )]
     async fn ask(
@@ -229,17 +221,12 @@ impl LoreMcp {
             mode,
             k: None,
             kind: None,
-            source: None,
+            source: args.source.filter(|s| !s.trim().is_empty()),
         };
-        let res = match answer::ask(&self.state, caller.tenant_id, req).await {
-            Ok(res) => res,
-            Err(e) => return app_failed(e),
-        };
-        let json = match serde_json::to_string(&res) {
-            Ok(json) => json,
-            Err(e) => return app_failed(AppError::Internal(e.into())),
-        };
-        ok(vec![answer_text(&res.answer, &res.citations), json])
+        match answer::ask(&self.state, caller.tenant_id, req).await {
+            Ok(res) => ok(vec![ask_text(&res)]),
+            Err(e) => app_failed(e),
+        }
     }
 
     #[tool(
@@ -288,6 +275,132 @@ impl ServerHandler for LoreMcp {
             .with_server_info(Implementation::new("lore", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
+}
+
+/// The lowercased words of `query` that place an excerpt: 3 characters or more, not a stop word.
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let word = word.to_lowercase();
+        if word.chars().count() >= 3
+            && !STOP_WORDS.contains(&word.as_str())
+            && !terms.contains(&word)
+        {
+            terms.push(word);
+        }
+    }
+    terms
+}
+
+/// The `search` result: the hits, a blank line between them, or `No hits.`.
+fn render_hits(hits: &[Hit], terms: &[String]) -> String {
+    if hits.is_empty() {
+        return "No hits.".to_string();
+    }
+    let rendered: Vec<String> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| render_hit(i + 1, h, terms))
+        .collect();
+    rendered.join("\n\n")
+}
+
+/// `[1] sample src/billing/plans.rs:3-14 (code: Plan, Plan::limits) id=<uuid>`, then the excerpt.
+fn render_hit(n: usize, h: &Hit, terms: &[String]) -> String {
+    let place = match (&h.path, h.start_line, h.end_line) {
+        (Some(path), Some(start), Some(end)) => format!("{path}:{start}-{end}"),
+        (Some(path), _, _) => path.clone(),
+        (None, _, _) => h.title.clone(),
+    };
+    let mut about = h.kind.clone();
+    if !h.symbols.is_empty() {
+        let mut symbols = h.symbols[..h.symbols.len().min(HEADER_SYMBOLS)].join(", ");
+        if h.symbols.len() > HEADER_SYMBOLS {
+            symbols.push_str(", …");
+        }
+        about = format!("{about}: {symbols}");
+    }
+    let mut out = format!("[{n}] {} {place} ({about}) id={}", h.source, h.document_id);
+    for line in excerpt(&h.text, h.start_line, terms) {
+        out.push('\n');
+        out.push_str(&line);
+    }
+    out
+}
+
+/// The lines of a hit worth showing, numbered when the hit has line numbers. A short hit is shown
+/// whole; a longer one by the window of [`EXCERPT_LINES`] lines with the most query words (the
+/// first such window, so a hit that matches only by meaning shows its start). The window loses its
+/// common indentation and each line is cut to [`EXCERPT_LINE_CHARS`] characters.
+fn excerpt(text: &str, start_line: Option<i32>, terms: &[String]) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let (from, len) = if lines.len() <= EXCERPT_LINES + EXCERPT_SLACK {
+        (0, lines.len())
+    } else {
+        let matches: Vec<usize> = lines
+            .iter()
+            .map(|l| {
+                let l = l.to_lowercase();
+                terms.iter().filter(|t| l.contains(t.as_str())).count()
+            })
+            .collect();
+        let mut best = (0, 0);
+        let mut sum: usize = matches[..EXCERPT_LINES].iter().sum();
+        best.1 = sum;
+        for from in 1..=lines.len() - EXCERPT_LINES {
+            sum = sum + matches[from + EXCERPT_LINES - 1] - matches[from - 1];
+            if sum > best.1 {
+                best = (from, sum);
+            }
+        }
+        (best.0, EXCERPT_LINES)
+    };
+    let shown = &lines[from..from + len];
+    let indent = shown
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    shown
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            // A blank line shorter than the indent, or one whose indent is wider characters, keeps
+            // all of it.
+            let body = line.get(indent..).unwrap_or(line);
+            let body = cut(body.trim_end(), EXCERPT_LINE_CHARS);
+            match start_line {
+                Some(start) => format!("{}: {body}", i64::from(start) + (from + i) as i64),
+                None => body,
+            }
+        })
+        .collect()
+}
+
+/// `s` cut to `max` characters, the last of them `…` when it was longer.
+fn cut(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some(_) => {
+            let keep: String = s.chars().take(max - 1).collect();
+            format!("{keep}…")
+        }
+        None => s.to_string(),
+    }
+}
+
+/// The `ask` result: the answer and its sources, then `(fast mode, <model>, 4.9 s)`, with the
+/// number of tool calls for deep mode.
+fn ask_text(res: &AskResponse) -> String {
+    let secs = res.latency_ms as f64 / 1000.0;
+    let footer = match res.mode {
+        Mode::Fast => format!("(fast mode, {}, {secs:.1} s)", res.model),
+        Mode::Deep => format!(
+            "(deep mode, {} tool calls, {}, {secs:.1} s)",
+            res.tool_calls, res.model
+        ),
+    };
+    format!("{}\n\n{footer}", answer_text(&res.answer, &res.citations))
 }
 
 /// The answer, a blank line, `Sources:` and one line per citation.
@@ -430,5 +543,133 @@ mod tests {
     #[test]
     fn sources_without_citations_say_none() {
         assert_eq!(answer_text("No idea.", &[]), "No idea.\n\nSources:\n(none)");
+    }
+
+    fn response(mode: Mode) -> AskResponse {
+        AskResponse {
+            answer: "Three plans.".to_string(),
+            mode,
+            model: "m1".to_string(),
+            citations: vec![],
+            sources_considered: 0,
+            tool_calls: 3,
+            usage: Default::default(),
+            latency_ms: 4_870,
+        }
+    }
+
+    #[test]
+    fn ask_text_ends_with_the_mode_model_and_time() {
+        assert_eq!(
+            ask_text(&response(Mode::Fast)),
+            "Three plans.\n\nSources:\n(none)\n\n(fast mode, m1, 4.9 s)"
+        );
+        assert!(
+            ask_text(&response(Mode::Deep)).ends_with("\n\n(deep mode, 3 tool calls, m1, 4.9 s)")
+        );
+    }
+
+    fn terms(q: &str) -> Vec<String> {
+        query_terms(q)
+    }
+
+    #[test]
+    fn query_terms_are_lowercased_words_of_3_or_more_without_stop_words() {
+        assert_eq!(
+            terms("How many billing plans are there? plan_key, Plans"),
+            ["billing", "plans", "plan_key"]
+        );
+        assert!(terms("is it ok").is_empty());
+    }
+
+    #[test]
+    fn a_short_hit_is_shown_whole_and_numbered_from_its_first_line() {
+        let text = "fn a() {\n    one\n}";
+        assert_eq!(
+            excerpt(text, Some(7), &terms("zzz")),
+            ["7: fn a() {", "8:     one", "9: }"]
+        );
+        assert_eq!(excerpt(text, None, &[]), ["fn a() {", "    one", "}"]);
+        let fifteen: String = (1..=15).map(|i| format!("l{i}\n")).collect();
+        assert_eq!(excerpt(&fifteen, Some(1), &[]).len(), 15);
+    }
+
+    #[test]
+    fn a_long_hit_shows_the_12_lines_with_the_most_query_words() {
+        let mut lines: Vec<String> = (1..=40).map(|i| format!("filler {i}")).collect();
+        lines[24] = "the Billing plan".to_string();
+        lines[27] = "billing again".to_string();
+        lines[30] = "plan".to_string();
+        let shown = excerpt(&lines.join("\n"), Some(101), &terms("billing plan"));
+        assert_eq!(shown.len(), 12);
+        // Lines 25 to 31 hold the matches; the first window holding all three starts at line 20.
+        assert_eq!(shown[0], "120: filler 20");
+        assert_eq!(shown[11], "131: plan");
+    }
+
+    #[test]
+    fn a_long_hit_without_matches_shows_its_start() {
+        let text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let shown = excerpt(&text, Some(1), &terms("nothing here"));
+        assert_eq!(shown.first().unwrap(), "1: line 1");
+        assert_eq!(shown.last().unwrap(), "12: line 12");
+    }
+
+    #[test]
+    fn excerpts_lose_common_indentation_and_long_lines_are_cut() {
+        let text = format!("        a\n\n            b\n        {}", "x".repeat(300));
+        let shown = excerpt(&text, None, &[]);
+        assert_eq!(shown[0], "a");
+        assert_eq!(shown[1], "");
+        assert_eq!(shown[2], "    b");
+        assert_eq!(shown[3].chars().count(), EXCERPT_LINE_CHARS);
+        assert!(shown[3].ends_with('…'));
+        // Indentation in wider characters is kept rather than cut through.
+        assert_eq!(excerpt("\u{3000}a\n  b", None, &[]), ["\u{3000}a", "b"]);
+    }
+
+    fn hit(path: Option<&str>, symbols: &[&str]) -> Hit {
+        Hit {
+            chunk_id: 1,
+            document_id: Uuid::nil(),
+            source: "sample".to_string(),
+            kind: "code".to_string(),
+            title: "Standup notes".to_string(),
+            uri: None,
+            path: path.map(str::to_string),
+            external_id: None,
+            start_line: path.map(|_| 3),
+            end_line: path.map(|_| 4),
+            symbols: symbols.iter().map(|s| s.to_string()).collect(),
+            text: "pub enum Plan {\n    Free }".to_string(),
+            score: 0.03,
+        }
+    }
+
+    #[test]
+    fn a_hit_header_has_source_place_kind_symbols_and_id() {
+        let id = Uuid::nil();
+        assert_eq!(
+            render_hit(1, &hit(Some("src/plans.rs"), &["Plan"]), &[]),
+            format!(
+                "[1] sample src/plans.rs:3-4 (code: Plan) id={id}\n3: pub enum Plan {{\n4:     Free }}"
+            )
+        );
+        let many: Vec<String> = (1..=10).map(|i| format!("s{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let header = render_hit(2, &hit(None, &many), &[]);
+        assert!(
+            header.starts_with(&format!(
+                "[2] sample Standup notes (code: s1, s2, s3, s4, s5, s6, s7, s8, …) id={id}\npub enum"
+            )),
+            "{header}"
+        );
+    }
+
+    #[test]
+    fn no_hits_say_so() {
+        assert_eq!(render_hits(&[], &[]), "No hits.");
+        let two = render_hits(&[hit(None, &[]), hit(None, &[])], &[]);
+        assert_eq!(two.matches("\n\n[2] ").count(), 1, "{two}");
     }
 }

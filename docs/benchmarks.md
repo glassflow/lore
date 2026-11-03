@@ -60,6 +60,8 @@ With lore connected but only mentioned in passing, Claude kept to its own tools 
 
 > This repository is indexed in the lore MCP server. Start with lore (search, or ask for an overview) to find the relevant code, then read the files it points to. Use Grep only for what lore does not find.
 
+The runs below used that line. Asked this way, Claude often chose `ask`, which runs lore's own model and is slower than reading the code. lore's tools have since been reworded for agents: `search` shows short excerpts, and the descriptions point agents to `search` when they can read the code. The line in [Use lore from agents](usage.md#use-lore-from-agents) names `search` directly.
+
 ### Setup
 
 - Claude Code 2.1.304 with `claude-opus-5-5` at effort `medium`, run as `claude -p` from a clone at the commit lore had indexed. Each question ended with "Answer from this repository's code and cite file:line."
