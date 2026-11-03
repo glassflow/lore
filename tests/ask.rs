@@ -153,7 +153,12 @@ async fn nothing_indexed_skips_the_model(pool: PgPool) {
     assert_eq!(body["tool_calls"], 0);
     assert_eq!(
         body["usage"],
-        json!({ "input_tokens": 0, "output_tokens": 0 })
+        json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0
+        })
     );
 }
 
@@ -249,7 +254,12 @@ async fn sources_mode_lists_the_hits_without_the_model(pool: PgPool) {
     assert_eq!(body["model"], "none");
     assert_eq!(
         body["usage"],
-        json!({ "input_tokens": 0, "output_tokens": 0 })
+        json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0
+        })
     );
     let citations = body["citations"].as_array().unwrap();
     assert_eq!(citations.len(), 4);
