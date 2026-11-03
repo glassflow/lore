@@ -1,5 +1,5 @@
-//! Splits file content into searchable chunks: code items via tree-sitter, markdown sections,
-//! and plain line windows. Everything here is pure (no I/O, no database) and total: any input,
+//! Splits file content into searchable chunks: code items via tree-sitter, SQL statements,
+//! markdown sections, and plain line windows. Everything here is pure (no I/O, no database) and total: any input,
 //! however malformed, yields chunks rather than a panic, so request handlers can call it directly.
 //!
 //! Repo files go through [`chunk_file`], which cuts what does not fit a chunk. The documents API
@@ -9,10 +9,16 @@
 mod code;
 mod lines;
 mod markdown;
+mod sql;
 
 use std::path::Path;
 
 pub use markdown::{chunk_markdown, chunk_markdown_split};
+
+/// Part of the stored hash of every repo file. Bump it whenever [`chunk_file`] chunks some file
+/// differently, so that `lore repo push --full` chunks files indexed by an older version again
+/// instead of skipping them as unchanged.
+pub const CHUNKER_VERSION: u32 = 2;
 
 /// Chunks are cut to this many characters (not bytes) so one huge line cannot blow up a row.
 /// [`chunk_markdown_split`] sizes its chunks to fit, so the cut never loses text there.
@@ -37,6 +43,10 @@ pub struct Chunk {
     pub end_line: u32,
     pub symbols: Vec<String>,
     pub kind: ChunkKind,
+    /// The chunk defines a closed list of values: an enum, a block of constants, a constant array,
+    /// seed rows, a `CHECK ... IN` list. Search ranks these on their own as well, because "which X
+    /// are there" is answered by one of them and is easily outranked by code that only uses X.
+    pub enumerates: bool,
 }
 
 impl Chunk {
@@ -54,7 +64,12 @@ impl Chunk {
             end_line,
             symbols,
             kind,
+            enumerates: false,
         }
+    }
+
+    pub(crate) fn enumerating(self, enumerates: bool) -> Self {
+        Chunk { enumerates, ..self }
     }
 
     /// A chunk over `lines`, where `lines[0]` is the 0-based line `first` of the file. None for an
@@ -86,6 +101,7 @@ pub enum Language {
     Tsx,
     JavaScript,
     Python,
+    Sql,
     Markdown,
     Other,
 }
@@ -103,6 +119,7 @@ pub fn language_for(path: &str) -> Language {
         Some("tsx") => Language::Tsx,
         Some("js" | "jsx" | "mjs" | "cjs") => Language::JavaScript,
         Some("py") => Language::Python,
+        Some("sql") => Language::Sql,
         Some("md" | "mdx") => Language::Markdown,
         _ => Language::Other,
     }
@@ -113,6 +130,7 @@ pub fn language_for(path: &str) -> Language {
 pub fn chunk_file(path: &str, content: &str) -> Vec<Chunk> {
     match language_for(path) {
         Language::Markdown => markdown::chunk_markdown(content, file_stem(path)),
+        Language::Sql => sql::chunk(content),
         Language::Other => lines::chunk(content),
         lang => code::chunk(lang, content),
     }
@@ -215,6 +233,8 @@ mod tests {
             ("a.mjs", Language::JavaScript),
             ("a.cjs", Language::JavaScript),
             ("tool.py", Language::Python),
+            ("migrations/0001_init.sql", Language::Sql),
+            ("SEED.SQL", Language::Sql),
             ("README.md", Language::Markdown),
             ("page.mdx", Language::Markdown),
             ("UPPER.RS", Language::Rust),
@@ -265,7 +285,7 @@ mod tests {
         // characters mixed in would not be, so use all three widths.
         let content = "é€𝄞".repeat(4000);
         assert!(content.chars().count() > MAX_CHUNK_CHARS);
-        for path in ["a.txt", "a.md", "a.rs"] {
+        for path in ["a.txt", "a.md", "a.rs", "a.sql"] {
             let chunks = chunk_file(path, &content);
             assert!(!chunks.is_empty(), "{path}");
             for c in &chunks {
@@ -288,7 +308,7 @@ mod tests {
     #[test]
     fn empty_and_blank_files_give_no_chunks() {
         for path in [
-            "a.rs", "a.go", "a.ts", "a.tsx", "a.js", "a.py", "a.md", "a.txt",
+            "a.rs", "a.go", "a.ts", "a.tsx", "a.js", "a.py", "a.sql", "a.md", "a.txt",
         ] {
             assert!(chunk_file(path, "").is_empty(), "{path} empty");
             assert!(chunk_file(path, "\n\n  \n").is_empty(), "{path} blank");

@@ -1,6 +1,8 @@
 //! Hybrid search: Postgres full-text ranking (good at exact names) fused with pgvector similarity
-//! (good at meaning) by Reciprocal Rank Fusion. The HTTP route, the CLI, fast answers and the
-//! MCP tools all call [`search`].
+//! (good at meaning) by Reciprocal Rank Fusion. A third list lifts the first few enumerations among
+//! the vector hits (enums, constant lists, seed rows): they answer "which X are there" but are
+//! easily outranked by the many chunks that only use X. The HTTP route, the CLI, fast answers and
+//! the MCP tools all call [`search`].
 //!
 //! Queries are runtime-checked and bind every value. The one built string is the tsquery text of
 //! the lexical branch, which is itself passed as a bind value.
@@ -35,6 +37,8 @@ const SNIPPET_LINES: usize = 40;
 
 /// Rows taken from each branch before fusion.
 const BRANCH_LIMIT: i64 = 50;
+/// How many of the vector hits that are enumerations get a place in the enumeration list.
+const ENUMERATION_LIMIT: usize = 3;
 /// The `k` constant of Reciprocal Rank Fusion.
 const RRF_K: f64 = 60.0;
 
@@ -179,9 +183,18 @@ pub async fn search(
     };
 
     let lexical = lexical_branch(pool, q, &filter).await?;
-    let vector = vector_branch(pool, embedder, q, &filter).await?;
+    let vector_hits = vector_branch(pool, embedder, q, &filter).await?;
+    let vector: Vec<i64> = vector_hits.iter().map(|(id, _)| *id).collect();
+    // The enumerations the vector branch found, in its order: an enumeration far from the query
+    // in meaning is not lifted, however few enumerations there are.
+    let enumerations: Vec<i64> = vector_hits
+        .iter()
+        .filter(|(_, enumerates)| *enumerates)
+        .map(|(id, _)| *id)
+        .take(ENUMERATION_LIMIT)
+        .collect();
 
-    let mut fused = fuse(&lexical, &vector);
+    let mut fused = fuse(&[&lexical, &vector, &enumerations]);
     fused.truncate(k);
     if fused.is_empty() {
         return Ok(Vec::new());
@@ -249,12 +262,13 @@ async fn lexical_branch(pool: &PgPool, q: &str, f: &Filter<'_>) -> Result<Vec<i6
     Ok(ids)
 }
 
+/// The nearest chunks, best first, each with whether it is an enumeration.
 async fn vector_branch(
     pool: &PgPool,
     embedder: Arc<dyn Embedder>,
     q: &str,
     f: &Filter<'_>,
-) -> Result<Vec<i64>, AppError> {
+) -> Result<Vec<(i64, bool)>, AppError> {
     let embedding = embed_query_async(embedder, q.to_string()).await?;
     // The filters are applied after the index scan, so let it keep scanning until it has enough
     // rows that pass them.
@@ -265,8 +279,8 @@ async fn vector_branch(
     sqlx::query("SET LOCAL hnsw.ef_search = 100")
         .execute(&mut *tx)
         .await?;
-    let ids = sqlx::query_scalar(
-        "SELECT c.id
+    let hits = sqlx::query_as(
+        "SELECT c.id, c.enumerates
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
          JOIN sources s ON s.id = d.source_id
@@ -283,7 +297,7 @@ async fn vector_branch(
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(ids)
+    Ok(hits)
 }
 
 /// `k` limited to 1..=50.
@@ -319,31 +333,29 @@ fn or_query(lexemes: &[String]) -> Option<String> {
     Some(quoted.join(" | "))
 }
 
-/// Reciprocal Rank Fusion of two ranked id lists (best first): an id scores
+/// Reciprocal Rank Fusion of ranked id lists (best first), the lexical list first: an id scores
 /// `1 / (60 + rank)` for each list it is in, with 1-based ranks. Returns `(id, score)` best
 /// first. Ties go to the id with the better lexical rank (an id missing from the lexical list
 /// comes after those in it), then to the lower id. Ranks inside one list are distinct, so the id
 /// only keeps the order total; equal scores of different ids with equal lexical ranks cannot
 /// happen. Ties inside a branch (equal `ts_rank_cd` or equal distance) are broken by id in SQL.
-fn fuse(lexical: &[i64], vector: &[i64]) -> Vec<(i64, f64)> {
+fn fuse(lists: &[&[i64]]) -> Vec<(i64, f64)> {
     struct Entry {
         score: f64,
         lexical_rank: usize,
     }
     let mut entries: HashMap<i64, Entry> = HashMap::new();
-    for (i, id) in lexical.iter().enumerate() {
-        let e = entries.entry(*id).or_insert(Entry {
-            score: 0.0,
-            lexical_rank: i + 1,
-        });
-        e.score += 1.0 / (RRF_K + (i + 1) as f64);
-    }
-    for (i, id) in vector.iter().enumerate() {
-        let e = entries.entry(*id).or_insert(Entry {
-            score: 0.0,
-            lexical_rank: usize::MAX,
-        });
-        e.score += 1.0 / (RRF_K + (i + 1) as f64);
+    for (n, list) in lists.iter().enumerate() {
+        for (i, id) in list.iter().enumerate() {
+            let e = entries.entry(*id).or_insert(Entry {
+                score: 0.0,
+                lexical_rank: usize::MAX,
+            });
+            if n == 0 {
+                e.lexical_rank = i + 1;
+            }
+            e.score += 1.0 / (RRF_K + (i + 1) as f64);
+        }
     }
     let mut out: Vec<(i64, Entry)> = entries.into_iter().collect();
     out.sort_by(|(a_id, a), (b_id, b)| {
@@ -460,7 +472,7 @@ mod tests {
 
     #[test]
     fn fusion_adds_the_reciprocal_ranks() {
-        let fused = fuse(&[1, 2], &[2, 3]);
+        let fused = fuse(&[&[1, 2], &[2, 3]]);
         let ids: Vec<i64> = fused.iter().map(|f| f.0).collect();
         assert_eq!(ids, vec![2, 1, 3]);
         let score = |id: i64| fused.iter().find(|f| f.0 == id).unwrap().1;
@@ -470,24 +482,36 @@ mod tests {
     }
 
     #[test]
+    fn a_third_list_adds_its_reciprocal_ranks() {
+        // First place in the third list scores like first place in any list: it ties with the
+        // vector-only 9 and wins on the lower id, and it beats the vector's second place.
+        let fused = fuse(&[&[1, 2], &[9, 8, 2], &[5]]);
+        let ids: Vec<i64> = fused.iter().map(|f| f.0).collect();
+        assert_eq!(ids, vec![2, 1, 5, 9, 8]);
+        let score = |id: i64| fused.iter().find(|f| f.0 == id).unwrap().1;
+        assert!((score(5) - 1.0 / 61.0).abs() < 1e-12);
+        assert!((score(2) - (1.0 / 62.0 + 1.0 / 63.0)).abs() < 1e-12);
+    }
+
+    #[test]
     fn one_branch_alone_keeps_its_order() {
         let ids = |v: Vec<(i64, f64)>| v.into_iter().map(|f| f.0).collect::<Vec<_>>();
-        assert_eq!(ids(fuse(&[], &[7, 5, 9])), vec![7, 5, 9]);
-        assert_eq!(ids(fuse(&[7, 5, 9], &[])), vec![7, 5, 9]);
-        assert!(fuse(&[], &[]).is_empty());
+        assert_eq!(ids(fuse(&[&[], &[7, 5, 9]])), vec![7, 5, 9]);
+        assert_eq!(ids(fuse(&[&[7, 5, 9], &[]])), vec![7, 5, 9]);
+        assert!(fuse(&[&[], &[]]).is_empty());
     }
 
     #[test]
     fn equal_scores_go_to_the_better_lexical_rank_then_the_lower_id() {
         // Lexical-only rank 1 and vector-only rank 1 score the same. The lexical one wins even
         // with the higher id.
-        let ids: Vec<i64> = fuse(&[9], &[3]).into_iter().map(|f| f.0).collect();
+        let ids: Vec<i64> = fuse(&[&[9], &[3]]).into_iter().map(|f| f.0).collect();
         assert_eq!(ids, vec![9, 3]);
         // Lexical 1 + vector 2 against lexical 2 + vector 1: equal sums, lexical rank decides.
-        let ids: Vec<i64> = fuse(&[8, 4], &[4, 8]).into_iter().map(|f| f.0).collect();
+        let ids: Vec<i64> = fuse(&[&[8, 4], &[4, 8]]).into_iter().map(|f| f.0).collect();
         assert_eq!(ids, vec![8, 4]);
         // The result is the same whatever the order of the ids in the lists.
-        let ids: Vec<i64> = fuse(&[4, 8], &[8, 4]).into_iter().map(|f| f.0).collect();
+        let ids: Vec<i64> = fuse(&[&[4, 8], &[8, 4]]).into_iter().map(|f| f.0).collect();
         assert_eq!(ids, vec![4, 8]);
     }
 

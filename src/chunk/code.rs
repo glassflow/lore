@@ -88,7 +88,7 @@ fn parse(lang: Language, content: &str) -> Option<tree_sitter::Tree> {
         Language::Tsx => tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TSX),
         Language::JavaScript => tree_sitter::Language::new(tree_sitter_javascript::LANGUAGE),
         Language::Python => tree_sitter::Language::new(tree_sitter_python::LANGUAGE),
-        Language::Markdown | Language::Other => return None,
+        Language::Sql | Language::Markdown | Language::Other => return None,
     };
     let mut parser = Parser::new();
     parser.set_language(&language).ok()?;
@@ -144,7 +144,7 @@ fn is_item_kind(lang: Language, kind: &str) -> bool {
                 | "lexical_declaration"
         ),
         Language::Python => matches!(kind, "function_definition" | "class_definition"),
-        Language::Markdown | Language::Other => false,
+        Language::Sql | Language::Markdown | Language::Other => false,
     }
 }
 
@@ -271,13 +271,108 @@ fn go_spec_names(src: &Source, node: Node<'_>, out: &mut Vec<String>) {
 
 fn item_chunks(src: &Source, inner: Node<'_>, span: Span) -> Vec<Chunk> {
     let symbols = symbols_of(src, inner);
-    if span.len() > MAX_ITEM_LINES
+    let enumerates = is_enumeration(src, inner);
+    let chunks = if span.len() > MAX_ITEM_LINES
         && is_container_kind(inner.kind())
         && let Some(chunks) = container_chunks(src, inner, span, &symbols)
     {
-        return chunks;
+        chunks
+    } else {
+        plain_item_chunks(src, span, symbols)
+    };
+    chunks
+        .into_iter()
+        .map(|c| c.enumerating(enumerates))
+        .collect()
+}
+
+/// Whether an item defines a closed list of values: an enum, a Python `Enum` class, a Go `const`
+/// block of two or more, a constant array or slice of two or more elements, or a TypeScript union
+/// of two or more literal types.
+fn is_enumeration(src: &Source, node: Node<'_>) -> bool {
+    match node.kind() {
+        "enum_item" | "enum_declaration" => true,
+        "const_declaration" => named_children_of_kind(node, "const_spec") >= 2,
+        "const_item" | "static_item" => node.child_by_field_name("value").is_some_and(is_list),
+        // Go: `var Scopes = []Scope{Read, Write}`.
+        "var_declaration" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .filter(|spec| spec.kind() == "var_spec")
+                .filter_map(|spec| spec.child_by_field_name("value"))
+                .any(|values| first_named_child(values).is_some_and(is_list))
+        }
+        // TS/JS: `const KINDS = ['a', 'b'] as const`.
+        "lexical_declaration" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .filter(|d| d.kind() == "variable_declarator")
+                .filter_map(|d| d.child_by_field_name("value"))
+                .any(is_list)
+        }
+        // TS: `type Status = 'open' | 'closed'`.
+        "type_alias_declaration" => node
+            .child_by_field_name("value")
+            .is_some_and(|v| v.kind() == "union_type" && count_descendants(v, "literal_type") >= 2),
+        "class_definition" => node
+            .child_by_field_name("superclasses")
+            .is_some_and(|bases| {
+                node_text(src, bases)
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|base| matches!(base, "Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag"))
+            }),
+        _ => false,
     }
-    plain_item_chunks(src, span, symbols)
+}
+
+/// A literal list of two or more elements, under any `&`, `as const` or parentheses: a Rust
+/// array or slice, a Go composite literal, a JS/TS array. A Rust `[x; n]` repeat is not a list.
+fn is_list(node: Node<'_>) -> bool {
+    match node.kind() {
+        "reference_expression" => node.child_by_field_name("value").is_some_and(is_list),
+        "as_expression" | "satisfies_expression" | "parenthesized_expression" => {
+            first_named_child(node).is_some_and(is_list)
+        }
+        "array_expression" => {
+            node.child_by_field_name("length").is_none() && count_elements(node) >= 2
+        }
+        "array" => count_elements(node) >= 2,
+        "composite_literal" => node
+            .child_by_field_name("body")
+            .is_some_and(|body| count_elements(body) >= 2),
+        _ => false,
+    }
+}
+
+fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|c| !c.kind().contains("comment"))
+}
+
+/// Named children that are not comments.
+fn count_elements(node: Node<'_>) -> usize {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|c| !c.kind().contains("comment"))
+        .count()
+}
+
+fn named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|c| c.kind() == kind)
+        .count()
+}
+
+fn count_descendants(node: Node<'_>, kind: &str) -> usize {
+    let mut cursor = node.walk();
+    let own = usize::from(node.kind() == kind);
+    let children: Vec<Node> = node.named_children(&mut cursor).collect();
+    own + children
+        .into_iter()
+        .map(|c| count_descendants(c, kind))
+        .sum::<usize>()
 }
 
 /// One chunk for an item that fits, line windows for one that does not.
@@ -507,6 +602,61 @@ fn main() {
         // Chunks come back in file order.
         let starts: Vec<u32> = chunks.iter().map(|c| c.start_line).collect();
         assert_eq!(starts, vec![1, 3, 11, 20]);
+    }
+
+    #[test]
+    fn enumerations_are_flagged() {
+        let cases = [
+            ("a.rs", "enum Plan { Free, Pro }\n", true),
+            (
+                "a.rs",
+                "const KINDS: [&str; 2] = [\"code\", \"doc\"];\n",
+                true,
+            ),
+            (
+                "a.rs",
+                "static KINDS: &[&str] = &[\"code\", \"doc\"];\n",
+                true,
+            ),
+            ("a.rs", "const ZEROS: [u8; 32] = [0; 32];\n", false),
+            ("a.rs", "const LIMIT: u32 = 100;\n", false),
+            ("a.rs", "struct Plan { seats: u32 }\n", false),
+            (
+                "a.go",
+                "package p\n\nconst (\n\tRead Scope = \"read\"\n\tWrite Scope = \"write\"\n)\n",
+                true,
+            ),
+            ("a.go", "package p\n\nconst Limit = 10\n", false),
+            (
+                "a.go",
+                "package p\n\nvar Scopes = []Scope{Read, Write}\n",
+                true,
+            ),
+            ("a.go", "package p\n\nvar limit = 10\n", false),
+            ("a.ts", "export enum Status { Open, Closed }\n", true),
+            ("a.ts", "export type Status = 'open' | 'closed';\n", true),
+            ("a.ts", "type Id = string | number;\n", false),
+            (
+                "a.ts",
+                "export const KINDS = ['code', 'doc'] as const;\n",
+                true,
+            ),
+            ("a.js", "const one = [1];\n", false),
+            (
+                "a.py",
+                "class Status(str, Enum):\n    OPEN = 'open'\n    CLOSED = 'closed'\n",
+                true,
+            ),
+            ("a.py", "class Plan(Base):\n    pass\n", false),
+        ];
+        for (path, src, want) in cases {
+            let chunks = chunk_file(path, src);
+            let item = chunks
+                .iter()
+                .find(|c| c.kind == ChunkKind::Item)
+                .unwrap_or_else(|| panic!("{path} {src:?}: no item in {chunks:#?}"));
+            assert_eq!(item.enumerates, want, "{path} {src:?}");
+        }
     }
 
     #[test]

@@ -67,6 +67,7 @@ fn chunk(text: &str, start: u32, end: u32, symbols: &[&str]) -> Chunk {
         end_line: end,
         symbols: symbols.iter().map(|s| s.to_string()).collect(),
         kind: ChunkKind::Lines,
+        enumerates: false,
     }
 }
 
@@ -119,7 +120,13 @@ async fn plan_limits_ranks_plans_rs_first_with_the_documented_shape(pool: PgPool
 
     let found = hits(&router, &key, "plan limits", "").await;
     assert!(found.len() <= 10);
-    let first = &found[0];
+    assert_eq!(found[0]["path"], PLANS);
+    // The `Plan` enum above it may rank first: it is an enumeration, and its doc comment is about
+    // plan limits too. The shape is checked on the function's hit.
+    let first = found
+        .iter()
+        .find(|h| h["start_line"] == 7)
+        .expect("the limits function is a hit");
     assert_eq!(first["path"], PLANS);
     assert_eq!(first["source"], "sample");
     assert_eq!(first["kind"], "code");
@@ -143,8 +150,11 @@ async fn plan_limits_ranks_plans_rs_first_with_the_documented_shape(pool: PgPool
     // Best first, and the fusion score only ever adds reciprocal ranks.
     let scores: Vec<f64> = found.iter().map(|h| h["score"].as_f64().unwrap()).collect();
     assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
-    assert!(scores[0] > 1.0 / 61.0, "the top hit is in both branches");
-    assert!(scores[0] <= 2.0 / 61.0 + 1e-12);
+    assert!(
+        scores[0] > 1.0 / 61.0,
+        "the top hit is in more than one list"
+    );
+    assert!(scores[0] <= 3.0 / 61.0 + 1e-12);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -425,8 +435,13 @@ async fn only_stop_words_search_by_vector_alone(pool: PgPool) {
 
     let found = hits(&router, &key, "the and of", "").await;
     assert!(!found.is_empty(), "the vector branch still answers");
-    // Without a lexical branch the best possible score is the vector rank 1 alone.
-    assert!((found[0]["score"].as_f64().unwrap() - 1.0 / 61.0).abs() < 1e-12);
+    // Without a lexical branch the best possible score is vector rank 1, plus rank 1 of the
+    // enumeration list, which is drawn from the vector hits.
+    let top = found[0]["score"].as_f64().unwrap();
+    assert!(
+        (1.0 / 61.0 - 1e-12..=2.0 / 61.0 + 1e-12).contains(&top),
+        "{top}"
+    );
 }
 
 /// Three notes with the same text, so they tie on full-text rank and on distance.
@@ -496,8 +511,9 @@ async fn camel_case_identifiers_are_found_by_their_words(pool: PgPool) {
     .await;
 
     // Words inside a camelCase name in the text, and inside a symbol, reach the full-text index.
+    // Notes only: the fixture's enumerations can be lifted for any query in so small a tenant.
     for q in ["quota gate", "burst window", "allowance"] {
-        let found = hits(&router, &key, q, "").await;
+        let found = hits(&router, &key, q, "&kind=note").await;
         assert_eq!(found[0]["title"], "Camel", "{q}");
         assert!(found[0]["score"].as_f64().unwrap() > 1.0 / 61.0, "{q}");
     }
@@ -507,7 +523,7 @@ async fn camel_case_identifiers_are_found_by_their_words(pool: PgPool) {
     assert_eq!(found[0]["title"], "Camel");
     assert!(found[0]["score"].as_f64().unwrap() > 1.0 / 61.0);
     // A camelCase query is not split: it only matches text that has the whole identifier.
-    let found = hits(&router, &key, "quotaGateway", "").await;
+    let found = hits(&router, &key, "quotaGateway", "&kind=note").await;
     assert!(
         found
             .iter()
@@ -552,7 +568,10 @@ async fn web_url_is_rendered_with_the_chunk_lines_and_an_escaped_path(pool: PgPo
     assert_eq!(found[0]["path"], PLANS);
     assert_eq!(
         found[0]["uri"],
-        format!("https://git.example.com/acme/sample/blob/{sha}/src/billing/plans.rs#L7-L14")
+        format!(
+            "https://git.example.com/acme/sample/blob/{sha}/src/billing/plans.rs#L{}-L{}",
+            found[0]["start_line"], found[0]["end_line"]
+        )
     );
 
     // Spaces, #, ?, % and non-ASCII are percent-encoded; the / between segments is kept.
