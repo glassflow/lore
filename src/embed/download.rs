@@ -264,7 +264,7 @@ async fn fetch_file(
     let commit = commit
         .map(str::to_string)
         .or(header_commit)
-        .ok_or_else(|| fatal(anyhow!("the response has no x-repo-commit header")))?;
+        .ok_or_else(|| fatal(anyhow!("the response has no usable x-repo-commit header")))?;
     let partial = partial_path(repo_dir, &commit, file);
 
     if let Some(dir) = partial.parent() {
@@ -367,7 +367,8 @@ async fn send(
                 .get("x-repo-commit")
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty());
+                // It becomes a directory name: a mirror must not be able to point it elsewhere.
+                .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric()));
         }
         if !res.status().is_redirection() {
             return Ok((res, commit));
@@ -574,6 +575,18 @@ mod tests {
         );
         assert!(err.contains(&dir.path().display().to_string()), "{err}");
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_commit_that_is_not_a_plain_name_is_refused() {
+        let (base, _) =
+            server(|_, _| Some(Reply::new(200, b"{}").header("x-repo-commit", "../../escape")));
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let d = download(&base, Duration::from_secs(10), Duration::from_secs(10));
+        let err = fetch(REPO, &FILES, &cache, &d).unwrap_err().to_string();
+        assert!(err.contains("x-repo-commit"), "{err}");
+        assert!(!dir.path().join("escape").exists());
     }
 
     #[test]
