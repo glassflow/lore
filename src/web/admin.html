@@ -1,0 +1,1128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>lore admin</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbf9;
+    --fg: #1d1d1b;
+    --muted: #6b6b66;
+    --border: #d9d9d2;
+    --panel: #ffffff;
+    --accent: #1f5fbf;
+    --code-bg: #eeeee8;
+    --error: #b3261e;
+    --ok: #1e7a3c;
+    --track: #e6e6df;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161618;
+      --fg: #e8e8e4;
+      --muted: #9a9a94;
+      --border: #38383c;
+      --panel: #1f1f22;
+      --accent: #7fb0ff;
+      --code-bg: #2a2a2e;
+      --error: #ff8a80;
+      --ok: #7fd49a;
+      --track: #34343a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.5;
+  }
+  main {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 24px 16px 48px;
+  }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; }
+  header h1 { margin: 0; font-size: 28px; letter-spacing: 0.02em; }
+  header p { margin: 4px 0 24px; color: var(--muted); flex-basis: 100%; }
+  a { color: var(--accent); }
+  h2 { margin: 0; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  h3 { margin: 0; font-size: 20px; overflow-wrap: anywhere; }
+  h4 { margin: 16px 0 6px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  section.block { margin-top: 32px; }
+  .section-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; margin-bottom: 12px; }
+  label.field { display: block; margin-bottom: 4px; font-size: 14px; color: var(--muted); }
+  input[type="password"], input[type="text"] {
+    padding: 10px 12px;
+    font: inherit;
+    color: var(--fg);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  input:focus-visible, button:focus-visible, a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .inline { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .inline input { flex: 1 1 240px; min-width: 0; }
+  .hint { margin: 6px 0 0; font-size: 13px; color: var(--muted); }
+  button {
+    padding: 10px 20px;
+    font: inherit;
+    font-weight: 600;
+    color: var(--bg);
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button.secondary { color: var(--fg); background: transparent; border-color: var(--border); }
+  button.danger { color: var(--bg); background: var(--error); border-color: var(--error); }
+  button.small { padding: 4px 12px; font-size: 14px; }
+  button:disabled { opacity: 0.6; cursor: wait; }
+  #status { min-height: 1.5em; margin: 16px 0 0; color: var(--muted); }
+  #status.error { color: var(--error); }
+  .muted { color: var(--muted); }
+  .empty { margin: 0; color: var(--muted); }
+  .mono, code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  dl.facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 12px 20px;
+    margin: 0;
+    padding: 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  dl.facts dt { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  dl.facts dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+  .card {
+    margin-bottom: 16px;
+    padding: 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+  .card-head .mono { color: var(--muted); overflow-wrap: anywhere; }
+  .card > p { margin: 4px 0 0; font-size: 14px; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th {
+    padding: 6px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-align: left;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--border);
+  }
+  td { padding: 8px; vertical-align: top; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+  tr:last-child td { border-bottom: 0; }
+  th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.action { text-align: right; white-space: nowrap; }
+  .pushes, .panel { padding: 4px 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+  .panel h4:first-child { margin-top: 8px; }
+  details { margin: 12px 0 8px; }
+  summary { cursor: pointer; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .badge {
+    display: inline-block;
+    padding: 0 8px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .badge.run { color: var(--accent); }
+  .badge.ok { color: var(--ok); }
+  .badge.bad { color: var(--error); }
+  .badge.off { color: var(--muted); }
+  .progress { min-width: 140px; }
+  .bar { height: 6px; margin: 6px 0 4px; overflow: hidden; background: var(--track); border-radius: 3px; }
+  .bar > span { display: block; height: 100%; background: var(--accent); }
+  .bar.ok > span { background: var(--ok); }
+  .bar.bad > span { background: var(--error); }
+  .bar.busy > span { width: 30%; animation: slide 1.4s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  @media (prefers-reduced-motion: reduce) {
+    .bar.busy > span { width: 100%; opacity: 0.35; animation: none; }
+  }
+  .failed-text { color: var(--error); }
+  form.new-key { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 12px; }
+  form.new-key label { cursor: pointer; }
+  .confirm { display: inline-flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; white-space: normal; }
+  .reveal {
+    margin-top: 12px;
+    padding: 12px;
+    border: 2px solid var(--accent);
+    border-radius: 8px;
+  }
+  .reveal p { margin: 0 0 8px; }
+  .reveal input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }
+  [hidden] { display: none !important; }
+
+  /* Phone width: every table row becomes a small card of label and value lines. */
+  @media (max-width: 640px) {
+    table, tbody, tr, td { display: block; width: 100%; }
+    thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+    tr { margin: 8px 0; padding: 4px 0; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+    td, tr:last-child td { display: flex; justify-content: space-between; gap: 12px; padding: 4px 12px; text-align: right; border: 0; }
+    td::before {
+      content: attr(data-label);
+      flex: none;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 12px;
+      color: var(--muted);
+      text-align: left;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    td[data-label=""]::before { content: none; }
+    td:empty { display: none; }
+    tr td.action, tr:last-child td.action { justify-content: flex-end; }
+    .progress { flex: 1 1 auto; min-width: 0; }
+    .pushes, .panel { padding: 0; background: transparent; border: 0; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>lore admin</h1>
+    <a href="/">Ask page</a>
+    <p>Tenants, sources, keys and pushes on this server</p>
+  </header>
+
+  <form id="token-form" autocomplete="off">
+    <label class="field" for="token">Admin token</label>
+    <div class="inline">
+      <input type="password" id="token" name="token" placeholder="LORE_ADMIN_TOKEN" autocomplete="off" spellcheck="false">
+      <button type="submit" id="open">Open</button>
+      <button type="button" id="forget" class="secondary">Forget</button>
+    </div>
+    <p class="hint">Kept in this tab's session storage only, and sent only to this server.</p>
+  </form>
+
+  <p id="status" role="status" aria-live="polite"></p>
+
+  <div id="content" hidden>
+    <section class="block" aria-labelledby="server-title">
+      <div class="section-head">
+        <h2 id="server-title">Server</h2>
+        <button type="button" id="refresh" class="secondary small">Refresh</button>
+      </div>
+      <dl id="facts" class="facts"></dl>
+    </section>
+
+    <section class="block" aria-labelledby="pushes-title">
+      <div class="section-head">
+        <h2 id="pushes-title">Pushes</h2>
+        <span id="pushes-note" class="muted"></span>
+      </div>
+      <div id="pushes"></div>
+    </section>
+
+    <section class="block" aria-labelledby="tenants-title">
+      <div class="section-head">
+        <h2 id="tenants-title">Tenants</h2>
+      </div>
+      <div id="tenants"></div>
+    </section>
+
+    <section class="block" aria-labelledby="storage-title">
+      <div class="section-head">
+        <h2 id="storage-title">Storage</h2>
+        <span id="storage-note" class="muted"></span>
+      </div>
+      <div id="storage" class="panel"></div>
+    </section>
+  </div>
+</main>
+
+<!-- Pure functions: no DOM access, so tests can run this block on its own. -->
+<script id="lore-admin-pure">
+var TOKEN_NAME = 'lore.admin';
+var FAST_POLL_MS = 3000;
+var SLOW_POLL_MS = 30000;
+
+// Session storage can throw (blocked cookies, private mode), so every access is guarded.
+function loadToken() {
+  try {
+    return sessionStorage.getItem(TOKEN_NAME) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function saveToken(value) {
+  try {
+    if (value) {
+      sessionStorage.setItem(TOKEN_NAME, value);
+    } else {
+      sessionStorage.removeItem(TOKEN_NAME);
+    }
+  } catch (e) {
+    // Storage is unavailable: the token just lasts for this page view.
+  }
+}
+
+// The message for a failed request: the server's own `error`, or something sensible when the
+// body is not JSON.
+function errorMessage(status, bodyText) {
+  var parsed = null;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch (e) {
+    parsed = null;
+  }
+  var error = parsed && typeof parsed.error === 'string' ? parsed.error : '';
+  if (status === 401) return 'Wrong or missing admin token';
+  if (status === 403 && error === 'admin API disabled') {
+    return 'The admin API is off on this server: set LORE_ADMIN_TOKEN to turn it on';
+  }
+  if (error) return error;
+  var snippet = String(bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return 'Request failed (HTTP ' + status + ')' + (snippet ? ': ' + snippet : '');
+}
+
+// 1234567 -> "1,234,567", whatever the browser's locale.
+function formatCount(n) {
+  if (typeof n !== 'number' || !isFinite(n)) return '0';
+  return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function plural(n, one, many) {
+  return formatCount(n) + ' ' + (n === 1 ? one : many);
+}
+
+function shortSha(sha) {
+  return typeof sha === 'string' ? sha.slice(0, 7) : '';
+}
+
+// The commit column of a source: only repos have one.
+function commitText(source) {
+  if (source.indexed_commit) return shortSha(source.indexed_commit);
+  return source.kind === 'repo' ? 'not indexed' : '';
+}
+
+function parseTime(iso) {
+  if (typeof iso !== 'string') return null;
+  var t = Date.parse(iso);
+  return isNaN(t) ? null : t;
+}
+
+// How long before `nowIso` (the server's clock) `iso` was: "just now", "42 s ago", "5 min ago".
+function ago(iso, nowIso) {
+  var t = parseTime(iso);
+  var now = parseTime(nowIso);
+  if (t === null || now === null) return '';
+  var s = Math.max(0, Math.floor((now - t) / 1000));
+  if (s < 5) return 'just now';
+  if (s < 60) return s + ' s ago';
+  var m = Math.floor(s / 60);
+  if (m < 60) return m + ' min ago';
+  var h = Math.floor(m / 60);
+  if (h < 48) return h + ' h ago';
+  return Math.floor(h / 24) + ' days ago';
+}
+
+// 1536 -> "1.5 KiB", in powers of 1024 like the rest of lore's docs.
+function formatBytes(n) {
+  if (typeof n !== 'number' || !isFinite(n) || n < 0) return '';
+  var units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  var i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i += 1;
+  }
+  return (i === 0 ? String(Math.round(n)) : n.toFixed(n < 10 ? 1 : 0)) + ' ' + units[i];
+}
+
+// "8.4 s", "2 min 14 s", "1 h 3 min".
+function formatDuration(ms) {
+  if (ms < 60000) return (Math.max(0, ms) / 1000).toFixed(1) + ' s';
+  var s = Math.floor(ms / 1000);
+  var m = Math.floor(s / 60);
+  if (m < 60) return m + ' min ' + (s % 60) + ' s';
+  return Math.floor(m / 60) + ' h ' + (m % 60) + ' min';
+}
+
+// Local date and time, "2026-11-03 14:05".
+function formatDate(iso) {
+  var t = parseTime(iso);
+  if (t === null) return '';
+  var d = new Date(t);
+  function two(n) { return (n < 10 ? '0' : '') + n; }
+  return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' +
+    two(d.getHours()) + ':' + two(d.getMinutes());
+}
+
+function isRunning(push) {
+  return !!push && push.state !== 'done' && push.state !== 'failed';
+}
+
+function anyRunning(list) {
+  return !!list && Array.isArray(list.running) && list.running.length > 0;
+}
+
+// Every few seconds while a push runs, otherwise now and then to notice a new one.
+function pollDelay(list) {
+  return anyRunning(list) ? FAST_POLL_MS : SLOW_POLL_MS;
+}
+
+// True when a push that was running in `before` is not running in `after`: the counts changed.
+function pushEnded(before, after) {
+  if (!before || !Array.isArray(before.running)) return false;
+  var still = {};
+  (after && Array.isArray(after.running) ? after.running : []).forEach(function (p) {
+    still['p' + p.id] = true;
+  });
+  return before.running.some(function (p) { return !still['p' + p.id]; });
+}
+
+// What a push is doing, or how many files it went through.
+function progressText(p) {
+  switch (p.state) {
+    case 'waiting':
+      return 'waiting for another push to this source';
+    case 'fetching':
+      return 'fetching the bundle';
+    case 'indexing':
+      return typeof p.files_total === 'number'
+        ? formatCount(p.files_done) + ' of ' + plural(p.files_total, 'file', 'files')
+        : 'indexing';
+    case 'done':
+      return plural(p.files_done, 'file', 'files');
+    case 'failed':
+      return p.error || 'failed';
+    default:
+      return String(p.state || '');
+  }
+}
+
+// 0 to 1, or null while the number of files is not known yet.
+function progressFraction(p) {
+  if (p.state === 'done') return 1;
+  if (typeof p.files_total !== 'number') return null;
+  if (p.files_total === 0) return 1;
+  return Math.min(1, p.files_done / p.files_total);
+}
+
+function stateClass(p) {
+  if (p.state === 'done') return 'ok';
+  if (p.state === 'failed') return 'bad';
+  return p.state === 'waiting' ? 'off' : 'run';
+}
+
+function pushTitle(p) {
+  return (p.tenant || 'deleted tenant') + ' / ' + p.source;
+}
+
+// How much embedding a push did: new vectors, vectors kept from before, and the time it took.
+function embedText(p) {
+  if (!p.chunks) return 'none';
+  var embedded = p.chunks_embedded || 0;
+  var reused = p.chunks - embedded;
+  return formatCount(embedded) + ' new' + (reused > 0 ? ', ' + formatCount(reused) + ' reused' : '') +
+    ' in ' + formatDuration(p.embed_ms || 0);
+}
+
+// "took 1 min 40 s" for a push that ended, "running for 12 s" for one that runs.
+function pushTiming(p, nowIso) {
+  var start = parseTime(p.started_at);
+  var end = p.finished_at ? parseTime(p.finished_at) : parseTime(nowIso);
+  if (start === null || end === null) return '';
+  return (p.finished_at ? 'took ' : 'running for ') + formatDuration(end - start);
+}
+
+// The scopes ticked in the new key form, in the server's order; null when none is.
+function scopesFrom(read, ingest) {
+  var scopes = [];
+  if (ingest) scopes.push('ingest');
+  if (read) scopes.push('read');
+  return scopes.length ? scopes : null;
+}
+
+function keyActive(k) {
+  return !k.revoked_at;
+}
+
+// "2 sources · 1,234 documents · 9,876 chunks · 1 active key"
+function tenantSummary(t) {
+  var sources = Array.isArray(t.sources) ? t.sources : [];
+  var keys = Array.isArray(t.keys) ? t.keys : [];
+  var documents = 0;
+  var chunks = 0;
+  sources.forEach(function (s) {
+    documents += s.documents || 0;
+    chunks += s.chunks || 0;
+  });
+  return [
+    plural(sources.length, 'source', 'sources'),
+    plural(documents, 'document', 'documents'),
+    plural(chunks, 'chunk', 'chunks'),
+    plural(keys.filter(keyActive).length, 'active key', 'active keys')
+  ].join(' · ');
+}
+
+function modelText(m) {
+  if (!m || !m.model) return '';
+  return m.effort ? m.model + ' (' + m.effort + ' effort)' : m.model;
+}
+
+// The server facts as [label, value] pairs, in the order they are shown. Memory is known on
+// Linux only and is left out elsewhere.
+function serverFacts(s) {
+  var models = s.models || {};
+  var memory = s.memory || {};
+  var deep = Array.isArray(s.modes) && s.modes.indexOf('deep') !== -1;
+  var facts = [
+    ['Version', s.version || ''],
+    ['Embedder', s.embedder || ''],
+    ['Model provider', s.llm || ''],
+    ['Fast answers', modelText(models.fast)],
+    ['Deep answers', deep ? modelText(models.deep) : 'off']
+  ];
+  if (typeof memory.rss_bytes === 'number') facts.push(['Memory', formatBytes(memory.rss_bytes)]);
+  if (typeof memory.peak_rss_bytes === 'number') {
+    facts.push(['Peak memory', formatBytes(memory.peak_rss_bytes)]);
+  }
+  return facts.concat([
+    ['Tenants', formatCount(s.tenants)],
+    ['Sources', formatCount(s.sources)],
+    ['Documents', formatCount(s.documents)],
+    ['Chunks', formatCount(s.chunks)]
+  ]);
+}
+
+// "Database 1.2 GiB · repos on disk 340 MiB"
+function storageSummary(st) {
+  return 'Database ' + formatBytes(st.database_bytes) + ' · repos on disk ' + formatBytes(st.repos_bytes);
+}
+
+// What an index is for, from its access method.
+function indexKind(method) {
+  if (method === 'hnsw') return 'vectors (hnsw)';
+  if (method === 'gin') return 'full-text (gin)';
+  return method || '';
+}
+
+function keysUrl(tenantId) {
+  return '/v1/admin/tenants/' + encodeURIComponent(tenantId) + '/keys';
+}
+
+function revokeUrl(keyId) {
+  return '/v1/admin/keys/' + encodeURIComponent(keyId);
+}
+</script>
+
+<script>
+(function () {
+  var tokenForm = document.getElementById('token-form');
+  var tokenInput = document.getElementById('token');
+  var forgetButton = document.getElementById('forget');
+  var refreshButton = document.getElementById('refresh');
+  var statusEl = document.getElementById('status');
+  var contentEl = document.getElementById('content');
+  var factsEl = document.getElementById('facts');
+  var storageEl = document.getElementById('storage');
+  var storageNote = document.getElementById('storage-note');
+  var pushesEl = document.getElementById('pushes');
+  var pushesNote = document.getElementById('pushes-note');
+  var tenantsEl = document.getElementById('tenants');
+
+  var token = loadToken();
+  var overview = null;
+  var pushes = null;
+  var pollTimer = null;
+  // Bumped on every open and forget, so answers to an older token are dropped.
+  var generation = 0;
+  // What the operator is doing: the key shown once, the key being revoked, the ticked scopes.
+  var ui = { reveal: null, confirm: null, scopes: {} };
+
+  tokenInput.value = token;
+
+  function el(tag, className, text) {
+    var e = document.createElement(tag);
+    if (className) e.className = className;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+
+  function button(label, className, onClick) {
+    var b = el('button', className, label);
+    b.type = 'button';
+    if (onClick) b.addEventListener('click', onClick);
+    return b;
+  }
+
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = isError ? 'error' : '';
+  }
+
+  // Calls the admin API. Resolves to the parsed body (null when empty); rejects with an Error
+  // whose message is ready to show and whose `status` is the HTTP status.
+  function api(method, path, body) {
+    var headers = { 'Authorization': 'Bearer ' + token };
+    var init = { method: method, headers: headers, cache: 'no-store' };
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    return fetch(path, init).then(function (r) {
+      return r.text().then(function (text) {
+        if (!r.ok) {
+          var err = new Error(errorMessage(r.status, text));
+          err.status = r.status;
+          throw err;
+        }
+        if (!text) return null;
+        try {
+          return JSON.parse(text);
+        } catch (e) {
+          throw new Error('The server sent a reply this page cannot read');
+        }
+      });
+    }, function (e) {
+      throw new Error('Could not reach the server: ' + (e && e.message ? e.message : e));
+    });
+  }
+
+  function isAuthError(e) {
+    return !!e && (e.status === 401 || e.status === 403);
+  }
+
+  function stopPolling() {
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function close(message, isError) {
+    stopPolling();
+    generation += 1;
+    overview = null;
+    pushes = null;
+    ui = { reveal: null, confirm: null, scopes: {} };
+    contentEl.hidden = true;
+    factsEl.textContent = '';
+    storageEl.textContent = '';
+    storageNote.textContent = '';
+    pushesEl.textContent = '';
+    tenantsEl.textContent = '';
+    setStatus(message || '', isError);
+  }
+
+  // A wrong token closes the view; anything else is shown and the view stays.
+  function failed(e) {
+    if (isAuthError(e)) {
+      saveToken('');
+      close(e.message, true);
+      return;
+    }
+    setStatus(e && e.message ? e.message : String(e), true);
+  }
+
+  function timeCell(iso, nowIso) {
+    if (!iso) return '';
+    var span = el('span', null, ago(iso, nowIso));
+    span.title = formatDate(iso);
+    return span;
+  }
+
+  // A table whose rows are arrays of strings or nodes. Each cell carries its column label, which
+  // the phone layout shows in front of the value.
+  function table(columns, rows) {
+    var wrap = el('div', 'table-wrap');
+    var tbl = el('table');
+    var head = el('tr');
+    columns.forEach(function (c) {
+      var th = el('th', c.cls, c.label);
+      th.scope = 'col';
+      head.appendChild(th);
+    });
+    var thead = el('thead');
+    thead.appendChild(head);
+    tbl.appendChild(thead);
+    var tbody = el('tbody');
+    rows.forEach(function (row) {
+      var tr = el('tr');
+      columns.forEach(function (c, i) {
+        var td = el('td', c.cls);
+        td.setAttribute('data-label', c.label);
+        var v = row[i];
+        if (v && typeof v === 'object' && v.nodeType) {
+          td.appendChild(v);
+        } else {
+          td.textContent = v === null || v === undefined ? '' : String(v);
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    tbl.appendChild(tbody);
+    wrap.appendChild(tbl);
+    return wrap;
+  }
+
+  function renderFacts() {
+    factsEl.textContent = '';
+    serverFacts(overview.server || {}).forEach(function (pair) {
+      var div = el('div');
+      div.appendChild(el('dt', null, pair[0]));
+      div.appendChild(el('dd', null, pair[1]));
+      factsEl.appendChild(div);
+    });
+  }
+
+  function renderStorage() {
+    storageEl.textContent = '';
+    var st = overview.storage || {};
+    storageNote.textContent = storageSummary(st);
+    var tables = Array.isArray(st.tables) ? st.tables : [];
+    var indexes = Array.isArray(st.indexes) ? st.indexes : [];
+    storageEl.appendChild(el('h4', null, 'Tables'));
+    storageEl.appendChild(table(
+      [
+        { label: 'Table', cls: 'mono' },
+        { label: 'Rows (estimate)', cls: 'num' },
+        { label: 'Data', cls: 'num' },
+        { label: 'Indexes', cls: 'num' },
+        { label: 'Total', cls: 'num' }
+      ],
+      tables.map(function (t) {
+        return [
+          t.name,
+          typeof t.rows_estimate === 'number' ? formatCount(t.rows_estimate) : 'not analyzed yet',
+          formatBytes(t.data_bytes),
+          formatBytes(t.index_bytes),
+          formatBytes(t.total_bytes)
+        ];
+      })
+    ));
+    // Indexes are many and mostly small, so they stay folded until asked for.
+    var folded = el('details');
+    folded.appendChild(el('summary', null, plural(indexes.length, 'index', 'indexes')));
+    storageEl.appendChild(folded);
+    folded.appendChild(table(
+      [
+        { label: 'Index', cls: 'mono' },
+        { label: 'Table', cls: 'mono' },
+        { label: 'Kind' },
+        { label: 'Size', cls: 'num' }
+      ],
+      indexes.map(function (i) {
+        return [i.name, i.table, indexKind(i.method), formatBytes(i.bytes)];
+      })
+    ));
+  }
+
+  function progressCell(p) {
+    var box = el('div', 'progress');
+    var fraction = progressFraction(p);
+    var cls = stateClass(p);
+    var bar = el('div', 'bar' + (fraction === null ? ' busy' : '') + (cls === 'ok' || cls === 'bad' ? ' ' + cls : ''));
+    var fill = el('span');
+    if (fraction !== null) fill.style.width = (fraction * 100).toFixed(1) + '%';
+    bar.appendChild(fill);
+    bar.setAttribute('role', 'progressbar');
+    bar.setAttribute('aria-label', 'Push progress');
+    if (fraction !== null) {
+      bar.setAttribute('aria-valuemin', '0');
+      bar.setAttribute('aria-valuemax', '100');
+      bar.setAttribute('aria-valuenow', String(Math.round(fraction * 100)));
+    }
+    box.appendChild(bar);
+    box.appendChild(el('div', p.state === 'failed' ? 'failed-text' : null, progressText(p)));
+    return box;
+  }
+
+  function renderPushes() {
+    pushesEl.textContent = '';
+    var list = pushes || {};
+    var running = Array.isArray(list.running) ? list.running : [];
+    var recent = Array.isArray(list.recent) ? list.recent : [];
+    var since = ago(list.since, list.now);
+    pushesNote.textContent = running.length
+      ? plural(running.length, 'push', 'pushes') + ' running, refreshing every ' + (FAST_POLL_MS / 1000) + ' s'
+      : 'Server started ' + since;
+    var all = running.concat(recent);
+    if (!all.length) {
+      pushesEl.className = '';
+      pushesEl.appendChild(el('p', 'empty', 'No repo pushes since the server started ' + since + '.'));
+      return;
+    }
+    pushesEl.className = 'pushes';
+    pushesEl.appendChild(table(
+      [
+        { label: 'Source' },
+        { label: 'Commit', cls: 'mono' },
+        { label: 'State' },
+        { label: 'Progress' },
+        { label: 'Chunks', cls: 'num' },
+        { label: 'Embedded' },
+        { label: 'Started' },
+        { label: 'Time' }
+      ],
+      all.map(function (p) {
+        var commit = el('span', null, shortSha(p.commit) + (p.full ? ' full' : ''));
+        commit.title = p.commit;
+        return [
+          pushTitle(p),
+          commit,
+          el('span', 'badge ' + stateClass(p), p.state),
+          progressCell(p),
+          formatCount(p.chunks),
+          embedText(p),
+          timeCell(p.started_at, list.now),
+          pushTiming(p, list.now)
+        ];
+      })
+    ));
+  }
+
+  function keyStatusCell(k, nowIso) {
+    if (keyActive(k)) return el('span', 'badge ok', 'active');
+    var span = el('span', 'badge off', 'revoked ' + ago(k.revoked_at, nowIso));
+    span.title = formatDate(k.revoked_at);
+    return span;
+  }
+
+  function revokeCell(k) {
+    if (!keyActive(k)) return '';
+    if (ui.confirm !== k.id) {
+      var start = button('Revoke', 'secondary small', function () {
+        ui.confirm = k.id;
+        renderTenants();
+        var yes = document.getElementById('confirm-revoke');
+        if (yes) yes.focus();
+      });
+      start.setAttribute('aria-label', 'Revoke key ' + k.prefix);
+      return start;
+    }
+    var box = el('div', 'confirm');
+    box.appendChild(el('span', null, 'Revoke ' + k.prefix + '? Clients using it stop at once.'));
+    var yes = button('Revoke', 'danger small');
+    var no = button('Cancel', 'secondary small', function () {
+      ui.confirm = null;
+      renderTenants();
+    });
+    yes.id = 'confirm-revoke';
+    yes.addEventListener('click', function () {
+      yes.disabled = true;
+      no.disabled = true;
+      var gen = generation;
+      api('DELETE', revokeUrl(k.id))
+        .then(function () {
+          if (gen !== generation) return null;
+          ui.confirm = null;
+          setStatus('Revoked ' + k.prefix, false);
+          return loadOverview(gen);
+        })
+        .catch(function (e) {
+          if (gen !== generation) return;
+          failed(e);
+          if (overview) renderTenants();
+        });
+    });
+    box.appendChild(yes);
+    box.appendChild(no);
+    return box;
+  }
+
+  function newKeyForm(t) {
+    var form = el('form', 'new-key');
+    form.setAttribute('autocomplete', 'off');
+    var scopes = ui.scopes[t.id] || { read: true, ingest: true };
+    ui.scopes[t.id] = scopes;
+    ['read', 'ingest'].forEach(function (name) {
+      var label = el('label');
+      var box = el('input');
+      box.type = 'checkbox';
+      box.name = name;
+      box.checked = scopes[name];
+      box.addEventListener('change', function () { scopes[name] = box.checked; });
+      label.appendChild(box);
+      label.appendChild(document.createTextNode(' ' + name));
+      form.appendChild(label);
+    });
+    var create = el('button', 'small', 'Create key');
+    create.type = 'submit';
+    form.appendChild(create);
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var picked = scopesFrom(scopes.read, scopes.ingest);
+      if (!picked) {
+        setStatus('Pick at least one scope for the new key', true);
+        return;
+      }
+      create.disabled = true;
+      var gen = generation;
+      api('POST', keysUrl(t.id), { scopes: picked })
+        .then(function (res) {
+          if (gen !== generation) return null;
+          if (!res || typeof res.key !== 'string') {
+            throw new Error('The server sent a reply this page cannot read');
+          }
+          ui.reveal = { tenantId: t.id, key: res.key, scopes: res.scopes || picked };
+          ui.confirm = null;
+          setStatus('', false);
+          renderTenants();
+          return loadOverview(gen);
+        })
+        .then(function () {
+          var input = document.getElementById('new-key');
+          if (input) input.focus();
+        })
+        .catch(function (e) {
+          create.disabled = false;
+          if (gen === generation) failed(e);
+        });
+    });
+    return form;
+  }
+
+  function copyKey(input, copy) {
+    function copied() { copy.textContent = 'Copied'; }
+    function bySelection() {
+      input.focus();
+      input.select();
+      var ok = false;
+      try {
+        ok = document.execCommand('copy');
+      } catch (e) {
+        ok = false;
+      }
+      if (ok) {
+        copied();
+      } else {
+        copy.textContent = 'Selected: copy it';
+      }
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(input.value).then(copied, bySelection);
+    } else {
+      bySelection();
+    }
+  }
+
+  function revealBox(t) {
+    var box = el('div', 'reveal');
+    box.setAttribute('role', 'region');
+    box.setAttribute('aria-label', 'New key');
+    box.appendChild(el('p', null, 'New ' + ui.reveal.scopes.join(' and ') + ' key for ' + t.name + '. It is shown once: copy it now, lore keeps only its hash.'));
+    var row = el('div', 'inline');
+    var input = el('input');
+    input.type = 'text';
+    input.id = 'new-key';
+    input.readOnly = true;
+    input.spellcheck = false;
+    input.value = ui.reveal.key;
+    input.setAttribute('aria-label', 'New API key');
+    input.addEventListener('focus', function () { input.select(); });
+    var copy = button('Copy', 'small');
+    copy.addEventListener('click', function () { copyKey(input, copy); });
+    var done = button('Done', 'secondary small', function () {
+      ui.reveal = null;
+      renderTenants();
+    });
+    row.appendChild(input);
+    row.appendChild(copy);
+    row.appendChild(done);
+    box.appendChild(row);
+    return box;
+  }
+
+  function tenantCard(t, nowIso) {
+    var card = el('section', 'card');
+    card.setAttribute('aria-label', 'Tenant ' + t.name);
+    var head = el('div', 'card-head');
+    head.appendChild(el('h3', null, t.name));
+    head.appendChild(el('span', 'mono', t.id));
+    card.appendChild(head);
+    card.appendChild(el('p', 'muted', 'Created ' + formatDate(t.created_at) + ' · ' + tenantSummary(t)));
+
+    var sources = Array.isArray(t.sources) ? t.sources : [];
+    card.appendChild(el('h4', null, 'Sources'));
+    if (sources.length) {
+      card.appendChild(table(
+        [
+          { label: 'Name' },
+          { label: 'Kind' },
+          { label: 'Indexed commit', cls: 'mono' },
+          { label: 'Documents', cls: 'num' },
+          { label: 'Chunks', cls: 'num' },
+          { label: 'On disk', cls: 'num' },
+          { label: 'Last indexed' }
+        ],
+        sources.map(function (s) {
+          var commit = el('span', null, commitText(s));
+          if (s.indexed_commit) commit.title = s.indexed_commit;
+          return [
+            s.name,
+            s.kind,
+            commit,
+            formatCount(s.documents),
+            formatCount(s.chunks),
+            formatBytes(s.disk_bytes),
+            timeCell(s.last_indexed_at, nowIso)
+          ];
+        })
+      ));
+    } else {
+      card.appendChild(el('p', 'empty', 'No sources yet.'));
+    }
+
+    var keys = Array.isArray(t.keys) ? t.keys : [];
+    card.appendChild(el('h4', null, 'Keys'));
+    if (keys.length) {
+      card.appendChild(table(
+        [
+          { label: 'Prefix', cls: 'mono' },
+          { label: 'Scopes' },
+          { label: 'Created' },
+          { label: 'Status' },
+          { label: '', cls: 'action' }
+        ],
+        keys.map(function (k) {
+          return [
+            k.prefix,
+            (k.scopes || []).join(', '),
+            timeCell(k.created_at, nowIso),
+            keyStatusCell(k, nowIso),
+            revokeCell(k)
+          ];
+        })
+      ));
+    } else {
+      card.appendChild(el('p', 'empty', 'No keys yet.'));
+    }
+    card.appendChild(newKeyForm(t));
+    if (ui.reveal && ui.reveal.tenantId === t.id) card.appendChild(revealBox(t));
+    return card;
+  }
+
+  function renderTenants() {
+    tenantsEl.textContent = '';
+    var tenants = overview && Array.isArray(overview.tenants) ? overview.tenants : [];
+    if (!tenants.length) {
+      tenantsEl.appendChild(el('p', 'empty', 'No tenants yet. Create one with lore admin tenant create --name <name>.'));
+      return;
+    }
+    tenants.forEach(function (t) { tenantsEl.appendChild(tenantCard(t, overview.now)); });
+  }
+
+  function loadOverview(gen) {
+    return api('GET', '/v1/admin/overview').then(function (res) {
+      if (gen !== generation) return;
+      overview = res || {};
+      renderFacts();
+      renderStorage();
+      renderTenants();
+    });
+  }
+
+  function loadPushes(gen) {
+    return api('GET', '/v1/admin/pushes').then(function (res) {
+      if (gen !== generation) return null;
+      var ended = pushEnded(pushes, res);
+      pushes = res || {};
+      renderPushes();
+      // A push that ended changed the counts.
+      return ended ? loadOverview(gen) : null;
+    });
+  }
+
+  function schedule(gen) {
+    stopPolling();
+    pollTimer = setTimeout(function () { poll(gen); }, pollDelay(pushes));
+  }
+
+  function poll(gen) {
+    pollTimer = null;
+    if (gen !== generation) return;
+    // A hidden tab asks again later; showing the tab again asks at once.
+    if (document.hidden) {
+      schedule(gen);
+      return;
+    }
+    loadPushes(gen).then(function () {
+      if (gen === generation) schedule(gen);
+    }, function (e) {
+      if (gen !== generation) return;
+      failed(e);
+      if (!isAuthError(e)) schedule(gen);
+    });
+  }
+
+  function open() {
+    token = tokenInput.value.trim();
+    if (!token) {
+      setStatus('Paste the admin token first', true);
+      return;
+    }
+    saveToken(token);
+    stopPolling();
+    generation += 1;
+    var gen = generation;
+    setStatus('Loading…', false);
+    Promise.all([loadOverview(gen), loadPushes(gen)]).then(function () {
+      if (gen !== generation) return;
+      setStatus('', false);
+      contentEl.hidden = false;
+      schedule(gen);
+    }, function (e) {
+      if (gen === generation) failed(e);
+    });
+  }
+
+  tokenForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    open();
+  });
+  forgetButton.addEventListener('click', function () {
+    token = '';
+    tokenInput.value = '';
+    saveToken('');
+    close('Token forgotten', false);
+  });
+  refreshButton.addEventListener('click', function () {
+    if (!overview) return;
+    var gen = generation;
+    refreshButton.disabled = true;
+    Promise.all([loadOverview(gen), loadPushes(gen)]).then(function () {
+      refreshButton.disabled = false;
+      if (gen === generation) {
+        setStatus('', false);
+        schedule(gen);
+      }
+    }, function (e) {
+      refreshButton.disabled = false;
+      if (gen === generation) failed(e);
+    });
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && overview && pollTimer !== null) {
+      stopPolling();
+      poll(generation);
+    }
+  });
+
+  if (token) open();
+})();
+</script>
+</body>
+</html>

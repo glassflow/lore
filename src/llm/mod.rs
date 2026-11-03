@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use serde::Serialize;
 
 use crate::config::{Config, LlmKind};
 
@@ -116,14 +117,14 @@ pub trait Llm: Send + Sync {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModeModel {
     pub model: String,
     pub effort: Option<String>,
 }
 
 /// The model and effort each answer mode uses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Models {
     pub fast: ModeModel,
     pub deep: ModeModel,

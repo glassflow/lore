@@ -28,9 +28,13 @@ use crate::chunk::{CHUNKER_VERSION, Language, chunk_file, language_for};
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::store::{
-    NewDocument, Source, delete_document, document_hash, get_source, index_text, list_external_ids,
-    set_indexed_commit,
+    IndexStats, NewDocument, Source, delete_document, document_hash, get_source,
+    index_text_with_stats, list_external_ids, set_indexed_commit,
 };
+
+pub mod progress;
+
+use progress::PushHandle;
 
 /// Files bigger than this are not indexed.
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -237,6 +241,44 @@ impl RepoPaths {
     }
 }
 
+/// The bytes each repo source takes on disk (its mirror and checkout), by source id, from the
+/// directories under `<data_dir>/repos`. Blocking: it walks every file, so call it off the
+/// async runtime. Unreadable entries are skipped, and a missing directory gives an empty map.
+pub fn disk_usage(data_dir: &Path) -> HashMap<Uuid, u64> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("repos")) else {
+        return HashMap::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let id: Uuid = e.file_name().to_str()?.parse().ok()?;
+            Some((id, dir_bytes(&e.path())))
+        })
+        .collect()
+}
+
+/// The total length of the files under `dir`. Symlinks are counted as links, never followed.
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 /// True for exactly 40 lowercase hex characters.
 pub fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -248,6 +290,9 @@ pub fn is_full_sha(s: &str) -> bool {
 /// `full` (or a source never indexed before) indexes every file of the tree and deletes the
 /// documents of paths that are gone or skipped. Otherwise only the diff from the last indexed
 /// commit is processed. A per-source lock is held for the whole call.
+///
+/// Once the request is checked, the push is registered in `state.pushes`, which tracks its
+/// progress for the admin page and records how it ended.
 pub async fn ingest_bundle(
     state: &AppState,
     source: &Source,
@@ -270,8 +315,38 @@ pub async fn ingest_bundle(
         .to_str()
         .ok_or_else(|| anyhow!("bundle path is not valid UTF-8"))?;
 
+    let push = state.pushes.start(source, expected_ref, full);
+    let result = ingest_locked(state, source, bundle_arg, expected_ref, full, &push).await;
+    match &result {
+        Ok(report) => push.done(report),
+        Err(e) => push.failed(&push_error(e)),
+    }
+    result
+}
+
+/// How a failed push reads on the admin page. An internal error stays in the server log, as it
+/// does for the HTTP response.
+fn push_error(e: &IngestError) -> String {
+    match e {
+        IngestError::NeedFull => "need a full bundle (the CLI sends one next)".to_string(),
+        IngestError::BadRequest(m) => m.clone(),
+        IngestError::Other(_) => "internal error (see the server log)".to_string(),
+    }
+}
+
+/// The body of [`ingest_bundle`]: takes the source's lock, then fetches and indexes, reporting
+/// each step to `push`.
+async fn ingest_locked(
+    state: &AppState,
+    source: &Source,
+    bundle_arg: &str,
+    expected_ref: &str,
+    full: bool,
+    push: &PushHandle,
+) -> Result<IndexReport, IngestError> {
     let lock = state.source_locks.get(source.id);
     let _guard = lock.lock().await;
+    push.fetching();
 
     // The caller read the source before waiting for the lock, so the last indexed commit may
     // have moved since.
@@ -311,14 +386,18 @@ pub async fn ingest_bundle(
             chunks: 0,
         },
         kept: HashSet::new(),
+        totals: IndexStats::default(),
     };
+    push.indexing(changes.upserts.len() + changes.deleted.len(), full_mode);
     for entry in &changes.upserts {
         job.index_entry(entry).await?;
+        push.file_done(&job.totals);
     }
     for path in &changes.deleted {
         if job.delete_doc(path).await? {
             job.report.files_deleted += 1;
         }
+        push.file_done(&job.totals);
     }
     if full_mode {
         job.delete_vanished().await?;
@@ -641,6 +720,8 @@ struct Job<'a> {
     report: IndexReport,
     /// Paths whose document is up to date (full mode only uses it, to find vanished documents).
     kept: HashSet<String>,
+    /// Chunks written and embedded so far, and the time spent embedding, for the push's progress.
+    totals: IndexStats,
 }
 
 impl Job<'_> {
@@ -704,7 +785,7 @@ impl Job<'_> {
             body: None,
         };
         let chunks = chunk_file(path, &content);
-        let n = index_text(
+        let stats = index_text_with_stats(
             self.state,
             self.source.tenant_id,
             self.source,
@@ -714,7 +795,10 @@ impl Job<'_> {
         )
         .await?;
         self.report.files_indexed += 1;
-        self.report.chunks += n;
+        self.report.chunks += stats.chunks;
+        self.totals.chunks += stats.chunks;
+        self.totals.embedded += stats.embedded;
+        self.totals.embed_time += stats.embed_time;
         self.kept.insert(path.to_string());
         Ok(())
     }
@@ -980,6 +1064,33 @@ mod tests {
             .expect("diff");
         assert_eq!(gone.deleted, ["zz.rs"]);
         assert_eq!(gone.skipped_paths, 0);
+    }
+
+    #[test]
+    fn disk_usage_sums_each_repo_directory() {
+        let data = tempfile::tempdir().expect("temp dir");
+        assert!(disk_usage(data.path()).is_empty());
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let repos = data.path().join("repos");
+        std::fs::create_dir_all(repos.join(a.to_string()).join("checkout/src")).unwrap();
+        std::fs::write(repos.join(a.to_string()).join("HEAD"), "abc").unwrap();
+        std::fs::write(repos.join(a.to_string()).join("checkout/src/x.rs"), "12345").unwrap();
+        std::fs::create_dir_all(repos.join(b.to_string())).unwrap();
+        std::fs::create_dir_all(repos.join("not-a-source")).unwrap();
+        std::fs::write(repos.join("not-a-source/big"), "x".repeat(10_000)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            repos.join("not-a-source"),
+            repos.join(a.to_string()).join("link"),
+        )
+        .unwrap();
+
+        let usage = disk_usage(data.path());
+        assert_eq!(usage.len(), 2);
+        // The symlink counts as itself, not as the 10,000 bytes it points at.
+        let a_bytes = usage[&a];
+        assert!((8..1000).contains(&a_bytes), "{a_bytes}");
+        assert_eq!(usage[&b], 0);
     }
 
     #[test]

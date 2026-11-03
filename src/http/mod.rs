@@ -19,6 +19,7 @@ use crate::error::AppError;
 use crate::llm::{Llm, Models};
 use crate::mcp;
 use crate::repo::SourceLocks;
+use crate::repo::progress::PushRegistry;
 use crate::web;
 
 pub mod admin;
@@ -40,6 +41,8 @@ pub struct AppState {
     pub models: Models,
     /// One lock per source, held while a bundle is ingested.
     pub source_locks: Arc<SourceLocks>,
+    /// Running and recent repo pushes, with their progress, for the admin page.
+    pub pushes: Arc<PushRegistry>,
     /// Per-tenant slots and the daily count of deep-mode questions.
     pub deep_guard: Arc<DeepGuard>,
 }
@@ -56,9 +59,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(mcp)
         .route("/", get(web::index))
+        .route("/admin", get(web::admin))
         .route("/healthz", get(healthz))
         .route("/livez", get(livez))
         .route("/v1/me", get(me::me))
+        .route("/v1/admin/overview", get(admin::overview))
+        .route("/v1/admin/pushes", get(admin::list_pushes))
         .route(
             "/v1/admin/tenants",
             post(admin::create_tenant).get(admin::list_tenants),
