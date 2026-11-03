@@ -158,6 +158,11 @@ impl SourceLocks {
 /// configuration out (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`), turns prompts off, makes
 /// pathspecs literal and forces English messages (the caller matches on stderr).
 async fn git(args: &[&str]) -> Result<Vec<u8>, GitError> {
+    git_env(args, &[]).await
+}
+
+/// [`git`] with extra environment variables, set after the defaults.
+async fn git_env(args: &[&str], envs: &[(&str, &str)]) -> Result<Vec<u8>, GitError> {
     let fail = |status: String, stderr: String| GitError {
         args: args.join(" "),
         status,
@@ -177,6 +182,7 @@ async fn git(args: &[&str]) -> Result<Vec<u8>, GitError> {
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output()
@@ -357,28 +363,43 @@ async fn ingest_locked(
     let paths = RepoPaths::new(&state.config.data_dir, source.id)?;
     ensure_mirror(&paths).await?;
     fetch_bundle(&paths, bundle_arg, expected_ref).await?;
+    index_commit(state, &source, &paths, expected_ref, full, push).await
+}
+
+/// Indexes `commit`, which the mirror already holds, and records it as the source's indexed
+/// commit. `full` (or a source never indexed before) indexes the whole tree; otherwise only the
+/// diff from the last indexed commit, which is `NeedFull` when the mirror lacks that commit.
+/// The caller holds the source's lock and passes the source as read under it.
+async fn index_commit(
+    state: &AppState,
+    source: &Source,
+    paths: &RepoPaths,
+    commit: &str,
+    full: bool,
+    push: &PushHandle,
+) -> Result<IndexReport, IngestError> {
     paths
-        .mirror_git(&["update-ref", "refs/heads/lore-indexed", expected_ref])
+        .mirror_git(&["update-ref", "refs/heads/lore-indexed", commit])
         .await?;
 
     let full_mode = full || source.indexed_commit.is_none();
     let changes = if full_mode {
-        Changes::from_tree(&paths, expected_ref).await?
+        Changes::from_tree(paths, commit).await?
     } else {
         // `indexed_commit` is only None in full mode, so it is set here.
         let indexed = source.indexed_commit.as_deref().unwrap_or_default();
-        Changes::from_diff(&paths, indexed, expected_ref).await?
+        Changes::from_diff(paths, indexed, commit).await?
     };
 
-    refresh_checkout(&paths, expected_ref).await?;
+    refresh_checkout(paths, commit).await?;
 
     let mut job = Job {
         state,
-        source: &source,
-        paths: &paths,
-        commit: expected_ref,
+        source,
+        paths,
+        commit,
         report: IndexReport {
-            indexed_commit: expected_ref.to_string(),
+            indexed_commit: commit.to_string(),
             files_indexed: 0,
             files_unchanged: 0,
             files_skipped: changes.skipped_paths,
@@ -403,7 +424,7 @@ async fn ingest_locked(
         job.delete_vanished().await?;
     }
 
-    set_indexed_commit(&state.pool, source.id, expected_ref).await?;
+    set_indexed_commit(&state.pool, source.id, commit).await?;
     Ok(job.report)
 }
 
