@@ -316,6 +316,26 @@ function commitText(source) {
   return source.kind === 'repo' ? 'not indexed' : '';
 }
 
+// The sync column of a source: how the last fetch of its remote went. Only repos have one.
+function syncText(source, nowIso) {
+  if (source.kind !== 'repo') return '';
+  if (!source.remote_url) return 'no remote';
+  if (!source.last_sync_at) return 'not synced yet';
+  var when = ago(source.last_sync_at, nowIso);
+  if (source.last_sync_error) return 'failed ' + when;
+  var at = source.last_sync_commit ? ' at ' + shortSha(source.last_sync_commit) : '';
+  return 'ok ' + when + at;
+}
+
+// The sync column's tooltip: the remote, the last synced commit and why the last sync failed.
+function syncTitle(source) {
+  return [
+    source.remote_url,
+    source.last_sync_commit ? 'commit ' + source.last_sync_commit : '',
+    source.last_sync_error || ''
+  ].filter(Boolean).join('\n');
+}
+
 function parseTime(iso) {
   if (typeof iso !== 'string') return null;
   var t = Date.parse(iso);
@@ -966,11 +986,15 @@ function revokeUrl(keyId) {
           { label: 'Documents', cls: 'num' },
           { label: 'Chunks', cls: 'num' },
           { label: 'On disk', cls: 'num' },
-          { label: 'Last indexed' }
+          { label: 'Last indexed' },
+          { label: 'Sync' }
         ],
         sources.map(function (s) {
           var commit = el('span', null, commitText(s));
           if (s.indexed_commit) commit.title = s.indexed_commit;
+          var sync = el('span', null, syncText(s, nowIso));
+          var syncTip = syncTitle(s);
+          if (syncTip) sync.title = syncTip;
           return [
             s.name,
             s.kind,
@@ -978,7 +1002,8 @@ function revokeUrl(keyId) {
             formatCount(s.documents),
             formatCount(s.chunks),
             formatBytes(s.disk_bytes),
-            timeCell(s.last_indexed_at, nowIso)
+            timeCell(s.last_indexed_at, nowIso),
+            sync
           ];
         })
       ));
