@@ -50,7 +50,7 @@ lore repo list                          # name, short indexed commit and web URL
 
 `PATH` defaults to `.` and can be any directory inside the repo. `--name` defaults to the name of the repo's top level directory.
 The first push sends the whole history. Later pushes send only the commits the server lacks, and when the server already has HEAD nothing is sent and the report is all zeros.
-If the server lost its copy, or the history was rewritten (for example after a force push), the CLI falls back to a full bundle by itself. `--full` forces one.
+If the server lost its copy, or the history was rewritten (for example after a force push), the CLI falls back to a full bundle by itself. `--full` forces one, and also chunks again every file that an older version of lore chunked differently, which a push otherwise skips as unchanged. Run it once after upgrading lore.
 Uncommitted changes are not indexed, and the CLI says so on stderr.
 `--web-url <template>` stores a URL template for links to files, for example `https://github.com/acme/app/blob/{commit}/{path}`. `repo list --json` prints the server's JSON on one line.
 
@@ -98,7 +98,7 @@ The answer is `{"hits": [...]}`, best first. A hit has `chunk_id`, `document_id`
 
 The `web_url_template` of a repo source can use `{path}`, `{commit}`, `{start}` and `{end}`, for example `https://github.com/acme/app/blob/{commit}/{path}#L{start}-L{end}`. `{path}` is percent-encoded segment by segment (the `/` between segments stays), so a space, `#`, `?` or `%` in a file name cannot change the link. Other `{...}` text is left as it is.
 
-How it ranks: the query is run twice, once against the Postgres full-text index (any query word may match, ranked with `ts_rank_cd`) and once against the pgvector embeddings (cosine distance). Each run keeps its best 50 chunks. The two lists are merged with Reciprocal Rank Fusion: a chunk scores the sum of `1 / (60 + rank)` over the lists it is in, so the score is at most about 0.033 and is only good for comparing hits of one search. Ties go to the better full-text rank, then to the lower chunk id. A query with only stop words (`the and of`) has no full-text part and is answered from the vectors alone. Identifiers such as `MaxSeatsPerPlan` are also indexed as the words `max seats per plan`, so a search for "seats" finds them.
+How it ranks: the query is run twice, once against the Postgres full-text index (any query word may match, ranked with `ts_rank_cd`) and once against the pgvector embeddings (cosine distance). Each run keeps its best 50 chunks. A third list holds the first 3 of the vector hits that define a list of values (enums, constant lists, SQL seed rows, `CHECK ... IN` lists), so "which X are there" finds the definition of X rather than only the code that uses it. The lists are merged with Reciprocal Rank Fusion: a chunk scores the sum of `1 / (60 + rank)` over the lists it is in, so the score is at most about 0.049 and is only good for comparing hits of one search. Ties go to the better full-text rank, then to the lower chunk id. A query with only stop words (`the and of`) has no full-text part and is answered from the vectors alone. Identifiers such as `MaxSeatsPerPlan` are also indexed as the words `max seats per plan`, so a search for "seats" finds them.
 
 The CLI prints, for each hit, `path:start-end  (score 0.032)  symbols` (the title when there is no path), then the first 3 snippet lines indented by 4 spaces. `--json` prints the server's JSON on one line. No hits prints `no results` on stderr and exits 0.
 
@@ -197,10 +197,14 @@ claude mcp add --transport http lore "$LORE_URL/mcp" --header "Authorization: Be
 
 Any other MCP client that speaks streamable HTTP works the same way: register `$LORE_URL/mcp` with the same `Authorization: Bearer <key>` header.
 
+The tools are written for agents. `search` runs no language model, answers in well under a second, and shows a short excerpt of each hit, so an agent can search several times without filling its context. `ask` runs lore's own model (about 5 s fast, 10 to 60 s deep) and suits a person, or an agent without the code at hand; its description says so. With lore connected and nothing else said, Claude Code still mostly uses its own Grep, so add a line to `CLAUDE.md`:
+
+> This repository is indexed in the lore MCP server. Use lore's search tool first: it returns ranked passages (path, line range and the code itself) in well under a second. Answer from those passages when they are enough, and Read a file only when they are not.
+
 | Tool | Input | Returns |
 | --- | --- | --- |
-| `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`) | One text item: a JSON array of hits with `document_id`, `path`, `start_line`, `end_line`, `kind`, `title`, `source`, `score` and `snippet` (the first 40 lines) |
-| `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop) | Two text items: the answer followed by a `Sources:` list with one line per citation, then the full `/v1/ask` response as JSON |
+| `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`), `source` | One text item, `No hits.` or one block per hit: a header `[1] <source> <path>:<start>-<end> (<kind>: <symbols>) id=<document id>` (the title in place of the path for documents without one), then at most 12 lines of the hit, numbered: the window with the most query words, or the whole hit when it is at most 15 lines. Common indentation is removed and lines are cut at 160 characters |
+| `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop), `source` | One text item: the answer, a `Sources:` list with one line per citation, and `(fast mode, <model>, 4.9 s)` (deep mode adds the number of tool calls) |
 | `get_document` | `document_id` (the id of a search hit or a citation) | The document's text under a `# <title>` header with its kind and path, cut to 100,000 characters. An unknown id, or another tenant's, is the tool error `document not found` |
 | `list_sources` | none | One text item: a JSON array of `{name, kind, indexed_commit, documents}` |
 

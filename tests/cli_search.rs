@@ -70,56 +70,44 @@ async fn plain_output_is_path_lines_score_symbols_and_three_snippet_lines(pool: 
     let env = Env::new(pool).await;
 
     let json = env.lore(&["search", "plan limits", "--json"]).await.json();
-    let top = &json["hits"][0];
-    assert_eq!(top["path"], "src/billing/plans.rs");
-    let symbols: Vec<&str> = top["symbols"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_str().unwrap())
-        .collect();
-    assert!(!symbols.is_empty());
-    let snippet: Vec<&str> = top["snippet"].as_str().unwrap().lines().collect();
+    let hits = json["hits"].as_array().unwrap();
+    assert_eq!(hits[0]["path"], "src/billing/plans.rs");
     assert!(
-        snippet.len() > 3,
-        "the snippet is longer than what is printed"
+        hits.iter()
+            .any(|h| h["snippet"].as_str().unwrap().lines().count() > 3),
+        "some snippet is longer than what is printed"
     );
 
     let out = env.lore(&["search", "plan limits"]).await;
     assert!(out.ok, "{}", out.stderr);
     assert!(out.stderr.is_empty(), "{}", out.stderr);
-    let lines: Vec<&str> = out.stdout.lines().collect();
-    assert_eq!(
-        lines[0],
-        format!(
-            "src/billing/plans.rs:{}-{}  (score {:.3})  {}",
-            top["start_line"],
-            top["end_line"],
-            top["score"].as_f64().unwrap(),
-            symbols.join(", ")
-        )
-    );
-    assert_eq!(
-        lines[0],
-        format!(
-            "src/billing/plans.rs:7-14  (score 0.033)  {}",
-            symbols.join(", ")
-        )
-    );
-    for (i, want) in snippet.iter().take(3).enumerate() {
-        assert_eq!(lines[1 + i], format!("    {want}").trim_end());
-    }
-    // The next line is the next hit's header: not indented.
-    assert!(!lines[4].starts_with(' '), "{:?}", lines[4]);
     assert!(out.stdout.ends_with('\n'));
-
-    // Each hit is a header plus at most 3 snippet lines.
-    // (A blank snippet line prints as an empty line.)
-    let headers = lines
-        .iter()
-        .filter(|l| !l.is_empty() && !l.starts_with(' '))
-        .count();
-    assert_eq!(headers, json["hits"].as_array().unwrap().len());
+    // Each hit, in order: `path:start-end  (score 0.032)  symbols`, then at most 3 snippet lines
+    // indented by 4 spaces (a blank snippet line prints as an empty line).
+    let mut lines = out.stdout.lines();
+    for hit in hits {
+        let symbols: Vec<&str> = hit["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        let mut header = format!(
+            "{}:{}-{}  (score {:.3})",
+            hit["path"].as_str().unwrap(),
+            hit["start_line"],
+            hit["end_line"],
+            hit["score"].as_f64().unwrap()
+        );
+        if !symbols.is_empty() {
+            header = format!("{header}  {}", symbols.join(", "));
+        }
+        assert_eq!(lines.next(), Some(header.as_str()));
+        for want in hit["snippet"].as_str().unwrap().lines().take(3) {
+            assert_eq!(lines.next(), Some(format!("    {want}").trim_end()));
+        }
+    }
+    assert_eq!(lines.next(), None);
 }
 
 #[sqlx::test(migrations = "./migrations")]

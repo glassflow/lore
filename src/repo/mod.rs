@@ -24,7 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::chunk::{Language, chunk_file, language_for};
+use crate::chunk::{CHUNKER_VERSION, Language, chunk_file, language_for};
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::store::{
@@ -602,6 +602,15 @@ fn path_is_skipped(path: &str) -> bool {
     SKIP_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
+/// The stored hash of a repo file: of its content and the chunker version, so that a file
+/// chunked by an older version does not count as unchanged.
+fn file_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("chunker {CHUNKER_VERSION}\n"));
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 fn language_name(lang: Language) -> &'static str {
     match lang {
         Language::Rust => "rust",
@@ -610,6 +619,7 @@ fn language_name(lang: Language) -> &'static str {
         Language::Tsx => "tsx",
         Language::JavaScript => "javascript",
         Language::Python => "python",
+        Language::Sql => "sql",
         Language::Markdown => "markdown",
         Language::Other => "text",
     }
@@ -662,7 +672,7 @@ impl Job<'_> {
             return self.skip(path).await;
         };
 
-        let content_hash = hex::encode(Sha256::digest(content.as_bytes()));
+        let content_hash = file_hash(&content);
         let known = document_hash(&self.state.pool, self.source.id, path).await?;
         if known.as_deref() == Some(content_hash.as_str()) {
             self.report.files_unchanged += 1;

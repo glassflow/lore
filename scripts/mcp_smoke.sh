@@ -123,9 +123,9 @@ main() {
   # 4. search.
   search=$(tool_call 3 search '{"query":"plan limits"}') || exit 1
   assert_jq "$search" '.result.isError != true' "search should not be a tool error"
+  # The result is text: a header per hit, `[n] <source> <path>:<start>-<end> (<kind>...) id=<uuid>`.
   line=$(printf '%s' "$search" | jq -er '.result.content[0].text' \
-    | jq -r '.[] | select(.path == "src/billing/plans.rs") | "\(.path):\(.start_line)-\(.end_line) \(.title) (\(.kind), score \(.score))"' \
-    | head -n 1)
+    | grep -m 1 -E "^\[[0-9]+\] [^ ]+ $PLANS:[0-9]+-[0-9]+ ")
   [ -n "$line" ] || fail "search for 'plan limits' should return $PLANS: ${search:0:400}"
   echo "$line"
 
@@ -134,7 +134,7 @@ main() {
   if printf '%s' "$info" | jq -e '.modes | index("deep")' >/dev/null 2>&1; then
     ask=$(tool_call 4 ask '{"question":"list every plan and its seat limit","mode":"deep"}') || exit 1
     assert_jq "$ask" '.result.isError != true' "the deep ask should not be a tool error"
-    assert_jq "$ask" '.result.content[1].text | fromjson | [.citations[].path] | index("src/billing/plans.rs") != null' \
+    assert_jq "$ask" '.result.content[0].text | contains("src/billing/plans.rs")' \
       "the deep ask should cite $PLANS"
     echo "deep ask cites $PLANS"
   else

@@ -117,7 +117,7 @@ The first start downloads the embedding model (about 130 MB). After that, search
   ```bash
   claude mcp add --transport http lore "$LORE_URL/mcp" --header "Authorization: Bearer $LORE_KEY"
   ```
-  Then tell Claude to use it, with a line in `CLAUDE.md` such as "Start with lore to find the relevant code." [Why](docs/benchmarks.md#tell-claude-to-start-with-lore).
+  Then tell Claude to use it, with a line in `CLAUDE.md` such as "Use lore's search tool first to find the relevant code." [The full line](docs/usage.md#use-lore-from-agents), and [why](docs/benchmarks.md#tell-claude-to-start-with-lore).
 - **Agent traces:** send OpenTelemetry GenAI spans to `/v1/traces`, and ask about past sessions.
 - **Notes and docs:** `lore doc put` indexes anything that isn't in a repo.
 

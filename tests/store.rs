@@ -35,6 +35,7 @@ fn chunk(text: &str, lines: (u32, u32), symbols: &[&str]) -> Chunk {
         end_line: lines.1,
         symbols: symbols.iter().map(|s| s.to_string()).collect(),
         kind: ChunkKind::Item,
+        enumerates: false,
     }
 }
 
