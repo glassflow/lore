@@ -20,9 +20,9 @@ pub struct SearchArgs {
     /// Only these document kinds, comma-separated (code, doc, session, note)
     #[arg(long, value_delimiter = ',')]
     kind: Option<Vec<String>>,
-    /// Only the source with this name
-    #[arg(long)]
-    source: Option<String>,
+    /// Only the sources with these names, comma-separated
+    #[arg(long, value_delimiter = ',')]
+    source: Vec<String>,
     /// Print the server's JSON on one line
     #[arg(long)]
     json: bool,
@@ -54,8 +54,8 @@ pub async fn run_search(client: &Client, args: SearchArgs) -> Result<()> {
     if let Some(kinds) = args.kind.filter(|k| !k.is_empty()) {
         query.push(("kind", kinds.join(",")));
     }
-    if let Some(source) = args.source {
-        query.push(("source", source));
+    if let Some(names) = crate::search::source_names(&args.source) {
+        query.push(("source", names.join(",")));
     }
     let reply: Value = client
         .get_json_query("/v1/search", Auth::Key, &query)

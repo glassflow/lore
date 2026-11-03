@@ -15,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use super::prompt::DEEP_SYSTEM;
-use super::tools::{ToolOutput, run_tool, tool_defs};
+use super::tools::{ToolOutput, run_tool_scoped, tool_defs};
 use super::{AskRequest, AskResponse, Citation, Mode, UsageOut};
 use crate::error::AppError;
 use crate::http::AppState;
@@ -123,6 +123,14 @@ impl DeepGuard {
     }
 }
 
+/// Tells the model which sources the question is limited to; the tools see no others.
+fn scope_note(names: &[String]) -> String {
+    format!(
+        "Look only in these sources; the tools see no others: {}.",
+        names.join(", ")
+    )
+}
+
 fn daily_limit_reached() -> AppError {
     AppError::TooManyRequests("daily deep-mode limit reached".to_string())
 }
@@ -153,11 +161,18 @@ pub async fn answer(
     let budget = Duration::from_secs(state.config.deep_budget_secs);
     let max_rounds = state.config.deep_max_rounds;
     let tools = tool_defs();
+    let scope = req.source_scope();
+    let mut question = vec![Block::Text {
+        text: req.question.trim().to_string(),
+    }];
+    if let Some(names) = &scope {
+        question.push(Block::Text {
+            text: scope_note(names),
+        });
+    }
     let mut messages = vec![Message {
         role: Role::User,
-        content: vec![Block::Text {
-            text: req.question.trim().to_string(),
-        }],
+        content: question,
     }];
     let mut usage = UsageOut::default();
     let mut tool_calls = 0u32;
@@ -217,11 +232,13 @@ pub async fn answer(
         }
 
         // Echo the turn exactly as the model sent it, then answer every tool call in one message.
-        let results =
-            futures::future::join_all(uses.iter().map(|(_, name, input)| {
-                timed(TOOL_TIMEOUT, run_tool(state, tenant_id, name, input))
-            }))
-            .await;
+        let results = futures::future::join_all(uses.iter().map(|(_, name, input)| {
+            timed(
+                TOOL_TIMEOUT,
+                run_tool_scoped(state, tenant_id, scope.as_deref(), name, input),
+            )
+        }))
+        .await;
         tool_calls += u32::try_from(uses.len()).unwrap_or(u32::MAX);
         messages.push(Message {
             role: Role::Assistant,

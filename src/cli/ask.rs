@@ -23,9 +23,9 @@ pub struct AskArgs {
     /// Only these document kinds, comma-separated (code, doc, session, note)
     #[arg(long, value_delimiter = ',')]
     kind: Option<Vec<String>>,
-    /// Only the source with this name
-    #[arg(long)]
-    source: Option<String>,
+    /// Only the sources with these names, comma-separated
+    #[arg(long, value_delimiter = ',')]
+    source: Vec<String>,
     /// Print the server's JSON on one line
     #[arg(long)]
     json: bool,
@@ -37,7 +37,8 @@ pub async fn run_ask(client: &Client, args: AskArgs) -> Result<()> {
         mode: args.mode,
         k: args.k,
         kind: args.kind.filter(|k| !k.is_empty()),
-        source: args.source,
+        source: None,
+        sources: crate::search::source_names(&args.source),
     };
     let reply: Value = client.post_json("/v1/ask", Auth::Key, &body).await?;
     if args.json {

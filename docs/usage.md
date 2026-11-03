@@ -85,6 +85,7 @@ curl -G localhost:8080/v1/search -H "Authorization: Bearer $LORE_KEY" \
 lore search "plan limits"                       # the same, from the CLI
 lore search "pricing plans" --kind doc --k 3
 lore search "plan limits" --source sample --json
+lore search "plan limits" --source sample,wiki    # either source
 ```
 
 | Parameter | Meaning |
@@ -92,7 +93,9 @@ lore search "plan limits" --source sample --json
 | `q` | The query. Required: a missing or blank `q` is a 400. At most 2000 characters, otherwise a 400. It cannot contain a NUL byte |
 | `k` | How many hits, default 10. Any integer is accepted and clamped to 1 to 50. Something that is not an integer is a 400 |
 | `kind` | Comma-separated document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 that lists the kinds. Empty means all |
-| `source` | Only the source with this name, whatever its kind (`repo`, `traces`, `documents`). Empty means all. A name that matches nothing gives no hits |
+| `source` | Only the sources with these comma-separated names, whatever their kind (`repo`, `traces`, `documents`). Blank names are ignored and empty means all. A name that matches nothing adds no hits |
+
+`GET /v1/sources` lists the tenant's sources for a `read` key, ordered by kind and then name: `{"sources": [{"name", "kind", "indexed_commit", "documents"}]}`. `documents` is how many documents the source holds.
 
 The answer is `{"hits": [...]}`, best first. A hit has `chunk_id`, `document_id`, `source`, `kind`, `title`, `uri`, `path`, `start_line`, `end_line` (1-based, inclusive), `symbols`, `snippet` (the first 40 lines of the chunk) and `score`. `path` is set for repo files only. `uri` is the source's `web_url_template` filled in for repo files (see below), or else the document's own URI, or null.
 
@@ -150,6 +153,7 @@ curl localhost:8080/v1/ask -H "Authorization: Bearer $LORE_KEY" -H 'content-type
   -d '{"question": "how many plans are there and what are their limits?"}'
 lore ask "how many plans are there and what are their limits?"     # the same, from the CLI
 lore ask "who owns billing?" --kind doc,note --k 8 --source sample
+lore ask "where is the retry policy?" --source api,worker          # only these two sources, in every mode
 lore ask "how many plans are there?" --json                        # the server's JSON on one line
 lore ask "how many plans are there?" --mode sources                # the sources as bullets, no model call
 ```
@@ -160,7 +164,8 @@ lore ask "how many plans are there?" --mode sources                # the sources
 | `mode` | `fast` (the default), `sources` or `deep`. `sources` calls no model (see below). `deep` runs an agent loop (see below) and is a 400 ("deep mode needs a tool-capable model provider (LORE_LLM=anthropic)") with `LORE_LLM=openai` |
 | `k` | Fast and sources mode: how many sources to retrieve, default 12, clamped to 1 to 50 |
 | `kind` | Fast and sources mode: a list of document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 |
-| `source` | Fast and sources mode: only the source with this name |
+| `source` | Only the source with this name |
+| `sources` | Only the sources with these names, a list. Combined with `source`; with neither, or only blank names, every source is used. Deep mode keeps its tools to them as well: `search` leaves other sources out, `grep` and `read_file` treat them as unknown, and `get_session` does not find sessions stored in them. Deep mode also tells the model which sources it may use |
 
 The answer is `{"answer", "mode", "model", "citations", "sources_considered", "tool_calls", "usage", "latency_ms"}`. `citations` lists the sources the answer cites with `[n]`, once each, in the order they first appear. A citation has `label` (the source number, as text), `document_id`, `kind`, `title`, `path`, `start_line`, `end_line` and `url` (the same link `/v1/search` gives as `uri`). `sources_considered` is the number of passages that went into the prompt (at most 60,000 characters of them, each cut to its first 120 lines), `tool_calls` is 0 in fast mode, and `usage` has `input_tokens` and `output_tokens`.
 
@@ -185,6 +190,8 @@ curl localhost:8080/v1/info    # {"version":"0.1.0","llm":"fake","embedder":"has
 `GET /` serves a small built-in page for asking questions, for example in a standup. It is one self-contained HTML file embedded in the binary (no build step, no CDN) and needs no key to load. Open `LORE_URL/` (`http://localhost:8080/` with `make run`), paste a `read` key and type a question. Enter sends it, Shift+Enter adds a new line.
 
 The key stays in the browser's local storage (under `lore.key`) and is sent only to this server, as `Authorization: Bearer <key>`. If the browser blocks local storage, the page still works and you paste the key again on each visit. The answer shows with numbered citations that link to the sources; a source is a link only when its URL starts with `http://` or `https://`. The `sources` option shows the sources as bullets without a model call. The `deep` option is enabled only when `GET /v1/info` lists `deep` in `modes`.
+
+When the key's tenant has two or more sources, a "Look in" checklist lists them (from `GET /v1/sources`), all ticked. Untick some to limit the question, in every mode, to the rest; the page then sends them as `sources`. With every source ticked it sends none, so a source indexed later is searched too. The unticked names stay in local storage under `lore.sources.off`, so a new source starts ticked. Asking with none ticked shows an error instead of sending.
 
 The page logic is checked by `tests/web.rs`, which also runs `tests/web_pure.js` under node when node is installed.
 

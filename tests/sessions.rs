@@ -93,7 +93,7 @@ impl Env {
                 q: q.to_string(),
                 k: 5,
                 kinds: Some(vec!["session".to_string()]),
-                source: None,
+                sources: None,
             },
         )
         .await
@@ -224,7 +224,7 @@ async fn another_tenants_session_is_not_found(pool: PgPool) {
             q: "how many plans".to_string(),
             k: 5,
             kinds: None,
-            source: None,
+            sources: None,
         },
     )
     .await

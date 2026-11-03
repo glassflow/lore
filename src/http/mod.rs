@@ -29,6 +29,7 @@ pub mod info;
 pub mod me;
 pub mod repos;
 pub mod search;
+pub mod sources;
 pub mod traces;
 
 #[derive(Clone)]
@@ -95,6 +96,7 @@ pub fn router(state: AppState) -> Router {
             delete(documents::delete_document),
         )
         .route("/v1/search", get(search::get_search))
+        .route("/v1/sources", get(sources::list_sources))
         .route("/v1/ask", post(ask::post_ask))
         .route("/v1/info", get(info::info))
         .layer(TraceLayer::new_for_http())

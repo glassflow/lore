@@ -6,7 +6,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{create_tenant_key, push_fixture, send, test_router, test_state_with};
-use lore::answer::tools::{MAX_OUTPUT_CHARS, ToolOutput, run_tool, tool_defs};
+use lore::answer::tools::{MAX_OUTPUT_CHARS, ToolOutput, run_tool, run_tool_scoped, tool_defs};
 use lore::http::AppState;
 use lore::sessions::process_due_sessions;
 use serde_json::{Value, json};
@@ -634,6 +634,64 @@ async fn get_session_text_is_cut_at_20000_chars(pool: PgPool) {
         MAX_OUTPUT_CHARS + TRUNCATED.chars().count()
     );
     assert!(text.starts_with("line of the session\n"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scoped_tools_see_only_the_named_sources(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let run = |scope: Vec<String>, name: &'static str, input: Value| {
+        let state = env.state.clone();
+        let tenant = env.tenant;
+        async move { run_tool_scoped(&state, tenant, Some(&scope), name, &input).await }
+    };
+
+    // Outside the scope, the repo is an unknown source and its sessions are not found.
+    let elsewhere = names(&["elsewhere"]);
+    let text = err(run(
+        elsewhere.clone(),
+        "read_file",
+        json!({ "source": "sample", "path": "src/billing/plans.rs" }),
+    )
+    .await);
+    assert_eq!(text, "unknown source");
+    let text = err(run(
+        elsewhere.clone(),
+        "grep",
+        json!({ "pattern": "Plan", "source": "sample" }),
+    )
+    .await);
+    assert_eq!(text, "unknown source");
+    let text = ok(run(elsewhere.clone(), "grep", json!({ "pattern": "Plan" })).await);
+    assert_eq!(text, "(0 matches)");
+    let text = ok(run(
+        elsewhere.clone(),
+        "search",
+        json!({ "query": "how many plans" }),
+    )
+    .await);
+    assert_eq!(text, "(no results)");
+    let text = err(run(
+        elsewhere,
+        "get_session",
+        json!({ "session_id": SESSION_ID }),
+    )
+    .await);
+    assert_eq!(text, "session not found");
+
+    // Scoped to the repo: its files, but not the session, which lives in the `otlp` source.
+    let repo = names(&["sample"]);
+    let text = ok(run(repo.clone(), "grep", json!({ "pattern": "enum Plan" })).await);
+    assert!(text.starts_with("sample/src/billing/plans.rs:"), "{text}");
+    let text = err(run(repo, "get_session", json!({ "session_id": SESSION_ID })).await);
+    assert_eq!(text, "session not found");
+    let text = ok(run(
+        names(&["sample", "otlp"]),
+        "get_session",
+        json!({ "session_id": SESSION_ID }),
+    )
+    .await);
+    assert!(!text.is_empty());
 }
 
 #[sqlx::test(migrations = "./migrations")]

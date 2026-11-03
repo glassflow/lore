@@ -186,7 +186,7 @@ impl LoreMcp {
             q: args.query,
             k,
             kinds: args.kind.filter(|kinds| !kinds.is_empty()),
-            source: args.source.filter(|s| !s.trim().is_empty()),
+            sources: crate::search::source_names(args.source.as_deref()),
         };
         let hits = match search(&self.state.pool, self.state.embedder.clone(), query).await {
             Ok(hits) => hits,
@@ -216,6 +216,7 @@ impl LoreMcp {
             k: None,
             kind: None,
             source: args.source.filter(|s| !s.trim().is_empty()),
+            sources: None,
         };
         match answer::ask(&self.state, caller.tenant_id, req).await {
             Ok(res) => ok(vec![ask_text(&res)]),

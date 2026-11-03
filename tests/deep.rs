@@ -611,6 +611,7 @@ fn deep_request() -> AskRequest {
         k: None,
         kind: None,
         source: None,
+        sources: None,
     }
 }
 

@@ -14,7 +14,8 @@ function load(storage) {
     'localStorage',
     m[1] +
       '\nreturn { loadKey, saveKey, escapeHtml, safeUrl, renderAnswer, citationView,' +
-      ' footerText, errorMessage, deepAvailable, shouldSubmit };'
+      ' footerText, errorMessage, deepAvailable, shouldSubmit, loadOff, saveOff, sourceOptions,' +
+      ' sourcesSummary, askBody };'
   )(storage);
 }
 
@@ -155,6 +156,60 @@ test('footerText has model, latency and token counts', () => {
 test('footerText in sources mode says no model', () => {
   const out = lore.footerText({ mode: 'sources', model: 'none', latency_ms: 7, usage: { input_tokens: 0, output_tokens: 0 } });
   assert.strictEqual(out, 'no model · 7 ms');
+});
+
+test('sourceOptions ticks every source but the unticked ones, once per name', () => {
+  const reply = {
+    sources: [
+      { name: 'docs', kind: 'documents', documents: 1 },
+      { name: 'api', kind: 'repo', documents: 120 },
+      { name: 'api', kind: 'repo', documents: 3 },
+      { name: '', kind: 'repo' },
+      null,
+      { kind: 'repo' },
+    ],
+  };
+  assert.deepStrictEqual(lore.sourceOptions(reply, ['api', 'gone']), [
+    { name: 'docs', title: 'documents, 1 document', checked: true },
+    { name: 'api', title: 'repo, 120 documents', checked: false },
+  ]);
+  assert.deepStrictEqual(lore.sourceOptions(null, []), []);
+  assert.deepStrictEqual(lore.sourceOptions({ sources: 'x' }, []), []);
+});
+
+test('askBody sends sources only for a subset, and refuses none', () => {
+  const opts = (...ticks) => ticks.map((checked, i) => ({ name: 's' + i, checked }));
+  assert.deepStrictEqual(lore.askBody('q', 'fast', []), { body: { question: 'q', mode: 'fast' } });
+  assert.deepStrictEqual(lore.askBody('q', 'fast', opts(true, true)), { body: { question: 'q', mode: 'fast' } });
+  assert.deepStrictEqual(lore.askBody('q', 'deep', opts(false, true, true)), {
+    body: { question: 'q', mode: 'deep', sources: ['s1', 's2'] },
+  });
+  assert.deepStrictEqual(lore.askBody('q', 'fast', opts(false, false)), { error: 'Tick at least one source' });
+});
+
+test('sourcesSummary says all or how many', () => {
+  assert.strictEqual(lore.sourcesSummary([{ checked: true }, { checked: true }]), 'all 2');
+  assert.strictEqual(lore.sourcesSummary([{ checked: false }, { checked: true }]), '1 of 2');
+});
+
+test('the unticked sources survive storage that throws and keep under lore.sources.off', () => {
+  assert.deepStrictEqual(lore.loadOff(), []);
+  lore.saveOff(['a']);
+  const data = {};
+  const ok = load({
+    getItem: (k) => (k in data ? data[k] : null),
+    setItem: (k, v) => { data[k] = v; },
+    removeItem: (k) => { delete data[k]; },
+  });
+  ok.saveOff(['a', 'b']);
+  assert.deepStrictEqual(data, { 'lore.sources.off': '["a","b"]' });
+  assert.deepStrictEqual(ok.loadOff(), ['a', 'b']);
+  ok.saveOff([]);
+  assert.deepStrictEqual(data, {});
+  data['lore.sources.off'] = '{not json';
+  assert.deepStrictEqual(ok.loadOff(), []);
+  data['lore.sources.off'] = '["a", 3, null]';
+  assert.deepStrictEqual(ok.loadOff(), ['a']);
 });
 
 if (!process.exitCode) console.log('web_pure: ' + count + ' checks passed');

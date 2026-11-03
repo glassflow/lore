@@ -42,6 +42,18 @@ pub struct AskRequest {
     /// Only the source with this name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Only the sources with these names. Combined with `source`; neither means every source.
+    /// Deep mode's tools keep to them too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<String>>,
+}
+
+impl AskRequest {
+    /// The source names this question is limited to, from `source` and `sources`; `None` means
+    /// every source.
+    pub fn source_scope(&self) -> Option<Vec<String>> {
+        crate::search::source_names(self.source.iter().chain(self.sources.iter().flatten()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

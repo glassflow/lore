@@ -261,6 +261,44 @@ async fn source_filter_matches_the_source_name(pool: PgPool) {
     let found = hits(&router, &key, "plan limits", "&source=&k=50").await;
     assert!(found.iter().any(|h| h["source"] == "wiki"));
     assert!(found.iter().any(|h| h["source"] == "sample"));
+
+    // A comma-separated list matches any of its names; blanks and unknown names add nothing.
+    let found = hits(&router, &key, "plan limits", "&source=wiki,sample&k=50").await;
+    assert!(found.iter().any(|h| h["source"] == "wiki"));
+    assert!(found.iter().any(|h| h["source"] == "sample"));
+    let found = hits(
+        &router,
+        &key,
+        "plan limits",
+        "&source=,nope,%20wiki%20,&k=50",
+    )
+    .await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0]["source"], "wiki");
+
+    // GET /v1/sources lists both, by kind and then name, with their document counts.
+    let (status, body) = send(&router, "GET", "/v1/sources", &key, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sources = body["sources"].as_array().unwrap();
+    let names: Vec<&str> = sources
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["wiki", "sample"], "{body}");
+    assert_eq!(sources[0]["kind"], "documents");
+    assert_eq!(sources[0]["documents"], 1);
+    assert_eq!(sources[1]["kind"], "repo");
+    assert!(sources[1]["documents"].as_i64().unwrap() > 1, "{body}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn listing_sources_needs_the_read_scope(pool: PgPool) {
+    let (_state, router, _tenant, _key) = setup(pool).await;
+    let (_, ingest_only) = create_tenant_key(&router, "ingest-only", &["ingest"]).await;
+    let (status, _) = send(&router, "GET", "/v1/sources", &ingest_only, Vec::new()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&router, "GET", "/v1/sources", "lk_nope", Vec::new()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -301,7 +339,7 @@ async fn k_defaults_to_10_and_is_clamped_to_1_through_50(pool: PgPool) {
             q: "limit".to_string(),
             k,
             kinds: None,
-            source: None,
+            sources: None,
         };
         let found = search(&state.pool, embedder.clone(), query).await.unwrap();
         assert_eq!(found.len(), want, "k = {k}");
@@ -377,7 +415,7 @@ async fn a_second_tenant_sees_nothing_of_the_first(pool: PgPool) {
         q: "plan limits".to_string(),
         k: 50,
         kinds: Some(vec!["code".to_string()]),
-        source: Some("sample".to_string()),
+        sources: Some(vec!["sample".to_string()]),
     };
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder);
     assert!(

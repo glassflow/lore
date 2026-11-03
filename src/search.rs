@@ -66,6 +66,23 @@ const ENUMERATION_LIMIT: usize = 3;
 /// The `k` constant of Reciprocal Rank Fusion.
 const RRF_K: f64 = 60.0;
 
+/// The source names in `names`, trimmed, without blanks and repeats, in their first order. `None`
+/// when none are left, which means every source.
+pub fn source_names<I, S>(names: I) -> Option<Vec<String>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        let name = name.as_ref().trim();
+        if !name.is_empty() && !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub tenant_id: Uuid,
@@ -74,8 +91,8 @@ pub struct SearchQuery {
     pub k: usize,
     /// Document kinds to keep (`code`, `doc`, `session`, `note`); `None` keeps all.
     pub kinds: Option<Vec<String>>,
-    /// A source name; `None` searches every source of the tenant.
-    pub source: Option<String>,
+    /// Source names to search; `None` searches every source of the tenant.
+    pub sources: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,7 +211,8 @@ pub async fn search(
         )));
     }
     // Postgres text cannot hold a NUL.
-    if q.contains('\0') || query.source.as_deref().is_some_and(|s| s.contains('\0')) {
+    let sources = query.sources.filter(|s| !s.is_empty());
+    if q.contains('\0') || sources.iter().flatten().any(|s| s.contains('\0')) {
         return Err(AppError::BadRequest(
             "q and source must not contain NUL".to_string(),
         ));
@@ -204,7 +222,7 @@ pub async fn search(
     let filter = Filter {
         tenant_id: query.tenant_id,
         kinds: kinds.as_deref(),
-        source: query.source.as_deref(),
+        sources: sources.as_deref(),
     };
 
     let lexical = lexical_branch(pool, q, &filter).await?;
@@ -255,7 +273,7 @@ pub async fn search(
 struct Filter<'a> {
     tenant_id: Uuid,
     kinds: Option<&'a [String]>,
-    source: Option<&'a str>,
+    sources: Option<&'a [String]>,
 }
 
 async fn lexical_branch(pool: &PgPool, q: &str, f: &Filter<'_>) -> Result<Vec<i64>, AppError> {
@@ -273,14 +291,14 @@ async fn lexical_branch(pool: &PgPool, q: &str, f: &Filter<'_>) -> Result<Vec<i6
          JOIN documents d ON d.id = c.document_id
          JOIN sources s ON s.id = d.source_id
          WHERE c.tenant_id = $1 AND c.tsv @@ to_tsquery('simple', $2)
-           AND ($3::text[] IS NULL OR d.kind = ANY($3)) AND ($4::text IS NULL OR s.name = $4)
+           AND ($3::text[] IS NULL OR d.kind = ANY($3)) AND ($4::text[] IS NULL OR s.name = ANY($4))
          ORDER BY ts_rank_cd(c.tsv, to_tsquery('simple', $2), 32) DESC, c.id
          LIMIT $5",
     )
     .bind(f.tenant_id)
     .bind(&tsquery)
     .bind(f.kinds)
-    .bind(f.source)
+    .bind(f.sources)
     .bind(BRANCH_LIMIT)
     .fetch_all(pool)
     .await?;
@@ -310,13 +328,13 @@ async fn vector_branch(
          JOIN documents d ON d.id = c.document_id
          JOIN sources s ON s.id = d.source_id
          WHERE c.tenant_id = $1
-           AND ($2::text[] IS NULL OR d.kind = ANY($2)) AND ($3::text IS NULL OR s.name = $3)
+           AND ($2::text[] IS NULL OR d.kind = ANY($2)) AND ($3::text[] IS NULL OR s.name = ANY($3))
          ORDER BY c.embedding <=> $4, c.id
          LIMIT $5",
     )
     .bind(f.tenant_id)
     .bind(f.kinds)
-    .bind(f.source)
+    .bind(f.sources)
     .bind(Vector::from(embedding))
     .bind(BRANCH_LIMIT)
     .fetch_all(&mut *tx)

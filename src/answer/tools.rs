@@ -211,16 +211,35 @@ pub fn tool_defs() -> Vec<ToolDef> {
     ]
 }
 
-/// Runs one tool for `tenant_id`. An unknown tool, invalid input or a failure is a
-/// `ToolOutput` with `is_error: true`; the text of a success or an error is cut by [`cap`].
+/// Runs one tool for `tenant_id`, over all of its sources. An unknown tool, invalid input or a
+/// failure is a `ToolOutput` with `is_error: true`; the text of a success or an error is cut by
+/// [`cap`].
 pub async fn run_tool(state: &AppState, tenant_id: Uuid, name: &str, input: &Value) -> ToolOutput {
+    run_tool_scoped(state, tenant_id, None, name, input).await
+}
+
+/// [`run_tool`] that sees only the sources named in `sources` (all of them when `None`). A source
+/// outside them is an unknown source to grep and read_file, search leaves it out, and get_session
+/// does not find its sessions.
+pub async fn run_tool_scoped(
+    state: &AppState,
+    tenant_id: Uuid,
+    sources: Option<&[String]>,
+    name: &str,
+    input: &Value,
+) -> ToolOutput {
     match name {
-        "search" => run_search(state, tenant_id, input).await,
-        "grep" => run_grep(state, tenant_id, input).await,
-        "read_file" => run_read_file(state, tenant_id, input).await,
-        "get_session" => run_get_session(state, tenant_id, input).await,
+        "search" => run_search(state, tenant_id, sources, input).await,
+        "grep" => run_grep(state, tenant_id, sources, input).await,
+        "read_file" => run_read_file(state, tenant_id, sources, input).await,
+        "get_session" => run_get_session(state, tenant_id, sources, input).await,
         other => ToolOutput::err(format!("unknown tool: {}", cut_chars(other, 64))),
     }
+}
+
+/// Whether the source called `name` is one of `sources`; every source is when `sources` is `None`.
+fn in_scope(sources: Option<&[String]>, name: &str) -> bool {
+    sources.is_none_or(|names| names.iter().any(|n| n == name))
 }
 
 /// Parses the tool input. Wrong types, missing fields and unknown fields (the structs deny them)
@@ -240,14 +259,20 @@ fn in_range(field: &str, value: i64, min: i64, max: i64) -> Result<i64, String> 
     }
 }
 
-/// The tenant's repo sources, ordered by name.
-async fn repo_sources(state: &AppState, tenant_id: Uuid) -> Result<Vec<Source>, ToolOutput> {
-    store::list_sources(&state.pool, tenant_id, Some("repo"))
+/// The tenant's repo sources within `scope`, ordered by name.
+async fn repo_sources(
+    state: &AppState,
+    tenant_id: Uuid,
+    scope: Option<&[String]>,
+) -> Result<Vec<Source>, ToolOutput> {
+    let mut sources = store::list_sources(&state.pool, tenant_id, Some("repo"))
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "listing repo sources for a tool failed");
             ToolOutput::err("internal error")
-        })
+        })?;
+    sources.retain(|s| in_scope(scope, &s.name));
+    Ok(sources)
 }
 
 /// `<data_dir>/repos/<source_id>/checkout`, the layout `repo` keeps.
@@ -271,7 +296,12 @@ struct SearchInput {
     kind: Option<Vec<String>>,
 }
 
-async fn run_search(state: &AppState, tenant_id: Uuid, input: &Value) -> ToolOutput {
+async fn run_search(
+    state: &AppState,
+    tenant_id: Uuid,
+    scope: Option<&[String]>,
+    input: &Value,
+) -> ToolOutput {
     let input: SearchInput = match parse_input(input) {
         Ok(i) => i,
         Err(e) => return ToolOutput::err(e),
@@ -288,7 +318,7 @@ async fn run_search(state: &AppState, tenant_id: Uuid, input: &Value) -> ToolOut
             q: input.query,
             k: usize::try_from(k).unwrap_or(1),
             kinds: input.kind,
-            source: None,
+            sources: scope.map(<[String]>::to_vec),
         },
     )
     .await;
@@ -345,7 +375,12 @@ struct GrepInput {
     max_results: Option<i64>,
 }
 
-async fn run_grep(state: &AppState, tenant_id: Uuid, input: &Value) -> ToolOutput {
+async fn run_grep(
+    state: &AppState,
+    tenant_id: Uuid,
+    scope: Option<&[String]>,
+    input: &Value,
+) -> ToolOutput {
     let input: GrepInput = match parse_input(input) {
         Ok(i) => i,
         Err(e) => return ToolOutput::err(e),
@@ -374,7 +409,7 @@ async fn run_grep(state: &AppState, tenant_id: Uuid, input: &Value) -> ToolOutpu
         None => None,
     };
 
-    let mut sources = match repo_sources(state, tenant_id).await {
+    let mut sources = match repo_sources(state, tenant_id, scope).await {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -521,7 +556,12 @@ struct ReadFileInput {
     end_line: Option<i64>,
 }
 
-async fn run_read_file(state: &AppState, tenant_id: Uuid, input: &Value) -> ToolOutput {
+async fn run_read_file(
+    state: &AppState,
+    tenant_id: Uuid,
+    scope: Option<&[String]>,
+    input: &Value,
+) -> ToolOutput {
     let input: ReadFileInput = match parse_input(input) {
         Ok(i) => i,
         Err(e) => return ToolOutput::err(e),
@@ -540,7 +580,7 @@ async fn run_read_file(state: &AppState, tenant_id: Uuid, input: &Value) -> Tool
     // At most READ_MAX_LINES lines per call: a longer range is cut, and the header says so.
     let end = end.min(start.saturating_add(READ_MAX_LINES - 1));
 
-    let sources = match repo_sources(state, tenant_id).await {
+    let sources = match repo_sources(state, tenant_id, scope).await {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -660,7 +700,12 @@ struct GetSessionInput {
     session_id: String,
 }
 
-async fn run_get_session(state: &AppState, tenant_id: Uuid, input: &Value) -> ToolOutput {
+async fn run_get_session(
+    state: &AppState,
+    tenant_id: Uuid,
+    scope: Option<&[String]>,
+    input: &Value,
+) -> ToolOutput {
     let input: GetSessionInput = match parse_input(input) {
         Ok(i) => i,
         Err(e) => return ToolOutput::err(e),
@@ -679,8 +724,8 @@ async fn run_get_session(state: &AppState, tenant_id: Uuid, input: &Value) -> To
         }
     };
     match store::document_text(&state.pool, tenant_id, id).await {
-        Some((_, text)) => ToolOutput::ok(text),
-        None => not_found(),
+        Some((row, text)) if in_scope(scope, &row.source) => ToolOutput::ok(text),
+        _ => not_found(),
     }
 }
 

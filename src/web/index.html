@@ -74,6 +74,20 @@
     cursor: pointer;
   }
   button:disabled { opacity: 0.6; cursor: wait; }
+  .sources-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 4px; }
+  .sources-head .title { font-size: 14px; color: var(--muted); }
+  #sources-count { font-size: 13px; color: var(--muted); }
+  button.link {
+    padding: 0;
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--accent);
+    background: none;
+    text-decoration: underline;
+  }
+  #sources { display: block; }
+  #source-list { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 15px; }
+  #source-list label { white-space: nowrap; }
   #status { min-height: 1.5em; margin: 16px 0 0; color: var(--muted); }
   #status.error { color: var(--error); }
   #answer { margin-top: 8px; font-size: 18px; overflow-wrap: anywhere; }
@@ -121,6 +135,17 @@
     <div class="row">
       <label class="field" for="question">Question</label>
       <textarea id="question" name="question" placeholder="How many plans are there?"></textarea>
+    </div>
+    <div class="row" id="sources-row" hidden>
+      <div class="sources-head">
+        <span class="title" id="sources-title">Look in</span>
+        <span id="sources-count"></span>
+        <button type="button" class="link" id="sources-all">all</button>
+        <button type="button" class="link" id="sources-none">none</button>
+      </div>
+      <fieldset id="sources" aria-labelledby="sources-title">
+        <div id="source-list"></div>
+      </fieldset>
     </div>
     <div class="actions">
       <fieldset>
@@ -284,6 +309,64 @@ function deepAvailable(info) {
 function shouldSubmit(e) {
   return e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229;
 }
+
+var OFF_NAME = 'lore.sources.off';
+
+// The names of the sources the reader unticked. A source added later is not in it, so it
+// starts ticked.
+function loadOff() {
+  try {
+    var parsed = JSON.parse(localStorage.getItem(OFF_NAME) || '[]');
+    return Array.isArray(parsed) ? parsed.filter(function (n) { return typeof n === 'string'; }) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveOff(names) {
+  try {
+    if (names.length) {
+      localStorage.setItem(OFF_NAME, JSON.stringify(names));
+    } else {
+      localStorage.removeItem(OFF_NAME);
+    }
+  } catch (e) {
+    // Storage is unavailable: the choice just lasts for this page view.
+  }
+}
+
+// The checklist for a /v1/sources reply: one entry per source name, ticked unless it is in `off`.
+function sourceOptions(reply, off) {
+  var seen = new Set();
+  var out = [];
+  var list = reply && Array.isArray(reply.sources) ? reply.sources : [];
+  list.forEach(function (s) {
+    if (!s || typeof s.name !== 'string' || !s.name || seen.has(s.name)) return;
+    seen.add(s.name);
+    var docs = typeof s.documents === 'number' ? s.documents : 0;
+    out.push({
+      name: s.name,
+      title: (s.kind || 'source') + ', ' + docs + (docs === 1 ? ' document' : ' documents'),
+      checked: off.indexOf(s.name) === -1
+    });
+  });
+  return out;
+}
+
+function sourcesSummary(options) {
+  var ticked = options.filter(function (o) { return o.checked; }).length;
+  return ticked === options.length ? 'all ' + ticked : ticked + ' of ' + options.length;
+}
+
+// The /v1/ask body, or an error when no source is ticked. `sources` goes only when some but not
+// all are ticked, so by default every source is searched, including ones added later.
+function askBody(question, mode, options) {
+  var body = { question: question, mode: mode };
+  var ticked = options.filter(function (o) { return o.checked; }).map(function (o) { return o.name; });
+  if (options.length && !ticked.length) return { error: 'Tick at least one source' };
+  if (ticked.length < options.length) body.sources = ticked;
+  return { body: body };
+}
 </script>
 
 <script>
@@ -299,10 +382,76 @@ function shouldSubmit(e) {
   var citesBox = document.getElementById('citations-box');
   var citesEl = document.getElementById('citations');
   var footerEl = document.getElementById('footer');
+  var sourcesRow = document.getElementById('sources-row');
+  var sourceList = document.getElementById('source-list');
+  var sourcesCount = document.getElementById('sources-count');
   var timer = null;
+  // The checklist, empty while there is nothing to choose between. `sourcesFor` is the key it
+  // was loaded with.
+  var options = [];
+  var sourcesFor = null;
+  var keyTimer = null;
+
+  function sourcesChanged() {
+    saveOff(options.filter(function (o) { return !o.checked; }).map(function (o) { return o.name; }));
+    sourcesCount.textContent = sourcesSummary(options);
+  }
+
+  function renderSources() {
+    sourceList.textContent = '';
+    options.forEach(function (o) {
+      var label = document.createElement('label');
+      label.title = o.title;
+      var box = document.createElement('input');
+      box.type = 'checkbox';
+      box.value = o.name;
+      box.checked = o.checked;
+      box.addEventListener('change', function () {
+        o.checked = box.checked;
+        sourcesChanged();
+      });
+      label.appendChild(box);
+      label.appendChild(document.createTextNode(' ' + o.name));
+      sourceList.appendChild(label);
+    });
+    sourcesRow.hidden = options.length === 0;
+    sourcesCount.textContent = options.length ? sourcesSummary(options) : '';
+  }
+
+  function setAll(on) {
+    options.forEach(function (o) { o.checked = on; });
+    renderSources();
+    sourcesChanged();
+  }
+  document.getElementById('sources-all').addEventListener('click', function () { setAll(true); });
+  document.getElementById('sources-none').addEventListener('click', function () { setAll(false); });
+
+  // Lists the key's sources. With fewer than two there is nothing to pick, so no checklist.
+  function loadSources() {
+    var key = keyInput.value.trim();
+    if (key === sourcesFor) return;
+    sourcesFor = key;
+    options = [];
+    renderSources();
+    if (!key) return;
+    fetch('/v1/sources', { headers: { 'Authorization': 'Bearer ' + key } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (reply) {
+        if (key !== sourcesFor) return;
+        var list = sourceOptions(reply, loadOff());
+        options = list.length > 1 ? list : [];
+        renderSources();
+      })
+      .catch(function () {});
+  }
 
   keyInput.value = loadKey();
-  keyInput.addEventListener('input', function () { saveKey(keyInput.value.trim()); });
+  keyInput.addEventListener('input', function () {
+    saveKey(keyInput.value.trim());
+    clearTimeout(keyTimer);
+    keyTimer = setTimeout(loadSources, 400);
+  });
+  loadSources();
 
   function setStatus(text, isError) {
     statusEl.textContent = text;
@@ -373,6 +522,11 @@ function shouldSubmit(e) {
       return;
     }
     var mode = document.querySelector('input[name="mode"]:checked').value;
+    var made = askBody(q, mode, options);
+    if (made.error) {
+      setStatus(made.error, true);
+      return;
+    }
     clearResult();
     button.disabled = true;
     var started = Date.now();
@@ -391,7 +545,7 @@ function shouldSubmit(e) {
     fetch('/v1/ask', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: q, mode: mode })
+      body: JSON.stringify(made.body)
     })
       .then(function (r) {
         return r.text().then(function (body) { return { status: r.status, ok: r.ok, body: body }; });

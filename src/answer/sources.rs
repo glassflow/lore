@@ -31,7 +31,7 @@ pub async fn answer(
             q: question.to_string(),
             k: req.k.unwrap_or(DEFAULT_K),
             kinds: req.kind.clone(),
-            source: req.source.clone().filter(|s| !s.trim().is_empty()),
+            sources: req.source_scope(),
         },
     )
     .await?;

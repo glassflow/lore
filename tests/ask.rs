@@ -132,6 +132,25 @@ async fn kind_and_source_filters_apply(pool: PgPool) {
     let (status, body) = ask(&router, &key, body).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["model"], "none");
+
+    // `sources` is a list; any name in it counts, and it adds to `source`.
+    for body in [
+        json!({ "question": QUESTION, "mode": "sources", "sources": ["nope", "sample"] }),
+        json!({ "question": QUESTION, "mode": "sources", "source": "sample", "sources": ["nope"] }),
+    ] {
+        let (status, body) = ask(&router, &key, body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["sources_considered"].as_u64().unwrap() > 0, "{body}");
+    }
+    let body = json!({ "question": QUESTION, "mode": "sources", "sources": ["nope", "other"] });
+    let (status, body) = ask(&router, &key, body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sources_considered"], 0, "{body}");
+    // An empty list is no filter.
+    let body = json!({ "question": QUESTION, "mode": "sources", "sources": [] });
+    let (status, body) = ask(&router, &key, body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["sources_considered"].as_u64().unwrap() > 0, "{body}");
 }
 
 #[sqlx::test(migrations = "./migrations")]

@@ -93,7 +93,10 @@ pub async fn get_search(
         q,
         k,
         kinds: parse_kinds(params.kind.as_deref()),
-        source: params.source.filter(|s| !s.trim().is_empty()),
+        sources: params
+            .source
+            .as_deref()
+            .and_then(|s| crate::search::source_names(s.split(','))),
     };
     let hits = search(&state.pool, state.embedder.clone(), query).await?;
     Ok(Json(SearchResponse {
