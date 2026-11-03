@@ -28,7 +28,7 @@ use crate::answer::{self, AskRequest, AskResponse, Citation, Mode};
 use crate::auth::{Caller, Scope, caller_from_headers};
 use crate::error::AppError;
 use crate::http::AppState;
-use crate::search::{Hit, SearchQuery, search};
+use crate::search::{Hit, SearchQuery, query_terms, search};
 use crate::store::{DocumentRow, document_text, list_source_summaries};
 
 /// What the server tells a client about itself. Agents read it, so it says what each tool costs:
@@ -46,14 +46,6 @@ const EXCERPT_SLACK: usize = 3;
 const EXCERPT_LINE_CHARS: usize = 160;
 /// A hit header lists at most this many symbols.
 const HEADER_SYMBOLS: usize = 8;
-
-/// Query words too common to place an excerpt.
-const STOP_WORDS: [&str; 40] = [
-    "the", "and", "for", "are", "what", "which", "how", "does", "with", "from", "this", "that",
-    "can", "there", "their", "when", "where", "who", "why", "into", "its", "our", "use", "used",
-    "any", "all", "each", "has", "have", "was", "were", "will", "would", "should", "could",
-    "about", "many", "much", "some", "get",
-];
 
 /// The longest `get_document` text, in characters, header included.
 pub const MAX_DOCUMENT_CHARS: usize = 100_000;
@@ -125,6 +117,7 @@ pub struct SearchArgs {
 pub enum AskMode {
     #[default]
     Fast,
+    Sources,
     Deep,
 }
 
@@ -132,7 +125,7 @@ pub enum AskMode {
 pub struct AskArgs {
     /// The question, in plain language.
     question: String,
-    /// `fast` (default, about 5 s) answers from the best passages in one model call. `deep` (10 to 60 s) lets lore's model search, grep and read files; it needs a tool-capable provider.
+    /// `fast` (default, about 5 s) answers from the best passages in one model call. `sources` (well under a second) lists those passages as bullets and calls no model. `deep` (10 to 60 s) lets lore's model search, grep and read files; it needs a tool-capable provider.
     mode: Option<AskMode>,
     /// Only this source: a repo or document source name, as `list_sources` shows it.
     source: Option<String>,
@@ -214,6 +207,7 @@ impl LoreMcp {
         let caller = caller_of(&parts)?;
         let mode = match args.mode.unwrap_or_default() {
             AskMode::Fast => Mode::Fast,
+            AskMode::Sources => Mode::Sources,
             AskMode::Deep => Mode::Deep,
         };
         let req = AskRequest {
@@ -275,21 +269,6 @@ impl ServerHandler for LoreMcp {
             .with_server_info(Implementation::new("lore", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
-}
-
-/// The lowercased words of `query` that place an excerpt: 3 characters or more, not a stop word.
-fn query_terms(query: &str) -> Vec<String> {
-    let mut terms: Vec<String> = Vec::new();
-    for word in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-        let word = word.to_lowercase();
-        if word.chars().count() >= 3
-            && !STOP_WORDS.contains(&word.as_str())
-            && !terms.contains(&word)
-        {
-            terms.push(word);
-        }
-    }
-    terms
 }
 
 /// The `search` result: the hits, a blank line between them, or `No hits.`.
@@ -390,11 +369,12 @@ fn cut(s: &str, max: usize) -> String {
 }
 
 /// The `ask` result: the answer and its sources, then `(fast mode, <model>, 4.9 s)`, with the
-/// number of tool calls for deep mode.
+/// number of tool calls for deep mode and no model for sources mode.
 fn ask_text(res: &AskResponse) -> String {
     let secs = res.latency_ms as f64 / 1000.0;
     let footer = match res.mode {
         Mode::Fast => format!("(fast mode, {}, {secs:.1} s)", res.model),
+        Mode::Sources => format!("(sources mode, no model, {secs:.1} s)"),
         Mode::Deep => format!(
             "(deep mode, {} tool calls, {}, {secs:.1} s)",
             res.tool_calls, res.model

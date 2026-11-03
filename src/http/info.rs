@@ -15,13 +15,13 @@ pub struct Info {
     modes: Vec<&'static str>,
 }
 
-/// The answer modes the provider supports. Deep mode drives tools, so it is on only when the
-/// provider can use them.
+/// The answer modes the provider supports. Sources mode calls no model, so it is always on. Deep
+/// mode drives tools, so it is on only when the provider can use them.
 pub fn modes(llm: &dyn Llm) -> Vec<&'static str> {
     if llm.supports_tools() {
-        vec!["fast", "deep"]
+        vec!["fast", "sources", "deep"]
     } else {
-        vec!["fast"]
+        vec!["fast", "sources"]
     }
 }
 

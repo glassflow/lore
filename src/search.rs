@@ -35,6 +35,30 @@ pub const DOCUMENT_KINDS: [&str; 4] = ["code", "doc", "session", "note"];
 /// A snippet is the first lines of a chunk.
 const SNIPPET_LINES: usize = 40;
 
+/// Query words too common to point at the lines of a hit that matter.
+const STOP_WORDS: [&str; 40] = [
+    "the", "and", "for", "are", "what", "which", "how", "does", "with", "from", "this", "that",
+    "can", "there", "their", "when", "where", "who", "why", "into", "its", "our", "use", "used",
+    "any", "all", "each", "has", "have", "was", "were", "will", "would", "should", "could",
+    "about", "many", "much", "some", "get",
+];
+
+/// The lowercased words of `query` that pick the lines of a hit worth showing (the MCP search
+/// excerpt, the line in a sources answer): 3 characters or more, not a stop word, each once.
+pub fn query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let word = word.to_lowercase();
+        if word.chars().count() >= 3
+            && !STOP_WORDS.contains(&word.as_str())
+            && !terms.contains(&word)
+        {
+            terms.push(word);
+        }
+    }
+    terms
+}
+
 /// Rows taken from each branch before fusion.
 const BRANCH_LIMIT: i64 = 50;
 /// How many of the vector hits that are enumerations get a place in the enumeration list.

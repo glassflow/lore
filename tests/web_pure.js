@@ -152,4 +152,9 @@ test('footerText has model, latency and token counts', () => {
   assert.strictEqual(out, 'fake · 12 ms · 3 in / 4 out');
 });
 
+test('footerText in sources mode says no model', () => {
+  const out = lore.footerText({ mode: 'sources', model: 'none', latency_ms: 7, usage: { input_tokens: 0, output_tokens: 0 } });
+  assert.strictEqual(out, 'no model · 7 ms');
+});
+
 if (!process.exitCode) console.log('web_pure: ' + count + ' checks passed');

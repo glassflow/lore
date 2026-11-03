@@ -227,6 +227,53 @@ async fn a_refusal_is_a_422(pool: PgPool) {
     assert_eq!(body, json!({ "error": "the model declined to answer" }));
 }
 
+/// Sources mode lists the hits as bullets and never calls the model: here the model declines
+/// everything, and the answer still comes back.
+#[sqlx::test(migrations = "./migrations")]
+async fn sources_mode_lists_the_hits_without_the_model(pool: PgPool) {
+    let data = tempfile::tempdir().unwrap();
+    let mut state = test_state(pool, data.path());
+    state.llm = Arc::new(RefusingLlm);
+    let router = test_router(state);
+    let (_, key) = create_tenant_key(&router, "acme", &["ingest", "read"]).await;
+    push_fixture(&router, &key).await;
+
+    let (status, body) = ask(
+        &router,
+        &key,
+        json!({ "question": QUESTION, "mode": "sources", "k": 4 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mode"], "sources");
+    assert_eq!(body["model"], "none");
+    assert_eq!(
+        body["usage"],
+        json!({ "input_tokens": 0, "output_tokens": 0 })
+    );
+    let citations = body["citations"].as_array().unwrap();
+    assert_eq!(citations.len(), 4);
+    assert_eq!(body["sources_considered"], 4);
+    let answer = body["answer"].as_str().unwrap();
+    let bullets: Vec<&str> = answer.lines().collect();
+    assert_eq!(bullets.len(), 4, "{answer}");
+    for (i, (line, c)) in bullets.iter().zip(citations).enumerate() {
+        let label = (i + 1).to_string();
+        assert_eq!(c["label"], label.as_str());
+        assert!(line.starts_with(&format!("- [{label}] `")), "{line}");
+        assert!(line.contains("(sample)"), "{line}");
+    }
+    assert!(
+        citations.iter().any(|c| c["path"] == PLANS),
+        "no citation for {PLANS}: {body}"
+    );
+    let plans = bullets
+        .iter()
+        .find(|b| b.contains(PLANS))
+        .expect("a bullet for the plans file");
+    assert!(plans.contains("Plan"), "{plans}");
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn info_needs_no_key(pool: PgPool) {
     let data = tempfile::tempdir().unwrap();
@@ -242,7 +289,7 @@ async fn info_needs_no_key(pool: PgPool) {
     assert_eq!(
         String::from_utf8(bytes.to_vec()).unwrap(),
         format!(
-            r#"{{"version":"{}","llm":"fake","embedder":"hash","modes":["fast","deep"]}}"#,
+            r#"{{"version":"{}","llm":"fake","embedder":"hash","modes":["fast","sources","deep"]}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );

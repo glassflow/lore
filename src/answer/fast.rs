@@ -13,12 +13,12 @@ use crate::llm::{Block, LlmError, LlmRequest, Message, Role, ToolChoice};
 use crate::search::{Hit, SearchQuery, search};
 
 /// Sources retrieved when the request does not say.
-const DEFAULT_K: usize = 12;
+pub(super) const DEFAULT_K: usize = 12;
 /// The most characters of sources and question sent to the model.
 const MAX_PROMPT_CHARS: usize = 60_000;
 const MAX_TOKENS: u32 = 2048;
 
-const NOTHING_FOUND: &str = "I found nothing indexed that matches this question.";
+pub(super) const NOTHING_FOUND: &str = "I found nothing indexed that matches this question.";
 
 static CITATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[(\d+)\]").expect("the citation pattern is valid"));

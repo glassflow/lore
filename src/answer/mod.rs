@@ -1,6 +1,7 @@
 //! Answers with citations. Fast mode (one search, one model call) lives in [`fast`]; the prompt
-//! it sends is built in [`prompt`]. Deep mode (an agent loop over the [`tools`]) lives in [`deep`]. The request and response types here are shared by the HTTP
-//! route, the CLI, the web page and MCP.
+//! it sends is built in [`prompt`]. Sources mode (the same search, no model: the hits as bullets)
+//! lives in [`sources`]. Deep mode (an agent loop over the [`tools`]) lives in [`deep`]. The
+//! request and response types here are shared by the HTTP route, the CLI, the web page and MCP.
 
 use std::time::Instant;
 
@@ -14,6 +15,7 @@ use crate::search::MAX_QUERY_CHARS;
 pub mod deep;
 pub mod fast;
 pub mod prompt;
+pub mod sources;
 pub mod tools;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -21,6 +23,8 @@ pub mod tools;
 pub enum Mode {
     #[default]
     Fast,
+    /// The sources fast mode would read, as bullets, with no model call.
+    Sources,
     Deep,
 }
 
@@ -29,7 +33,7 @@ pub struct AskRequest {
     pub question: String,
     #[serde(default)]
     pub mode: Mode,
-    /// Sources to retrieve in fast mode (the search clamps it to 1..=50). Default 12.
+    /// Sources to retrieve in fast and sources mode (the search clamps it to 1..=50). Default 12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k: Option<usize>,
     /// Only these document kinds.
@@ -84,7 +88,8 @@ pub async fn ask(
         return Err(AppError::BadRequest("question is required".to_string()));
     }
     // Checked here, before the mode split and before deep mode takes a slot of the day, so a
-    // refused question costs nothing. Both modes send the question to the model.
+    // refused question costs nothing. Every mode searches with the question, which has the same
+    // limit.
     if question.chars().count() > MAX_QUERY_CHARS {
         return Err(AppError::BadRequest(format!(
             "question must be at most {MAX_QUERY_CHARS} characters"
@@ -92,6 +97,7 @@ pub async fn ask(
     }
     let mut res = match req.mode {
         Mode::Fast => fast::answer(state, tenant_id, &req).await?,
+        Mode::Sources => sources::answer(state, tenant_id, &req).await?,
         Mode::Deep => deep::answer(state, tenant_id, &req).await?,
     };
     res.latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
