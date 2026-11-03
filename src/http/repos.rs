@@ -1,4 +1,4 @@
-//! Repo sources: create, list and push a git bundle.
+//! Repo sources: create, list, push a git bundle and sync from a remote.
 
 use std::error::Error as StdError;
 
@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::auth::{Caller, Scope};
 use crate::error::AppError;
 use crate::http::{AppJson, AppQuery, AppState};
+use crate::repo::sync::{SyncReport, check_remote_url, remote_urls, set_remote_url};
 use crate::repo::{IndexReport, ingest_bundle, is_full_sha};
 use crate::store::{Source, ensure_source, get_source, list_sources};
 
@@ -20,6 +21,8 @@ use crate::store::{Source, ensure_source, get_source, list_sources};
 pub struct CreateRepo {
     name: String,
     web_url_template: Option<String>,
+    /// Missing or null keeps the stored remote, `""` removes it.
+    remote_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -28,15 +31,17 @@ pub struct RepoItem {
     name: String,
     indexed_commit: Option<String>,
     web_url_template: Option<String>,
+    remote_url: Option<String>,
 }
 
-impl From<Source> for RepoItem {
-    fn from(s: Source) -> Self {
+impl RepoItem {
+    fn new(s: Source, remote_url: Option<String>) -> Self {
         Self {
             id: s.id,
             name: s.name,
             indexed_commit: s.indexed_commit,
             web_url_template: s.web_url_template,
+            remote_url,
         }
     }
 }
@@ -73,6 +78,11 @@ pub async fn create_repo(
             "repo name must be 1 to 100 characters of A-Z, a-z, 0-9, . _ and -".to_string(),
         ));
     }
+    let remote = req.remote_url.as_deref().map(str::trim);
+    if let Some(url) = remote.filter(|u| !u.is_empty()) {
+        check_remote_url(url, state.config.sync_allow_file_remotes)
+            .map_err(AppError::BadRequest)?;
+    }
     let source = ensure_source(
         &state.pool,
         caller.tenant_id,
@@ -81,7 +91,12 @@ pub async fn create_repo(
         req.web_url_template.as_deref(),
     )
     .await?;
-    Ok(Json(source.into()))
+    if let Some(url) = remote {
+        set_remote_url(&state.pool, source.id, Some(url).filter(|u| !u.is_empty())).await?;
+    }
+    let mut remotes = remote_urls(&state.pool, caller.tenant_id).await?;
+    let remote_url = remotes.remove(&source.id);
+    Ok(Json(RepoItem::new(source, remote_url)))
 }
 
 pub async fn list_repos(
@@ -90,8 +105,15 @@ pub async fn list_repos(
 ) -> Result<Json<RepoList>, AppError> {
     caller.require(Scope::Read)?;
     let sources = list_sources(&state.pool, caller.tenant_id, Some("repo")).await?;
+    let mut remotes = remote_urls(&state.pool, caller.tenant_id).await?;
     Ok(Json(RepoList {
-        repos: sources.into_iter().map(RepoItem::from).collect(),
+        repos: sources
+            .into_iter()
+            .map(|s| {
+                let remote = remotes.remove(&s.id);
+                RepoItem::new(s, remote)
+            })
+            .collect(),
     }))
 }
 
@@ -170,6 +192,25 @@ pub async fn put_bundle(
     let report = task
         .await
         .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("ingest task failed")))??;
+    Ok(Json(report))
+}
+
+/// Fetches the repo's remote and indexes what changed since the last indexed commit.
+pub async fn sync_repo(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SyncReport>, AppError> {
+    caller.require(Scope::Ingest)?;
+    let source = get_source(&state.pool, caller.tenant_id, id)
+        .await?
+        .filter(|s| s.kind == "repo")
+        .ok_or(AppError::NotFound)?;
+    // Like a bundle push, the sync finishes even if the client disconnects.
+    let task = tokio::spawn(async move { crate::repo::sync::sync_repo(&state, &source).await });
+    let report = task
+        .await
+        .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("sync task failed")))??;
     Ok(Json(report))
 }
 

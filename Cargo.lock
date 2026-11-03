@@ -1963,6 +1963,7 @@ dependencies = [
  "futures",
  "globset",
  "hex",
+ "hmac",
  "ignore",
  "opentelemetry-proto",
  "pgvector",

@@ -16,6 +16,7 @@ flate2 = "1"
 futures = "0.3"
 globset = "0.4.20"
 hex = "0.4"
+hmac = "0.12"
 ignore = "0.4.33"
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["trace", "gen-tonic-messages", "with-serde"] }
 pgvector = { version = "=0.4.1", features = ["sqlx"] }

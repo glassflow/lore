@@ -33,6 +33,7 @@ use crate::store::{
 };
 
 pub mod progress;
+pub mod sync;
 
 use progress::PushHandle;
 

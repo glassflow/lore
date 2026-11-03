@@ -23,6 +23,9 @@ pub enum AppError {
     Unprocessable(String),
     #[error("too many requests: {0}")]
     TooManyRequests(String),
+    /// An upstream the server called (a git remote) failed.
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
     #[error("internal error: {0}")]
     Internal(anyhow::Error),
 }
@@ -44,6 +47,7 @@ impl AppError {
             AppError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             AppError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            AppError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -56,7 +60,8 @@ impl AppError {
             | AppError::Conflict(m)
             | AppError::Unsupported(m)
             | AppError::Unprocessable(m)
-            | AppError::TooManyRequests(m) => m.clone(),
+            | AppError::TooManyRequests(m)
+            | AppError::BadGateway(m) => m.clone(),
             AppError::Unauthorized => "unauthorized".to_string(),
             AppError::NotFound => "not found".to_string(),
             AppError::PayloadTooLarge => "payload too large".to_string(),
@@ -105,6 +110,7 @@ mod tests {
             (AppError::Unsupported("x".into()), 415),
             (AppError::Unprocessable("x".into()), 422),
             (AppError::TooManyRequests("x".into()), 429),
+            (AppError::BadGateway("x".into()), 502),
             (AppError::Internal(anyhow::anyhow!("boom")), 500),
         ];
         for (err, code) in cases {

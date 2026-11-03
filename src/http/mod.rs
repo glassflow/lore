@@ -30,6 +30,7 @@ pub mod me;
 pub mod repos;
 pub mod search;
 pub mod traces;
+pub mod webhooks;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -78,6 +79,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/repos/{id}/bundle",
             put(repos::put_bundle).layer(RequestBodyLimitLayer::new(bundle_limit)),
+        )
+        .route("/v1/repos/{id}/sync", post(repos::sync_repo))
+        .route(
+            "/v1/webhooks/github",
+            post(webhooks::github).layer(RequestBodyLimitLayer::new(webhooks::BODY_LIMIT)),
         )
         .route(
             "/v1/traces",
