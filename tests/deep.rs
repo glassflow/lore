@@ -389,11 +389,17 @@ async fn info(router: &Router) -> Value {
 #[sqlx::test(migrations = "./migrations")]
 async fn info_lists_deep_only_when_the_provider_has_tools(pool: PgPool) {
     let env = Env::new(pool, Probe::fake(), |_| {}).await;
-    assert_eq!(info(&env.router).await["modes"], json!(["fast", "deep"]));
+    assert_eq!(
+        info(&env.router).await["modes"],
+        json!(["fast", "sources", "deep"])
+    );
 
     let mut state = env.state.clone();
     state.llm = Probe::without_tools();
-    assert_eq!(info(&test_router(state)).await["modes"], json!(["fast"]));
+    assert_eq!(
+        info(&test_router(state)).await["modes"],
+        json!(["fast", "sources"])
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

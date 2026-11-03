@@ -126,6 +126,7 @@
       <fieldset>
         <legend hidden>Mode</legend>
         <label><input type="radio" name="mode" value="fast" checked> fast</label>
+        <label title="No model: the sources fast mode would read, as bullets"><input type="radio" name="mode" value="sources"> sources</label>
         <label id="deep-label"><input type="radio" name="mode" value="deep" id="mode-deep" disabled title="Deep mode is not enabled on this server"> deep</label>
       </fieldset>
       <button type="submit" id="submit">Ask</button>
@@ -254,6 +255,7 @@ function citationView(c) {
 }
 
 function footerText(res) {
+  if (res.mode === 'sources') return 'no model · ' + res.latency_ms + ' ms';
   var usage = res.usage || {};
   return res.model + ' · ' + res.latency_ms + ' ms · ' +
     usage.input_tokens + ' in / ' + usage.output_tokens + ' out';

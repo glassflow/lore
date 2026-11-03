@@ -151,19 +151,22 @@ curl localhost:8080/v1/ask -H "Authorization: Bearer $LORE_KEY" -H 'content-type
 lore ask "how many plans are there and what are their limits?"     # the same, from the CLI
 lore ask "who owns billing?" --kind doc,note --k 8 --source sample
 lore ask "how many plans are there?" --json                        # the server's JSON on one line
+lore ask "how many plans are there?" --mode sources                # the sources as bullets, no model call
 ```
 
 | Field | Meaning |
 |---|---|
 | `question` | Required. A missing or blank question is a 400. At most 2000 characters, otherwise a 400 |
-| `mode` | `fast` (the default) or `deep`. `deep` runs an agent loop (see below) and is a 400 ("deep mode needs a tool-capable model provider (LORE_LLM=anthropic)") with `LORE_LLM=openai` |
-| `k` | Fast mode only: how many sources to retrieve, default 12, clamped to 1 to 50 |
-| `kind` | Fast mode only: a list of document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 |
-| `source` | Fast mode only: only the source with this name |
+| `mode` | `fast` (the default), `sources` or `deep`. `sources` calls no model (see below). `deep` runs an agent loop (see below) and is a 400 ("deep mode needs a tool-capable model provider (LORE_LLM=anthropic)") with `LORE_LLM=openai` |
+| `k` | Fast and sources mode: how many sources to retrieve, default 12, clamped to 1 to 50 |
+| `kind` | Fast and sources mode: a list of document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 |
+| `source` | Fast and sources mode: only the source with this name |
 
 The answer is `{"answer", "mode", "model", "citations", "sources_considered", "tool_calls", "usage", "latency_ms"}`. `citations` lists the sources the answer cites with `[n]`, once each, in the order they first appear. A citation has `label` (the source number, as text), `document_id`, `kind`, `title`, `path`, `start_line`, `end_line` and `url` (the same link `/v1/search` gives as `uri`). `sources_considered` is the number of passages that went into the prompt (at most 60,000 characters of them, each cut to its first 120 lines), `tool_calls` is 0 in fast mode, and `usage` has `input_tokens` and `output_tokens`.
 
 When nothing indexed matches, the answer is "I found nothing indexed that matches this question.", `model` is `"none"` and the model is not called. If the model declines to answer, the response is a 422 `{"error": "the model declined to answer"}`.
+
+Sources mode (`"mode": "sources"`) runs the same search as fast mode and calls no model, so it answers in the time of a search and costs nothing, and it works without a model provider. The answer is one bullet per source, best first: ``- [1] `src/billing/plans.rs:3-14` (sample): Plan, Plan::limits — `pub enum Plan { Free, Pro, Team }` ``, that is the label, the path and lines (the title for documents without a path), the source, up to 6 symbols, and the line that shares the most words with the question. Every source is cited, labelled `1`, `2` and so on in rank order. `model` is `"none"` and `usage` is zero. The CLI prints each bullet with its link on the next line, and ends with `no model · <latency> ms`.
 
 Deep mode (`"mode": "deep"`) lets the model drive the `search`, `grep`, `read_file` and `get_session` tools for up to `LORE_DEEP_MAX_ROUNDS` rounds within `LORE_DEEP_BUDGET_SECS` seconds. Tool calls of one round run at the same time, each for at most 10 seconds; a slower one gives the model an error result. Past 80% of the budget, or at the round cap, the model gets one last call with the tools turned off and is told to answer. Cost is capped per tenant by `LORE_DEEP_CONCURRENCY` and `LORE_DEEP_DAILY_LIMIT` (both give a 429). A deep answer cites code as `[path:start-end]`, with the path as the tools print it minus the source name, and sessions as `[session:<id>]`. Each distinct citation appears once in `citations` (at most 50), in order of first appearance. The `label` is the text between the brackets. A citation whose path or session lives in the tenant's index carries `document_id`, `kind`, `title` and `url`; one that does not match keeps its `label`, `path` and lines, with `document_id` null. In deep mode `tool_calls` counts the tool calls, `sources_considered` is 0, `usage` is summed over all model calls and `model` is the model of the last call. If the budget runs out with no answer at all, the response is a 500.
 
@@ -172,16 +175,16 @@ The CLI prints the answer, a blank line, a `Sources:` list with `[label] path:st
 `GET /v1/info` needs no key. It reports what the server runs, for clients and health dashboards:
 
 ```bash
-curl localhost:8080/v1/info    # {"version":"0.1.0","llm":"fake","embedder":"hash","modes":["fast","deep"]}
+curl localhost:8080/v1/info    # {"version":"0.1.0","llm":"fake","embedder":"hash","modes":["fast","sources","deep"]}
 ```
 
-`modes` lists `deep` only when the model provider can use tools (`anthropic` and `fake`, not `openai`).
+`modes` always lists `fast` and `sources`, and lists `deep` only when the model provider can use tools (`anthropic` and `fake`, not `openai`).
 
 ## Web page
 
 `GET /` serves a small built-in page for asking questions, for example in a standup. It is one self-contained HTML file embedded in the binary (no build step, no CDN) and needs no key to load. Open `LORE_URL/` (`http://localhost:8080/` with `make run`), paste a `read` key and type a question. Enter sends it, Shift+Enter adds a new line.
 
-The key stays in the browser's local storage (under `lore.key`) and is sent only to this server, as `Authorization: Bearer <key>`. If the browser blocks local storage, the page still works and you paste the key again on each visit. The answer shows with numbered citations that link to the sources; a source is a link only when its URL starts with `http://` or `https://`. The `deep` option is enabled only when `GET /v1/info` lists `deep` in `modes`.
+The key stays in the browser's local storage (under `lore.key`) and is sent only to this server, as `Authorization: Bearer <key>`. If the browser blocks local storage, the page still works and you paste the key again on each visit. The answer shows with numbered citations that link to the sources; a source is a link only when its URL starts with `http://` or `https://`. The `sources` option shows the sources as bullets without a model call. The `deep` option is enabled only when `GET /v1/info` lists `deep` in `modes`.
 
 The page logic is checked by `tests/web.rs`, which also runs `tests/web_pure.js` under node when node is installed.
 

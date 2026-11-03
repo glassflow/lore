@@ -471,11 +471,33 @@ async fn the_host_header_is_unchecked_unless_allowed_hosts_are_set(pool: PgPool)
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn ask_refuses_a_question_over_2000_characters_in_both_modes(pool: PgPool) {
+async fn ask_in_sources_mode_lists_the_hits_and_names_no_model(pool: PgPool) {
     let (url, key, _) = start(pool).await;
     let client = connect(&url, &key).await;
 
-    for mode in ["fast", "deep"] {
+    let res = call(
+        &client,
+        "ask",
+        json!({ "question": "how many plans are there?", "mode": "sources" }),
+    )
+    .await;
+    assert!(!is_error(&res), "{:?}", texts(&res));
+    let texts = texts(&res);
+    assert_eq!(texts.len(), 1);
+    let (answer, rest) = texts[0].split_once("\n\nSources:\n").expect("sources");
+    assert!(answer.lines().all(|l| l.starts_with("- [")), "{answer}");
+    assert!(answer.contains(PLANS), "{answer}");
+    let footer = rest.rsplit("\n\n").next().unwrap();
+    assert!(footer.starts_with("(sources mode, no model, "), "{footer}");
+    client.cancel().await.unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ask_refuses_a_question_over_2000_characters_in_every_mode(pool: PgPool) {
+    let (url, key, _) = start(pool).await;
+    let client = connect(&url, &key).await;
+
+    for mode in ["fast", "sources", "deep"] {
         let long = call(
             &client,
             "ask",

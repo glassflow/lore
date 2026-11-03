@@ -123,7 +123,7 @@ async fn the_overview_of_an_empty_server_has_its_facts(pool: PgPool) {
             "version": env.state.config.version,
             "llm": "fake",
             "embedder": "hash",
-            "modes": ["fast", "deep"],
+            "modes": ["fast", "sources", "deep"],
             "models": {
                 "fast": {"model": "fake", "effort": null},
                 "deep": {"model": "fake", "effort": null}

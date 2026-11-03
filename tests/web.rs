@@ -38,6 +38,7 @@ fn page_has_the_form_and_its_wiring() {
         r#"<input type="password" id="key""#,
         r#"<textarea id="question""#,
         r#"name="mode" value="fast""#,
+        r#"name="mode" value="sources""#,
         r#"name="mode" value="deep""#,
         r#"<button type="submit""#,
         "Ask your code, docs and agent sessions",
