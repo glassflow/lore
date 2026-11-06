@@ -250,11 +250,18 @@ pub async fn delete_tenant(
 ) -> Result<StatusCode, AppError> {
     let mut tx = state.pool.begin().await?;
     // Block new sources (their foreign-key check takes a key-share lock) before listing them.
+    // A push may already hold a tenant key-share lock: reject it rather than waiting.
     let tenant: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM tenants WHERE id = $1 FOR UPDATE")
+        sqlx::query_scalar("SELECT id FROM tenants WHERE id = $1 FOR UPDATE NOWAIT")
             .bind(tenant_id)
             .fetch_optional(&mut *tx)
-            .await?;
+            .await
+            .map_err(|e| match &e {
+                sqlx::Error::Database(db) if db.code().as_deref() == Some("55P03") => {
+                    AppError::Conflict("this tenant is busy; try again when its work ends".into())
+                }
+                _ => AppError::from(e),
+            })?;
     tenant.ok_or(AppError::NotFound)?;
     let mut ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM sources WHERE tenant_id = $1")
         .bind(tenant_id)

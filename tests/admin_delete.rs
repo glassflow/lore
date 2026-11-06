@@ -273,41 +273,15 @@ async fn tenant_delete_checks_a_source_created_concurrently(pool: PgPool) {
         .unwrap();
     let lock = env.state.source_locks.get(source);
     let _guard = lock.lock().await;
-    let deleting = {
-        let router = env.router.clone();
-        tokio::spawn(async move {
-            send(
-                &router,
-                "DELETE",
-                &format!("/v1/admin/tenants/{tenant}"),
-                "t",
-                Vec::new(),
-            )
-            .await
-        })
-    };
-    // The uncommitted source's FK holds a key-share lock on the tenant. Wait until the
-    // deletion reaches it, then make the new source visible.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let blocked: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-                 WHERE datname = current_database() AND wait_event_type = 'Lock'
-                 AND pid <> pg_backend_pid())",
-            )
-            .fetch_one(&env.pool)
-            .await
-            .unwrap();
-            if blocked {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    // The uncommitted source's FK holds a key-share lock on the tenant. Deletion
+    // must reject it without waiting, then also check the source lock on retry.
+    let path = format!("/v1/admin/tenants/{tenant}");
+    let (status, body) = tokio::time::timeout(Duration::from_secs(1), env.delete(&path))
+        .await
+        .expect("tenant deletion must not wait for source creation");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
     creating.commit().await.unwrap();
-    let (status, body) = deleting.await.unwrap();
+    let (status, body) = env.delete(&path).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let sources: i64 = sqlx::query_scalar("SELECT count(*) FROM sources WHERE id = $1")
         .bind(source)
@@ -315,6 +289,31 @@ async fn tenant_delete_checks_a_source_created_concurrently(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(sources, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_held_tenant_key_share_returns_409_without_waiting(pool: PgPool) {
+    let env = env(pool);
+    let (tenant, _key, source) = env.full_tenant("acme").await;
+    let before = rows_of(&env.pool, tenant).await;
+    let mut pushing = env.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR KEY SHARE")
+        .bind(tenant)
+        .execute(&mut *pushing)
+        .await
+        .unwrap();
+    let path = format!("/v1/admin/tenants/{tenant}");
+    let (status, body) = tokio::time::timeout(Duration::from_secs(1), env.delete(&path))
+        .await
+        .expect("tenant deletion must not wait for an active push transaction");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(rows_of(&env.pool, tenant).await, before);
+    assert!(env.repo_dir(source).exists());
+
+    pushing.rollback().await.unwrap();
+    let (status, body) = env.delete(&path).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!env.repo_dir(source).exists());
 }
 
 #[sqlx::test(migrations = "./migrations")]
