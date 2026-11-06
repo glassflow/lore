@@ -35,6 +35,23 @@ curl -X PUT "localhost:8080/v1/repos/<id>/bundle?ref=$(git rev-parse HEAD)&full=
 
 `ref` is the full 40 character lowercase sha of the bundle's `HEAD`. With `full=true` the bundle holds the whole history and the tree is re-indexed, deleting documents of files that are gone. With `full=false` the bundle may be incremental (`git bundle create out.bundle <last-sha>..HEAD`) and only changed files are indexed. If the server no longer has the last indexed commit, or the bundle needs commits it lacks, the answer is 409 (`need_full_bundle`) and the client sends a full bundle. The answer is a report with `indexed_commit`, `files_indexed`, `files_unchanged`, `files_skipped`, `files_deleted` and `chunks`.
 
+Repo indexing publishes atomically. While a push runs, search sees the previous complete index
+(or no repo chunks on its first push). Changed, new and deleted files and `indexed_commit`
+become visible together after success. A failed or cancelled push leaves the previous index
+visible. Unchanged files keep their existing chunks and embeddings.
+
+Each search uses one database snapshot for lexical ranking, vector ranking and returned text,
+even if a push finishes between those steps. Stored document reads likewise keep metadata and
+chunks on one snapshot. Separate requests can observe different completed pushes. This does
+not pin deep-mode or MCP `grep` and `read_file`: those tools read the live checkout, which may
+already contain the incoming commit while indexing is still running or after a failed push.
+
+The atomic write uses one database transaction and connection for the duration of indexing,
+including embedding. It does not buffer the whole repo in application memory or copy unchanged
+chunks, but a large update retains old row versions until publication and until older readers
+finish. Concurrent pushes to different sources each use a connection; when the pool is full,
+other requests wait for one. Pushes to the same source remain serialized.
+
 Symlinks, submodules, binary or non-UTF-8 files, files over 256 KiB, and lock files, build output and vendored directories are skipped and counted in `files_skipped`.
 
 ## Index a repo

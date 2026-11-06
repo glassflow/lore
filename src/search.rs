@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use pgvector::Vector;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::embed::{Embedder, embed_query_async};
@@ -207,8 +207,14 @@ pub async fn search(
         source: query.source.as_deref(),
     };
 
-    let lexical = lexical_branch(pool, q, &filter).await?;
-    let vector_hits = vector_branch(pool, embedder, q, &filter).await?;
+    // A push can commit between any two queries, including ranking and hydration. One MVCC
+    // snapshot keeps every branch on the same version, even when its old chunks are deleted.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let lexical = lexical_branch(&mut tx, q, &filter).await?;
+    let vector_hits = vector_branch(&mut tx, embedder, q, &filter).await?;
     let vector: Vec<i64> = vector_hits.iter().map(|(id, _)| *id).collect();
     // The enumerations the vector branch found, in its order: an enumeration far from the query
     // in meaning is not lifted, however few enumerations there are.
@@ -222,6 +228,7 @@ pub async fn search(
     let mut fused = fuse(&[&lexical, &vector, &enumerations]);
     fused.truncate(k);
     if fused.is_empty() {
+        tx.commit().await?;
         return Ok(Vec::new());
     }
 
@@ -241,10 +248,10 @@ pub async fn search(
     )
     .bind(&ids)
     .bind(query.tenant_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     let mut by_id: HashMap<i64, HitRow> = rows.into_iter().map(|r| (r.id, r)).collect();
-    // A chunk deleted since the branches ran is simply missing.
     Ok(fused
         .into_iter()
         .filter_map(|(id, score)| by_id.remove(&id).map(|row| row.into_hit(score)))
@@ -258,11 +265,15 @@ struct Filter<'a> {
     source: Option<&'a str>,
 }
 
-async fn lexical_branch(pool: &PgPool, q: &str, f: &Filter<'_>) -> Result<Vec<i64>, AppError> {
+async fn lexical_branch(
+    conn: &mut PgConnection,
+    q: &str,
+    f: &Filter<'_>,
+) -> Result<Vec<i64>, AppError> {
     let lexemes: Vec<String> =
         sqlx::query_scalar("SELECT tsvector_to_array(to_tsvector('english', $1))")
             .bind(q)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
     let Some(tsquery) = or_query(&lexemes) else {
         return Ok(Vec::new());
@@ -282,14 +293,14 @@ async fn lexical_branch(pool: &PgPool, q: &str, f: &Filter<'_>) -> Result<Vec<i6
     .bind(f.kinds)
     .bind(f.source)
     .bind(BRANCH_LIMIT)
-    .fetch_all(pool)
+    .fetch_all(conn)
     .await?;
     Ok(ids)
 }
 
 /// The nearest chunks, best first, each with whether it is an enumeration.
 async fn vector_branch(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     embedder: Arc<dyn Embedder>,
     q: &str,
     f: &Filter<'_>,
@@ -297,12 +308,11 @@ async fn vector_branch(
     let embedding = embed_query_async(embedder, q.to_string()).await?;
     // The filters are applied after the index scan, so let it keep scanning until it has enough
     // rows that pass them.
-    let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL hnsw.iterative_scan = 'relaxed_order'")
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     sqlx::query("SET LOCAL hnsw.ef_search = 100")
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     let hits = sqlx::query_as(
         "SELECT c.id, c.enumerates
@@ -319,9 +329,8 @@ async fn vector_branch(
     .bind(f.source)
     .bind(Vector::from(embedding))
     .bind(BRANCH_LIMIT)
-    .fetch_all(&mut *tx)
+    .fetch_all(conn)
     .await?;
-    tx.commit().await?;
     Ok(hits)
 }
 

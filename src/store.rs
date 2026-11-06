@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use pgvector::Vector;
 use serde::Serialize;
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::chunk::{Chunk, embed_text, lexical_text};
@@ -242,6 +242,11 @@ async fn load_document(
     tenant_id: Uuid,
     document_id: Uuid,
 ) -> sqlx::Result<Option<(DocumentRow, String)>> {
+    // Metadata and chunks must describe the same document version across a repo publication.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let found: Option<StoredDocument> = sqlx::query_as(
         "SELECT d.id, d.source_id, s.name AS source, d.kind, d.title, d.uri, d.metadata,
                 d.metadata->>'path' AS path, d.body
@@ -251,12 +256,14 @@ async fn load_document(
     )
     .bind(document_id)
     .bind(tenant_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(StoredDocument { row, body }) = found else {
+        tx.commit().await?;
         return Ok(None);
     };
     if let Some(body) = body {
+        tx.commit().await?;
         return Ok(Some((row, body)));
     }
     let chunks: Vec<(String, i32, i32)> = sqlx::query_as(
@@ -265,8 +272,9 @@ async fn load_document(
     )
     .bind(document_id)
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Some((row, join_chunks(&chunks))))
 }
 
@@ -298,11 +306,15 @@ fn join_chunks(chunks: &[(String, i32, i32)]) -> String {
 
 /// Records the commit a repo source has been indexed up to. `source_id` comes from a `Source` the
 /// caller already fetched for its tenant.
-pub async fn set_indexed_commit(pool: &PgPool, source_id: Uuid, sha: &str) -> sqlx::Result<()> {
+pub async fn set_indexed_commit<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
+    source_id: Uuid,
+    sha: &str,
+) -> sqlx::Result<()> {
     sqlx::query("UPDATE sources SET indexed_commit = $2, updated_at = now() WHERE id = $1")
         .bind(source_id)
         .bind(sha)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
@@ -344,8 +356,8 @@ pub async fn upsert_document(
 }
 
 /// The stored content hash of a document, for skipping files that did not change.
-pub async fn document_hash(
-    pool: &PgPool,
+pub async fn document_hash<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
     source_id: Uuid,
     external_id: &str,
 ) -> sqlx::Result<Option<String>> {
@@ -354,15 +366,18 @@ pub async fn document_hash(
     )
     .bind(source_id)
     .bind(external_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// The external ids of every document of a source.
-pub async fn list_external_ids(pool: &PgPool, source_id: Uuid) -> sqlx::Result<Vec<String>> {
+pub async fn list_external_ids<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
+    source_id: Uuid,
+) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar("SELECT external_id FROM documents WHERE source_id = $1")
         .bind(source_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
 }
 
@@ -452,8 +467,8 @@ fn embedding_key(text: &str, symbols: &[String]) -> String {
 /// because then the stored vectors were made from another `embed_text`. All callers of
 /// `index_text` store the title they embed with, so a stored title that differs means the title
 /// changed and every chunk has to be embedded again.
-async fn stored_embeddings(
-    pool: &PgPool,
+async fn stored_embeddings<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
     tenant_id: Uuid,
     source_id: Uuid,
     external_id: &str,
@@ -469,7 +484,7 @@ async fn stored_embeddings(
     .bind(source_id)
     .bind(external_id)
     .bind(title_for_embed)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()
@@ -523,7 +538,6 @@ pub async fn index_text_with_stats(
     if source.tenant_id != tenant_id || doc.tenant_id != tenant_id || doc.source_id != source.id {
         bail!("document does not belong to the source and tenant");
     }
-    let lexicals: Vec<String> = chunks.iter().map(lexical_text).collect();
     let stored = stored_embeddings(
         &state.pool,
         tenant_id,
@@ -532,6 +546,43 @@ pub async fn index_text_with_stats(
         title_for_embed,
     )
     .await?;
+    let (indexed, stats) = prepare_chunks(state, chunks, title_for_embed, stored).await?;
+    let mut tx = state.pool.begin().await?;
+    let document_id = upsert_document(&mut tx, &doc).await?;
+    replace_chunks(&mut tx, tenant_id, document_id, &indexed).await?;
+    tx.commit().await?;
+    Ok(stats)
+}
+
+/// Repo pushes keep every changed document in the same transaction. Use that connection for
+/// lookups too, so concurrent pushes cannot exhaust the pool waiting for a second connection.
+pub(crate) async fn index_repo_text(
+    state: &AppState,
+    tx: &mut Transaction<'_, Postgres>,
+    doc: NewDocument,
+    chunks: Vec<Chunk>,
+) -> Result<IndexStats> {
+    let stored = stored_embeddings(
+        &mut **tx,
+        doc.tenant_id,
+        doc.source_id,
+        &doc.external_id,
+        &doc.title,
+    )
+    .await?;
+    let (indexed, stats) = prepare_chunks(state, chunks, &doc.title, stored).await?;
+    let id = upsert_document(tx, &doc).await?;
+    replace_chunks(tx, doc.tenant_id, id, &indexed).await?;
+    Ok(stats)
+}
+
+async fn prepare_chunks(
+    state: &AppState,
+    chunks: Vec<Chunk>,
+    title_for_embed: &str,
+    stored: HashMap<String, Vec<f32>>,
+) -> Result<(Vec<IndexedChunk>, IndexStats)> {
+    let lexicals: Vec<String> = chunks.iter().map(lexical_text).collect();
     let mut embeddings: Vec<Option<Vec<f32>>> = chunks
         .iter()
         .map(|c| {
@@ -584,15 +635,12 @@ pub async fn index_text_with_stats(
         })
         .collect();
 
-    let mut tx = state.pool.begin().await?;
-    let document_id = upsert_document(&mut tx, &doc).await?;
-    replace_chunks(&mut tx, tenant_id, document_id, &indexed).await?;
-    tx.commit().await?;
-    Ok(IndexStats {
+    let stats = IndexStats {
         chunks: indexed.len(),
         embedded,
         embed_time,
-    })
+    };
+    Ok((indexed, stats))
 }
 
 /// Rows per `INSERT` of spans: 14 binds each stays well under Postgres's 65535 limit.
