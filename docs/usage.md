@@ -4,7 +4,7 @@ Tenants and keys, indexing, search, traces, documents, answers, the web pages an
 
 ## Tenants and keys
 
-lore is multi-tenant. Each tenant has API keys with the scopes `ingest` and `read`. Keys look like `lk_` followed by 40 hex characters, and only their SHA-256 hash is stored, so a key is shown once, when it is created. An admin token (`LORE_ADMIN_TOKEN` on the server) creates tenants and keys. Without it the admin API answers 403.
+lore is multi-tenant. Each tenant has API keys with the scopes `ingest` and `read`. Keys look like `lk_` followed by 40 hex characters, and only their SHA-256 hash is stored, so a key is shown once, when it is created. An admin token (`LORE_ADMIN_TOKEN` on the server) creates and deletes tenants and keys, and deletes sources. Without it the admin API answers 403.
 
 The CLI talks to the server over HTTP. `--url`, `--key` and `--admin-token` are global flags (env `LORE_URL`, `LORE_KEY`, `LORE_ADMIN_TOKEN`), and the `admin` and `me` subcommands print the server's JSON.
 
@@ -15,10 +15,18 @@ lore admin tenant list
 lore admin key create --tenant <id>             # {"id": "...", "key": "lk_...", ...}; add --scopes read to limit it
 lore admin key list --tenant <id>               # prefixes only, never the key or its hash
 lore admin key revoke <key-id>                  # the key stops working at once
+lore admin source delete <source-id>            # {"id": "...", "deleted": true}
+lore admin tenant delete <tenant-id>            # {"id": "...", "deleted": true}
 lore --key lk_... me                            # {"tenant_id": "...", "tenant_name": "demo", "scopes": [...]}
 ```
 
 Tenant names are 1 to 64 characters of `a-z`, `0-9` and `-`. Send keys as `Authorization: Bearer lk_...`.
+
+### Deleting tenants and sources
+
+`DELETE /v1/admin/tenants/{id}` deletes a tenant with everything it holds: its sources, documents, chunks, trace spans, queued sessions and keys, in one transaction. `DELETE /v1/admin/sources/{id}` deletes one source with its documents and chunks. Both answer 204, or 404 when the id is unknown, and then remove the repo mirror and checkout of each deleted repo source (`$LORE_DATA_DIR/repos/<source id>`). While a push to the source, or to any source of the tenant, is running or waiting, the delete answers 409 and changes nothing; try again when the push ends. Deleting the `traces` source (the session transcripts) does not delete the tenant's spans, so a session that gets new spans is indexed again.
+
+Postgres reuses the space of the deleted rows after `VACUUM` (autovacuum runs it on its own), but it does not give it back to the file system, so the database size on the admin page does not shrink. `VACUUM FULL` rewrites the tables to shrink them, and locks them while it runs.
 
 ## Repos
 
@@ -194,9 +202,10 @@ The page logic is checked by `tests/web.rs`, which also runs `tests/web_pure.js`
 
 The page shows:
 
+- **New tenant**: creates a tenant from its name. Create a key for it in its card.
 - **Server**: version, embedder, model provider, the fast and deep models with their effort, the process's memory now and at its peak (Linux only), and the number of tenants, sources, documents and chunks.
 - **Pushes**: the repo pushes that are running, and the last 20 that ended, with their state (`waiting` for another push to the same source, `fetching` the bundle, `indexing`, `done` or `failed`), files done out of the total, chunks written, how many of those were embedded and how many kept their stored vector, the time spent embedding, and why a failed push failed. While a push runs the list refreshes every 3 seconds, otherwise every 30. When a push ends, the counts are read again.
-- **Tenants**: for each tenant its sources (name, kind, indexed commit, documents, chunks, size on disk for repos, and when it was last indexed) and its keys (prefix, scopes, created, revoked). **Create key** makes a key with the ticked scopes and shows it once, with a copy button. **Revoke** asks for a confirmation first.
+- **Tenants**: for each tenant its sources (name, kind, indexed commit, documents, chunks, size on disk for repos, and when it was last indexed) and its keys (prefix, scopes, created, revoked). **Create key** makes a key with the ticked scopes and shows it once, with a copy button. **Revoke** asks for a confirmation first. **Delete tenant** and each source's **Delete** say what goes with it and ask you to type the name to confirm; a push in progress makes them fail with a message.
 - **Storage**: the database size, the repo mirrors and checkouts on disk, each table's data and index bytes, and each index with its kind (the vector index is `hnsw`, the full-text index `gin`).
 
 Push progress is kept in memory, so a restart forgets it, and only repo pushes are tracked. The CLI stops waiting for a push after 15 minutes, but the server finishes it; the page shows when it does.
@@ -212,7 +221,7 @@ curl -H "Authorization: Bearer $LORE_ADMIN_TOKEN" localhost:8080/v1/admin/pushes
 
 `GET /v1/admin/pushes` answers `{"now", "since", "running", "recent"}`, newest first. `since` is when the server started. A push has `id`, `tenant` (null when the tenant is gone), `tenant_id`, `source`, `source_id`, `commit`, `full`, `state`, `started_at`, `finished_at`, `files_total` (null until the bundle is fetched), `files_done`, `chunks`, `chunks_embedded`, `embed_ms` and `error`. `embed_ms` is wall-clock time in the embedder, including waits while another push uses it. CPU and memory are not measured per push: pushes and searches share one process.
 
-Keys are created and revoked with the existing `POST /v1/admin/tenants/{id}/keys` and `DELETE /v1/admin/keys/{id}`. The page sets `Content-Security-Policy` so it can only talk to its own server and cannot be framed, and `Cache-Control: no-store`. Its logic is checked by `tests/web.rs`, which runs `tests/web_admin_pure.js` under node when node is installed.
+Keys are created and revoked with the existing `POST /v1/admin/tenants/{id}/keys` and `DELETE /v1/admin/keys/{id}`, tenants created with `POST /v1/admin/tenants`, and tenants and sources deleted with `DELETE /v1/admin/tenants/{id}` and `DELETE /v1/admin/sources/{id}` (see [Deleting tenants and sources](#deleting-tenants-and-sources)). The page sets `Content-Security-Policy` so it can only talk to its own server and cannot be framed, and `Cache-Control: no-store`. Its logic is checked by `tests/web.rs`, which runs `tests/web_admin_pure.js` under node when node is installed.
 
 ## Use lore from agents
 

@@ -279,6 +279,21 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// Removes the mirror and checkout of each source, `<data_dir>/repos/<source_id>`. A missing
+/// directory is fine; any other failure is logged and the next directory is still removed.
+pub async fn remove_repo_dirs(data_dir: &Path, source_ids: &[Uuid]) {
+    for id in source_ids {
+        let dir = data_dir.join("repos").join(id.to_string());
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => tracing::info!(source = %id, "repo directory removed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(source = %id, dir = %dir.display(), error = %e, "could not remove the repo directory")
+            }
+        }
+    }
+}
+
 /// True for exactly 40 lowercase hex characters.
 pub fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))

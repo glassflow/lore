@@ -120,7 +120,7 @@ The first start downloads the embedding model (about 130 MB). After that, search
   Then tell Claude to use it, with a line in `CLAUDE.md` such as "Use lore's search tool first to find the relevant code." [The full line](docs/usage.md#use-lore-from-agents), and [why](docs/benchmarks.md#tell-claude-to-start-with-lore).
 - **Agent traces:** send OpenTelemetry GenAI spans to `/v1/traces`, and ask about past sessions.
 - **Notes and docs:** `lore doc put` indexes anything that isn't in a repo.
-- **The admin page:** open `http://localhost:8080/admin` and paste the admin token to see tenants, sources, keys, storage and push progress, and to create or revoke keys.
+- **The admin page:** open `http://localhost:8080/admin` and paste the admin token to see tenants, sources, keys, storage and push progress, and to create tenants, create or revoke keys, and delete tenants and sources.
 
 ## Offline
 
