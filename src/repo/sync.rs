@@ -47,8 +47,8 @@ pub struct SyncReport {
     pub report: IndexReport,
     /// The remote's head was already indexed.
     pub up_to_date: bool,
-    /// The whole tree was indexed: the source's first index, or the last indexed commit was gone
-    /// from the mirror.
+    /// The whole tree was indexed: the source's first index, a history rewrite, or the last
+    /// indexed commit was gone from the mirror.
     pub full: bool,
 }
 
@@ -258,6 +258,8 @@ pub async fn sync_repo(state: &AppState, source: &Source) -> Result<SyncReport, 
     if source.kind != "repo" {
         return Err(IngestError::BadRequest("source is not a repo".to_string()).into());
     }
+    let lock = state.source_locks.get(source.id);
+    let _guard = lock.lock().await;
     let result = sync_locked(state, source).await;
     if matches!(result, Err(SyncError::NoRemote)) {
         return result;
@@ -274,9 +276,6 @@ pub async fn sync_repo(state: &AppState, source: &Source) -> Result<SyncReport, 
 }
 
 async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, SyncError> {
-    let lock = state.source_locks.get(source.id);
-    let _guard = lock.lock().await;
-
     // Read again under the lock: a push may have moved the indexed commit while this waited.
     let source = get_source(&state.pool, source.tenant_id, source.id)
         .await?
@@ -298,7 +297,7 @@ async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, Sy
 
     let paths = RepoPaths::new(&state.config.data_dir, source.id)?;
     ensure_mirror(&paths).await?;
-    let head = fetch_remote(&paths, &url, token.as_deref(), allow_file).await?;
+    let head = fetch_remote(&paths, &url, token.as_deref(), allow_file, false).await?;
 
     if source.indexed_commit.as_deref() == Some(head.as_str()) {
         // A lost data volume leaves the index intact but no checkout for deep mode.
@@ -323,6 +322,17 @@ async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, Sy
     }
 
     let mut full = source.indexed_commit.is_none();
+    if let Some(indexed) = source.indexed_commit.as_deref()
+        && paths
+            .mirror_git(&["merge-base", "--is-ancestor", indexed, &head])
+            .await
+            .is_err()
+    {
+        // A force push or a lost mirror: ask for all objects again, without negotiation
+        // based on the old history, then reconcile the entire indexed tree.
+        fetch_remote(&paths, &url, token.as_deref(), allow_file, true).await?;
+        full = true;
+    }
     let push = state.pushes.start(&source, &head, full);
     push.fetching();
     let mut result = index_commit(state, &source, &paths, &head, full, &push).await;
@@ -354,6 +364,7 @@ async fn fetch_remote(
     url: &str,
     token: Option<&str>,
     allow_file: bool,
+    refetch: bool,
 ) -> Result<String, SyncError> {
     let git_dir = format!("--git-dir={}", paths.mirror);
     let protocols = if allow_file { "https:file" } else { "https" };
@@ -368,7 +379,11 @@ async fn fetch_remote(
             ("GIT_CONFIG_VALUE_0", h.as_str()),
         ]);
     }
-    let args = [&git_dir, "fetch", "--no-tags", "-q", "--", url, "HEAD"];
+    let mut args = vec![git_dir.as_str(), "fetch", "--no-tags", "-q"];
+    if refetch {
+        args.push("--refetch");
+    }
+    args.extend(["--", url, "HEAD"]);
     let fetch = git_env(&args, &envs);
     match tokio::time::timeout(FETCH_TIMEOUT, fetch).await {
         Err(_) => return Err(SyncError::Fetch("timed out".to_string())),

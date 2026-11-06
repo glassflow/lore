@@ -192,6 +192,23 @@ async fn sync_indexes_the_remote_then_only_what_changed(pool: PgPool) {
     let docs = doc_paths(&pool, id).await;
     assert!(docs.contains(&"NOTES.md".to_string()));
     assert!(!docs.contains(&"scripts/seed.py".to_string()));
+    let (status, search) = send(
+        &env.router,
+        "GET",
+        "/v1/search?q=Sync%20works&source=sample",
+        &env.key,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(
+        search["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["path"] == "NOTES.md"),
+        "{search}"
+    );
 
     let admin = admin_source(&env, id).await;
     assert_eq!(admin["remote_url"], file_url(remote.path()));
@@ -261,6 +278,7 @@ async fn a_rewritten_history_is_indexed_correctly(pool: PgPool) {
     commit_all(&remote, "other");
     let report = sync_ok(&env, id).await;
     assert_eq!(report["indexed_commit"], head(&remote));
+    assert_eq!(report["full"], true);
     let docs = doc_paths(&pool, id).await;
     assert!(docs.contains(&"other.md".to_string()));
     assert!(!docs.contains(&"extra.md".to_string()), "{docs:?}");
