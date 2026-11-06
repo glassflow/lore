@@ -117,8 +117,8 @@ main() {
   names=$(printf '%s' "$tools" | jq -er '[.result.tools[].name] | sort | join(" ")') \
     || fail "tools/list gave no tools: ${tools:0:400}"
   echo "$names"
-  [ "$names" = "ask get_document list_sources search" ] \
-    || fail "expected the tools 'ask get_document list_sources search', got '$names'"
+  [ "$names" = "ask callers definition get_document list_sources search" ] \
+    || fail "expected the tools 'ask callers definition get_document list_sources search', got '$names'"
 
   # 4. search.
   search=$(tool_call 3 search '{"query":"plan limits"}') || exit 1

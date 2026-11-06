@@ -405,11 +405,11 @@ async fn insert_chunk(
     sqlx::query(
         "INSERT INTO chunks
            (tenant_id, document_id, ord, text, start_line, end_line, symbols, tsv, embedding,
-            enumerates)
+            enumerates, defines, calls)
          VALUES ($1, $2, $3, $4, $5, $6, $7,
                  setweight(to_tsvector('english', $8::text), 'A')
                    || setweight(to_tsvector('english', $9::text), 'B'),
-                 $10, $11)",
+                 $10, $11, $12, $13)",
     )
     .bind(tenant_id)
     .bind(document_id)
@@ -422,6 +422,8 @@ async fn insert_chunk(
     .bind(&c.lexical)
     .bind(Vector::from(c.embedding.clone()))
     .bind(c.chunk.enumerates)
+    .bind(&c.chunk.defines)
+    .bind(&c.chunk.calls)
     .execute(conn)
     .await?;
     Ok(())

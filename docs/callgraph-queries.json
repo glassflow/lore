@@ -1,0 +1,9 @@
+{
+  "commit": "105500e75cdf3d65886d5220ca070440735b50bb",
+  "questions": [
+    {"id":"symbols-01","repo":"lore","category":"where","q":"where does index_text get called for sessions?","need":"any","gold":[{"path":"src/sessions.rs","start":645,"end":645}]},
+    {"id":"symbols-02","repo":"lore","category":"where","q":"where is document_text used by the MCP tool?","need":"any","gold":[{"path":"src/mcp.rs","start":239,"end":239}]},
+    {"id":"symbols-03","repo":"lore","category":"how","q":"how does session_id choose a session and bound its length?","need":"all","gold":[{"path":"src/otlp/mod.rs","start":210,"end":223},{"path":"src/otlp/mod.rs","start":227,"end":234}]},
+    {"id":"symbols-04","repo":"lore","category":"how","q":"how does index_text embed chunks asynchronously?","need":"all","gold":[{"path":"src/store.rs","start":555,"end":555},{"path":"src/embed/mod.rs","start":41,"end":50}]}
+  ]
+}

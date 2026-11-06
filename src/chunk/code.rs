@@ -4,7 +4,7 @@
 use tree_sitter::{Node, Parser};
 
 use super::lines::{self, windows};
-use super::{Chunk, ChunkKind, Language};
+use super::{Chunk, ChunkKind, Language, calls};
 
 /// An item of at most this many lines is one chunk.
 const MAX_ITEM_LINES: usize = 150;
@@ -28,9 +28,9 @@ impl Span {
     }
 }
 
-struct Source<'a> {
-    text: &'a str,
-    lines: &'a [&'a str],
+pub(super) struct Source<'a> {
+    pub(super) text: &'a str,
+    pub(super) lines: &'a [&'a str],
 }
 
 pub fn chunk(lang: Language, content: &str) -> Vec<Chunk> {
@@ -75,6 +75,7 @@ pub fn chunk(lang: Language, content: &str) -> Vec<Chunk> {
     out.extend(gap_chunks(&src, &covered, 0, lines.len() - 1, &[], false));
     // Items and gaps were collected separately; put them back in file order.
     out.sort_by_key(|c| c.start_line);
+    calls::annotate(lang, &src, root, &mut out);
     out
 }
 
@@ -110,7 +111,7 @@ fn unwrap_wrapper(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn is_item_kind(lang: Language, kind: &str) -> bool {
+pub(super) fn is_item_kind(lang: Language, kind: &str) -> bool {
     match lang {
         Language::Rust => matches!(
             kind,
@@ -149,7 +150,7 @@ fn is_item_kind(lang: Language, kind: &str) -> bool {
 }
 
 /// Items whose members are chunked separately when the item is too long.
-fn is_container_kind(kind: &str) -> bool {
+pub(super) fn is_container_kind(kind: &str) -> bool {
     matches!(
         kind,
         "impl_item"
@@ -215,7 +216,7 @@ fn mark(covered: &mut [bool], span: Span) {
     }
 }
 
-fn node_text<'a>(src: &'a Source, node: Node<'_>) -> &'a str {
+pub(super) fn node_text<'a>(src: &'a Source, node: Node<'_>) -> &'a str {
     src.text.get(node.byte_range()).unwrap_or("")
 }
 
@@ -225,7 +226,7 @@ fn field_text(src: &Source, node: Node<'_>, field: &str) -> Option<String> {
 }
 
 /// The names an item is known by.
-fn symbols_of(src: &Source, node: Node<'_>) -> Vec<String> {
+pub(super) fn symbols_of(src: &Source, node: Node<'_>) -> Vec<String> {
     match node.kind() {
         // `impl Trait for Type` is known as `Type`.
         "impl_item" => field_text(src, node, "type").into_iter().collect(),

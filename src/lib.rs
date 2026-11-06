@@ -1,5 +1,6 @@
 pub mod answer;
 pub mod auth;
+pub mod callgraph;
 pub mod chunk;
 pub mod cli;
 pub mod config;

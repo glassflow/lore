@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::answer::{self, AskRequest, AskResponse, Citation, Mode};
 use crate::auth::{Caller, Scope, caller_from_headers};
+use crate::callgraph;
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::search::{Hit, SearchQuery, query_terms, search};
@@ -33,7 +34,7 @@ use crate::store::{DocumentRow, document_text, list_source_summaries};
 
 /// What the server tells a client about itself. Agents read it, so it says what each tool costs:
 /// left alone, an agent tends to call `ask`, which runs a second model, where `search` would do.
-const INSTRUCTIONS: &str = "lore indexes code, documents and agent sessions. Start with `search`: it is fast, runs no language model, and returns the matching lines with their paths and line numbers. `get_document` reads one document in full. `ask` has lore's own model write an answer, which takes seconds to a minute: prefer `search` when you can read the code yourself. `list_sources` names what is indexed.";
+const INSTRUCTIONS: &str = "lore indexes code, documents and agent sessions. Start with `search`: it is fast, runs no language model, and returns the matching lines with their paths and line numbers. `definition` and `callers` look up exact symbols without a model and label ambiguous matches. `get_document` reads one document in full. `ask` has lore's own model write an answer, which takes seconds to a minute: prefer `search` when you can read the code yourself. `list_sources` names what is indexed.";
 
 /// Hits returned by `search` when `k` is not given.
 const DEFAULT_SEARCH_K: usize = 8;
@@ -137,6 +138,14 @@ pub struct GetDocumentArgs {
     document_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymbolArgs {
+    /// Exact, case-sensitive name, optionally qualified: `chunk_file` or `Plan::limits`.
+    symbol: String,
+    /// Only this indexed source.
+    source: Option<String>,
+}
+
 fn ok(content: Vec<String>) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::success(
         content.into_iter().map(ContentBlock::text).collect(),
@@ -167,6 +176,32 @@ fn caller_of(parts: &Parts) -> Result<Caller, ErrorData> {
 
 #[tool_router]
 impl LoreMcp {
+    #[tool(
+        description = "Find indexed definitions of an exact symbol, optionally qualified as module::name or Type::method. No model. Returns code excerpts and document ids; multiple definitions are explicitly ambiguous.",
+        annotations(read_only_hint = true)
+    )]
+    async fn definition(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<SymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.symbol_lookup(caller_of(&parts)?.tenant_id, args, false)
+            .await
+    }
+
+    #[tool(
+        description = "Find code chunks calling an indexed symbol. No model. Prefers the caller's own file, then an import or type path, then a unique name. Ambiguous matches are labeled; this is syntax-based, not compiler type resolution.",
+        annotations(read_only_hint = true)
+    )]
+    async fn callers(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<SymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.symbol_lookup(caller_of(&parts)?.tenant_id, args, true)
+            .await
+    }
+
     #[tool(
         description = "Find code, documents and agent sessions by name and by meaning. Fast: well under a second, no language model. Returns the best hits as text: a header per hit (source, path:lines, kind, symbols, document id), then up to 12 numbered lines of it that best match the query. Often enough to answer; read the file, or call get_document, when you need more.",
         annotations(read_only_hint = true)
@@ -259,6 +294,91 @@ impl LoreMcp {
             Ok(json) => ok(vec![json]),
             Err(e) => app_failed(AppError::Internal(e.into())),
         }
+    }
+}
+
+impl LoreMcp {
+    async fn symbol_lookup(
+        &self,
+        tenant_id: Uuid,
+        args: SymbolArgs,
+        want_callers: bool,
+    ) -> Result<CallToolResult, ErrorData> {
+        if args.symbol.len() > 512
+            || args
+                .source
+                .as_deref()
+                .is_some_and(|s| s.len() > 100 || s.contains('\0'))
+        {
+            return failed(
+                "symbol must be at most 512 bytes; source at most 100 bytes without NUL",
+            );
+        }
+        let Some(symbol) = callgraph::parse_symbol(&args.symbol) else {
+            return failed("symbol must be an identifier, optionally qualified as module::name");
+        };
+        let scope = callgraph::Scope {
+            tenant_id,
+            kinds: None,
+            source: args.source.as_deref().filter(|s| !s.trim().is_empty()),
+        };
+        let result = if want_callers {
+            callgraph::callers(&self.state.pool, &scope, &symbol).await
+        } else {
+            callgraph::definition_lookup(&self.state.pool, &scope, &symbol).await
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => return app_failed(e),
+        };
+        if result.definitions.is_empty() {
+            if result.truncated {
+                return ok(vec!["No matching definition in the first 100 candidates. Lookup truncated; narrow the source.".into()]);
+            }
+            return ok(vec![
+                "No indexed definition. Re-push older repositories with --full to extract symbols."
+                    .into(),
+            ]);
+        }
+        let mut out = if result.definitions.len() > 1 {
+            format!(
+                "Ambiguous: {} definition chunks. Qualify the symbol or filter source.\n\n",
+                result.definitions.len()
+            )
+        } else {
+            String::new()
+        };
+        let sites: Vec<_> = if want_callers {
+            result.callers.iter().map(|c| &c.site).collect()
+        } else {
+            result.definitions.iter().collect()
+        };
+        let ids: Vec<_> = sites.iter().map(|s| s.chunk_id).collect();
+        let mut hits = match crate::search::hits_by_id(&self.state.pool, tenant_id, &ids).await {
+            Ok(hits) => hits,
+            Err(e) => return app_failed(e),
+        };
+        if sites.is_empty() {
+            out.push_str("No indexed callers.");
+        }
+        let terms = query_terms(&symbol.name);
+        for (i, site) in sites.iter().enumerate() {
+            if let Some(hit) = hits.remove(&site.chunk_id) {
+                if want_callers {
+                    let caller = &result.callers[i];
+                    out.push_str(&format!(
+                        "Match: {:?} ({} candidate definitions)\n",
+                        caller.resolution, caller.definitions
+                    ));
+                }
+                out.push_str(&render_hit(i + 1, &hit, &terms));
+                out.push_str("\n\n");
+            }
+        }
+        if result.truncated {
+            out.push_str("Lookup truncated: at most 100 definition candidates and 200 caller candidates. Narrow the source.");
+        }
+        ok(vec![out])
     }
 }
 

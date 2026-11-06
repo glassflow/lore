@@ -138,7 +138,7 @@ async fn raw_initialize(url: &str, headers: &[(&str, &str)]) -> reqwest::Respons
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn lists_the_four_tools_and_describes_the_server(pool: PgPool) {
+async fn lists_the_six_tools_and_describes_the_server(pool: PgPool) {
     let (url, key, _) = start(pool).await;
     let client = connect(&url, &key).await;
 
@@ -150,7 +150,17 @@ async fn lists_the_four_tools_and_describes_the_server(pool: PgPool) {
         .map(|t| t.name.to_string())
         .collect();
     names.sort();
-    assert_eq!(names, ["ask", "get_document", "list_sources", "search"]);
+    assert_eq!(
+        names,
+        [
+            "ask",
+            "callers",
+            "definition",
+            "get_document",
+            "list_sources",
+            "search"
+        ]
+    );
 
     let info = client.peer_info().expect("server info");
     let server = info.server_info.as_ref().expect("server name and version");
@@ -159,9 +169,95 @@ async fn lists_the_four_tools_and_describes_the_server(pool: PgPool) {
     assert_eq!(
         info.instructions.as_deref(),
         Some(
-            "lore indexes code, documents and agent sessions. Start with `search`: it is fast, runs no language model, and returns the matching lines with their paths and line numbers. `get_document` reads one document in full. `ask` has lore's own model write an answer, which takes seconds to a minute: prefer `search` when you can read the code yourself. `list_sources` names what is indexed."
+            "lore indexes code, documents and agent sessions. Start with `search`: it is fast, runs no language model, and returns the matching lines with their paths and line numbers. `definition` and `callers` look up exact symbols without a model and label ambiguous matches. `get_document` reads one document in full. `ask` has lore's own model write an answer, which takes seconds to a minute: prefer `search` when you can read the code yourself. `list_sources` names what is indexed."
         )
     );
+    client.cancel().await.unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn symbol_tools_show_definitions_callers_and_isolate_tenants(pool: PgPool) {
+    let (url, key, router) = start(pool.clone()).await;
+    let client = connect(&url, &key).await;
+    let definition = call(
+        &client,
+        "definition",
+        json!({"symbol":"plans::limits","source":"sample"}),
+    )
+    .await;
+    assert!(!is_error(&definition), "{:?}", texts(&definition));
+    assert!(texts(&definition)[0].contains(PLANS));
+    assert!(texts(&definition)[0].contains("pub fn limits"));
+    let missing = call(&client, "definition", json!({"symbol":"not_a_symbol"})).await;
+    assert!(texts(&missing)[0].contains("No indexed definition"));
+    let none = call(
+        &client,
+        "callers",
+        json!({"symbol":"limits","source":"sample"}),
+    )
+    .await;
+    assert!(texts(&none)[0].contains("No indexed callers"));
+    let bad = call(&client, "definition", json!({"symbol":"contains spaces"})).await;
+    assert!(is_error(&bad));
+    let bad = call(
+        &client,
+        "callers",
+        json!({"symbol":"limits","source":"bad\u{0000}source"}),
+    )
+    .await;
+    assert!(is_error(&bad));
+
+    // Index a real caller through the same extraction/storage path as repository ingestion.
+    let tenant: uuid::Uuid = sqlx::query_scalar("SELECT id FROM tenants WHERE name = 'acme'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let state = test_state(pool.clone(), &std::env::temp_dir());
+    let source = lore::store::ensure_source(&pool, tenant, "repo", "sample", None)
+        .await
+        .unwrap();
+    let path = "src/checkout.rs";
+    let text = "use crate::billing::plans::limits as plan_limits;\npub fn checkout() { plan_limits(Plan::Free); }\n";
+    lore::store::index_text(
+        &state,
+        tenant,
+        &source,
+        lore::store::NewDocument {
+            tenant_id: tenant,
+            source_id: source.id,
+            external_id: path.into(),
+            kind: "code".into(),
+            title: path.into(),
+            uri: None,
+            metadata: json!({"path": path}),
+            content_hash: text.into(),
+            body: None,
+        },
+        lore::chunk::chunk_file(path, text),
+        path,
+    )
+    .await
+    .unwrap();
+    let callers = call(
+        &client,
+        "callers",
+        json!({"symbol":"plans::limits","source":"sample"}),
+    )
+    .await;
+    assert!(!is_error(&callers));
+    assert!(
+        texts(&callers)[0].contains("src/checkout.rs"),
+        "{:?}",
+        texts(&callers)
+    );
+    assert!(texts(&callers)[0].contains("Imported"));
+    let (_, other_key) = create_tenant_key(&router, "other-symbols", &["read"]).await;
+    let other = connect(&url, &other_key).await;
+    for tool in ["definition", "callers"] {
+        let result = call(&other, tool, json!({"symbol":"limits","source":"sample"})).await;
+        assert!(texts(&result)[0].contains("No indexed definition"));
+    }
+    other.cancel().await.unwrap();
     client.cancel().await.unwrap();
 }
 
