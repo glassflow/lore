@@ -170,7 +170,7 @@ async fn serve(config: Config) -> Result<()> {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let syncer = state.config.sync_interval_secs.map(|secs| {
         tracing::info!(interval_secs = secs, "repo sync poller on");
-        tokio::spawn(sync_worker(
+        tokio::spawn(lore::repo::sync::poll_repos(
             state.clone(),
             std::time::Duration::from_secs(secs),
             stop_rx.clone(),
@@ -218,28 +218,6 @@ async fn session_worker(state: AppState, mut stop: tokio::sync::watch::Receiver<
             Ok(0) => {}
             Ok(n) => tracing::info!(sessions = n, "sessions processed"),
             Err(e) => tracing::error!(error = ?e, "session worker failed"),
-        }
-    }
-}
-
-/// Fetches and indexes every repo that has a remote, every `interval`, until `stop` changes. A
-/// stop waits for the sync in progress to end.
-async fn sync_worker(
-    state: AppState,
-    interval: std::time::Duration,
-    mut stop: tokio::sync::watch::Receiver<bool>,
-) {
-    let mut tick = tokio::time::interval(interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = stop.changed() => break,
-            _ = tick.tick() => {}
-        }
-        match lore::repo::sync::sync_all(&state).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(repos = n, "repos synced"),
-            Err(e) => tracing::error!(error = ?e, "sync worker failed"),
         }
     }
 }

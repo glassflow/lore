@@ -92,7 +92,7 @@ curl -X POST localhost:8080/v1/repos/<id>/sync -H "Authorization: Bearer $LORE_K
 
 Two ways to sync without anyone calling the route:
 
-- **Poller.** With `LORE_SYNC_INTERVAL_SECS` set, the server syncs every repo that has a remote at start and then every interval, one repo after another. A push lands within one interval.
+- **Poller.** With `LORE_SYNC_INTERVAL_SECS` set, the server checks every repo that has a remote at start and then every interval. Repos sync independently, so an unreachable remote cannot hold up the others. Each repo has at most one running poll; a repo already pushing or syncing skips that tick instead of queuing duplicate work. A default-branch push is picked up on the next available tick, plus fetch and indexing time.
 - **GitHub webhook.** Set `LORE_GITHUB_WEBHOOK_SECRET`, then in the GitHub repository's settings add a webhook with payload URL `<LORE_URL>/v1/webhooks/github`, content type `application/json`, the same secret, and the `push` event. A push to the default branch syncs every repo, of any tenant, whose `remote_url` is that repository (`clone_url` or `html_url`, compared without case, a trailing `/` or `.git`); the answer is 202 `{"queued": n}` and the sync runs in the background, so the change is searchable seconds later. The route needs no API key: a delivery whose `X-Hub-Signature-256` is not the HMAC-SHA256 of the body under the secret is a 401, and a valid one can only start fetches from remotes tenants configured. Pushes to other branches, deleted branches and other events are accepted and ignored, `ping` answers 200. Without the secret the route is a 404.
 
 `lore repo push` keeps working for local repos and CI.

@@ -362,7 +362,7 @@ async fn sync_needs_an_ingest_key_of_the_owning_tenant(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn the_poller_syncs_every_repo_with_a_remote(pool: PgPool) {
+async fn a_sync_batch_indexes_every_repo_with_a_remote(pool: PgPool) {
     let env = env(pool.clone()).await;
     let (a, b) = (fixture_repo(), fixture_repo());
     let id_a = create_ok(&env, "a", &file_url(a.path())).await;
@@ -379,6 +379,70 @@ async fn the_poller_syncs_every_repo_with_a_remote(pool: PgPool) {
     commit_all(&b, "b");
     assert_eq!(lore::repo::sync::sync_all(&env.state).await.unwrap(), 1);
     assert_eq!(indexed_commit(&pool, id_b).await, Some(head(&b)));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_busy_repo_does_not_starve_other_repos_or_queue_duplicate_polls(pool: PgPool) {
+    let env = env(pool.clone()).await;
+    let (a, b) = (fixture_repo(), fixture_repo());
+    let id_a = create_ok(&env, "a", &file_url(a.path())).await;
+    let id_b = create_ok(&env, "b", &file_url(b.path())).await;
+    // A holds the same lock during its whole fetch, index and outcome recording.
+    let lock = env.state.source_locks.get(id_a);
+    let guard = lock.lock().await;
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let poller = tokio::spawn(lore::repo::sync::poll_repos(
+        env.state.clone(),
+        Duration::from_millis(50),
+        receiver,
+    ));
+    let wait_for_commit = |id, want: String| {
+        let pool = pool.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while indexed_commit(&pool, id).await.as_deref() != Some(want.as_str()) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("poller must sync the unlocked repo while A stays blocked");
+        }
+    };
+    wait_for_commit(id_b, head(&b)).await;
+    // Exercise another tick, not just the initial startup scan.
+    std::fs::write(
+        b.path().join("fresh.md"),
+        "# Polling\n\nIndependentfreshness marker.\n",
+    )
+    .unwrap();
+    commit_all(&b, "new searchable content");
+    wait_for_commit(id_b, head(&b)).await;
+    assert_eq!(indexed_commit(&pool, id_a).await, None);
+    let (status, search) = send(
+        &env.router,
+        "GET",
+        "/v1/search?q=Independentfreshness&source=b",
+        &env.key,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(
+        search["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["path"] == "fresh.md"),
+        "{search}"
+    );
+    stop.send(true).unwrap();
+    // If ticks queued duplicate tasks behind A, shutdown would hang here. Its lock is
+    // deliberately held until the poller has completely drained.
+    tokio::time::timeout(Duration::from_secs(5), poller)
+        .await
+        .expect("shutdown must not wait for queued polls of A")
+        .unwrap();
+    drop(guard);
 }
 
 #[sqlx::test(migrations = "./migrations")]

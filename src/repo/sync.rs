@@ -260,6 +260,11 @@ pub async fn sync_repo(state: &AppState, source: &Source) -> Result<SyncReport, 
     }
     let lock = state.source_locks.get(source.id);
     let _guard = lock.lock().await;
+    sync_under_lock(state, source).await
+}
+
+/// The caller owns this source's lock, including while recording the outcome.
+async fn sync_under_lock(state: &AppState, source: &Source) -> Result<SyncReport, SyncError> {
     let result = sync_locked(state, source).await;
     if matches!(result, Err(SyncError::NoRemote)) {
         return result;
@@ -273,6 +278,60 @@ pub async fn sync_repo(state: &AppState, source: &Source) -> Result<SyncReport, 
         tracing::error!(error = %e, source_id = %source.id, "recording a sync failed");
     }
     result
+}
+
+/// Poll each configured remote independently. At most one poll per source can run, and a busy
+/// source is skipped rather than accumulating waiting tasks. A slow fetch or push therefore
+/// cannot delay other sources. Shutdown stops scheduling and drains the polls already running.
+pub async fn poll_repos(
+    state: AppState,
+    interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut jobs = tokio::task::JoinSet::<()>::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.changed() => break,
+            Some(result) = jobs.join_next(), if !jobs.is_empty() => {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "repo poll task failed");
+                }
+                continue;
+            }
+            _ = tick.tick() => {}
+        }
+        let sources = match remote_sources(&state.pool).await {
+            Ok(sources) => sources,
+            Err(e) => {
+                tracing::error!(error = %e, "listing repos for polling failed");
+                continue;
+            }
+        };
+        for source in sources {
+            let Ok(guard) = state.source_locks.get(source.id).try_lock_owned() else {
+                continue;
+            };
+            let state = state.clone();
+            jobs.spawn(async move {
+                let _guard = guard;
+                match sync_under_lock(&state, &source).await {
+                    Ok(r) if !r.up_to_date => {
+                        tracing::info!(source_id = %source.id, commit = %r.report.indexed_commit, "repo synced by poller");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(source_id = %source.id, error = %e, "repo poll failed"),
+                }
+            });
+        }
+    }
+    while let Some(result) = jobs.join_next().await {
+        if let Err(e) = result {
+            tracing::error!(error = %e, "repo poll task failed");
+        }
+    }
 }
 
 async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, SyncError> {
