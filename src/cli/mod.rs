@@ -30,6 +30,11 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// Manage sources
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -42,6 +47,20 @@ pub enum TenantCommand {
     },
     /// List tenants
     List,
+    /// Delete a tenant with all its sources, documents, keys and repo directories
+    Delete {
+        /// Tenant id
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SourceCommand {
+    /// Delete a source with its documents and repo directory
+    Delete {
+        /// Source id
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -80,6 +99,12 @@ struct CreateKeyBody<'a> {
 }
 
 #[derive(Serialize)]
+struct Deleted<'a> {
+    id: &'a str,
+    deleted: bool,
+}
+
+#[derive(Serialize)]
 struct Revoked<'a> {
     id: &'a str,
     revoked: bool,
@@ -107,6 +132,26 @@ pub async fn run_admin(client: &Client, command: AdminCommand) -> Result<()> {
             TenantCommand::List => {
                 let v: Value = client.get_json("/v1/admin/tenants", Auth::Admin).await?;
                 print_json(&v)
+            }
+            TenantCommand::Delete { id } => {
+                client
+                    .delete(&format!("/v1/admin/tenants/{id}"), Auth::Admin)
+                    .await?;
+                print_json(&Deleted {
+                    id: &id,
+                    deleted: true,
+                })
+            }
+        },
+        AdminCommand::Source { command } => match command {
+            SourceCommand::Delete { id } => {
+                client
+                    .delete(&format!("/v1/admin/sources/{id}"), Auth::Admin)
+                    .await?;
+                print_json(&Deleted {
+                    id: &id,
+                    deleted: true,
+                })
             }
         },
         AdminCommand::Key { command } => match command {

@@ -18,7 +18,7 @@ function load(storage) {
       ' ago, formatBytes, formatDuration, formatDate, isRunning, anyRunning, pollDelay, pushEnded,' +
       ' progressText, progressFraction, stateClass, pushTitle, embedText, pushTiming, scopesFrom,' +
       ' keyActive, tenantSummary, modelText, serverFacts, storageSummary, indexKind, keysUrl,' +
-      ' revokeUrl, syncText, syncTitle };'
+      ' revokeUrl, tenantUrl, sourceUrl, confirmMatches, deleteQuestion, syncText, syncTitle };'
   )(storage);
 }
 
@@ -264,6 +264,43 @@ test('key URLs escape their ids', () => {
   assert.strictEqual(page.keysUrl('abc'), '/v1/admin/tenants/abc/keys');
   assert.strictEqual(page.keysUrl('a/../b'), '/v1/admin/tenants/a%2F..%2Fb/keys');
   assert.strictEqual(page.revokeUrl('k?x=1'), '/v1/admin/keys/k%3Fx%3D1');
+});
+
+test('delete URLs escape their ids', () => {
+  assert.strictEqual(page.tenantUrl('abc'), '/v1/admin/tenants/abc');
+  assert.strictEqual(page.tenantUrl('a/../b'), '/v1/admin/tenants/a%2F..%2Fb');
+  assert.strictEqual(page.sourceUrl('s?x=1'), '/v1/admin/sources/s%3Fx%3D1');
+});
+
+test('a delete needs the exact name typed', () => {
+  assert.strictEqual(page.confirmMatches('acme', 'acme'), true);
+  assert.strictEqual(page.confirmMatches('  acme ', 'acme'), true);
+  assert.strictEqual(page.confirmMatches('Acme', 'acme'), false);
+  assert.strictEqual(page.confirmMatches('acm', 'acme'), false);
+  assert.strictEqual(page.confirmMatches('', ''), false);
+  assert.strictEqual(page.confirmMatches(undefined, 'acme'), false);
+  assert.strictEqual(page.confirmMatches('acme', null), false);
+});
+
+test('the delete question says what goes', () => {
+  const tenant = {
+    name: 'acme',
+    sources: [{ documents: 2, chunks: 10 }, { documents: 1, chunks: 1 }],
+    keys: [{ revoked_at: null }],
+  };
+  assert.strictEqual(
+    page.deleteQuestion('tenant', tenant),
+    'Delete tenant acme and everything it holds (2 sources · 3 documents · 11 chunks · 1 active key)?' +
+      ' Its keys stop working at once. This cannot be undone.'
+  );
+  assert.strictEqual(
+    page.deleteQuestion('source', { name: 'sample', kind: 'repo', documents: 1, chunks: 1234 }),
+    'Delete source sample with its 1 document and 1,234 chunks, and its repo directory? This cannot be undone.'
+  );
+  assert.strictEqual(
+    page.deleteQuestion('source', { name: 'notes', kind: 'notes', documents: 0, chunks: 0 }),
+    'Delete source notes with its 0 documents and 0 chunks? This cannot be undone.'
+  );
 });
 
 if (!process.exitCode) console.log('web_admin_pure: ' + count + ' checks passed');

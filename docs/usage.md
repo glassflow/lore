@@ -4,7 +4,7 @@ Tenants and keys, indexing, search, traces, documents, answers, the web pages an
 
 ## Tenants and keys
 
-lore is multi-tenant. Each tenant has API keys with the scopes `ingest` and `read`. Keys look like `lk_` followed by 40 hex characters, and only their SHA-256 hash is stored, so a key is shown once, when it is created. An admin token (`LORE_ADMIN_TOKEN` on the server) creates tenants and keys. Without it the admin API answers 403.
+lore is multi-tenant. Each tenant has API keys with the scopes `ingest` and `read`. Keys look like `lk_` followed by 40 hex characters, and only their SHA-256 hash is stored, so a key is shown once, when it is created. An admin token (`LORE_ADMIN_TOKEN` on the server) creates and deletes tenants and keys, and deletes sources. Without it the admin API answers 403.
 
 The CLI talks to the server over HTTP. `--url`, `--key` and `--admin-token` are global flags (env `LORE_URL`, `LORE_KEY`, `LORE_ADMIN_TOKEN`), and the `admin` and `me` subcommands print the server's JSON.
 
@@ -15,10 +15,18 @@ lore admin tenant list
 lore admin key create --tenant <id>             # {"id": "...", "key": "lk_...", ...}; add --scopes read to limit it
 lore admin key list --tenant <id>               # prefixes only, never the key or its hash
 lore admin key revoke <key-id>                  # the key stops working at once
+lore admin source delete <source-id>            # {"id": "...", "deleted": true}
+lore admin tenant delete <tenant-id>            # {"id": "...", "deleted": true}
 lore --key lk_... me                            # {"tenant_id": "...", "tenant_name": "demo", "scopes": [...]}
 ```
 
 Tenant names are 1 to 64 characters of `a-z`, `0-9` and `-`. Send keys as `Authorization: Bearer lk_...`.
+
+### Deleting tenants and sources
+
+`DELETE /v1/admin/tenants/{id}` deletes a tenant with everything it holds: its sources, documents, chunks, trace spans, queued sessions and keys, in one transaction. `DELETE /v1/admin/sources/{id}` deletes one source with its documents and chunks. Both answer 204, or 404 when the id is unknown, and then remove the repo mirror and checkout of each deleted repo source (`$LORE_DATA_DIR/repos/<source id>`). While a push to the source, or to any source of the tenant, is running or waiting, the delete answers 409 and changes nothing; try again when the push ends. Deleting the `traces` source (the session transcripts) does not delete the tenant's spans, so a session that gets new spans is indexed again.
+
+Postgres reuses the space of the deleted rows after `VACUUM` (autovacuum runs it on its own), but it does not give it back to the file system, so the database size on the admin page does not shrink. `VACUUM FULL` rewrites the tables to shrink them, and locks them while it runs.
 
 ## Repos
 
@@ -184,7 +192,7 @@ lore ask "how many plans are there?" --mode sources                # the sources
 | `kind` | Fast and sources mode: a list of document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 |
 | `source` | Fast and sources mode: only the source with this name |
 
-The answer is `{"answer", "mode", "model", "citations", "sources_considered", "tool_calls", "usage", "latency_ms"}`. `citations` lists the sources the answer cites with `[n]`, once each, in the order they first appear. A citation has `label` (the source number, as text), `document_id`, `kind`, `title`, `path`, `start_line`, `end_line` and `url` (the same link `/v1/search` gives as `uri`). `sources_considered` is the number of passages that went into the prompt (at most 60,000 characters of them, each cut to its first 120 lines), `tool_calls` is 0 in fast mode, and `usage` has `input_tokens` and `output_tokens`.
+The answer is `{"answer", "mode", "model", "citations", "sources_considered", "tool_calls", "usage", "latency_ms"}`. `citations` lists the sources the answer cites with `[n]`, once each, in the order they first appear. A citation has `label` (the source number, as text), `document_id`, `kind`, `title`, `path`, `start_line`, `end_line` and `url` (the same link `/v1/search` gives as `uri`). `sources_considered` is the number of passages that went into the prompt (at most 60,000 characters of them, each cut to its first 120 lines), `tool_calls` is 0 in fast mode, and `usage` has `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`. `input_tokens` is only the part of the prompt the model's prompt cache did not cover: the whole prompt is the sum of the three input counts.
 
 When nothing indexed matches, the answer is "I found nothing indexed that matches this question.", `model` is `"none"` and the model is not called. If the model declines to answer, the response is a 422 `{"error": "the model declined to answer"}`.
 
@@ -192,7 +200,7 @@ Sources mode (`"mode": "sources"`) runs the same search as fast mode and calls n
 
 Deep mode (`"mode": "deep"`) lets the model drive the `search`, `grep`, `read_file` and `get_session` tools for up to `LORE_DEEP_MAX_ROUNDS` rounds within `LORE_DEEP_BUDGET_SECS` seconds. Tool calls of one round run at the same time, each for at most 10 seconds; a slower one gives the model an error result. Past 80% of the budget, or at the round cap, the model gets one last call with the tools turned off and is told to answer. Cost is capped per tenant by `LORE_DEEP_CONCURRENCY` and `LORE_DEEP_DAILY_LIMIT` (both give a 429). A deep answer cites code as `[path:start-end]`, with the path as the tools print it minus the source name, and sessions as `[session:<id>]`. Each distinct citation appears once in `citations` (at most 50), in order of first appearance. The `label` is the text between the brackets. A citation whose path or session lives in the tenant's index carries `document_id`, `kind`, `title` and `url`; one that does not match keeps its `label`, `path` and lines, with `document_id` null. In deep mode `tool_calls` counts the tool calls, `sources_considered` is 0, `usage` is summed over all model calls and `model` is the model of the last call. If the budget runs out with no answer at all, the response is a 500.
 
-The CLI prints the answer, a blank line, a `Sources:` list with `[label] path:start-end` (the title when there is no path) and the link on the next line, then a dim line `<model> · <latency> ms · <input> in / <output> out`. With `LORE_LLM=fake` the answer is `Fake answer from N sources.` followed by `[1] [2]` and so on: it exercises the plumbing without a model.
+The CLI prints the answer, a blank line, a `Sources:` list with `[label] path:start-end` (the title when there is no path) and the link on the next line, then a dim line `<model> · <latency> ms · <input> in / <output> out`, where `<input>` is the whole prompt, cache included, followed by `(<n> cached)` when part of it was read from the cache. The web page shows the same line. With `LORE_LLM=fake` the answer is `Fake answer from N sources.` followed by `[1] [2]` and so on: it exercises the plumbing without a model.
 
 `GET /v1/info` needs no key. It reports what the server runs, for clients and health dashboards:
 
@@ -216,9 +224,10 @@ The page logic is checked by `tests/web.rs`, which also runs `tests/web_pure.js`
 
 The page shows:
 
+- **New tenant**: creates a tenant from its name. Create a key for it in its card.
 - **Server**: version, embedder, model provider, the fast and deep models with their effort, the process's memory now and at its peak (Linux only), and the number of tenants, sources, documents and chunks.
-- **Pushes**: the repo pushes that are running, and the last 20 that ended, with their state (`waiting` for another push to the same source, `fetching` the bundle, `indexing`, `done` or `failed`), files done out of the total, chunks written, how many of those were embedded and how many kept their stored vector, the time spent embedding, and why a failed push failed. While a push runs the list refreshes every 3 seconds, otherwise every 30. When a push ends, the counts are read again.
-- **Tenants**: for each tenant its sources (name, kind, indexed commit, documents, chunks, size on disk for repos, when it was last indexed, and for repos with a remote how the last [sync](#sync-a-repo-from-its-remote) went, with the remote, the commit and the error in its tooltip) and its keys (prefix, scopes, created, revoked). **Create key** makes a key with the ticked scopes and shows it once, with a copy button. **Revoke** asks for a confirmation first.
+- **Pushes**: the repo pushes that are running, and the last 20 that ended, with their state (`waiting` for another push to the same source, `fetching` the bundle, `indexing`, `done` or `failed`), files done out of the total, chunks written, how many of those were embedded and how many reused a vector (from the embedding cache, from the document's earlier chunks, or from a repeated chunk in the same file), the time spent embedding, and why a failed push failed. While a push runs the list refreshes every 3 seconds, otherwise every 30. When a push ends, the counts are read again.
+- **Tenants**: for each tenant its sources (name, kind, indexed commit, documents, chunks, size on disk for repos, when it was last indexed, and for repos with a remote how the last [sync](#sync-a-repo-from-its-remote) went, with the remote, the commit and the error in its tooltip) and its keys (prefix, scopes, created, revoked). **Create key** makes a key with the ticked scopes and shows it once, with a copy button. **Revoke** asks for a confirmation first. **Delete tenant** and each source's **Delete** say what goes with it and ask you to type the name to confirm; a push in progress makes them fail with a message.
 - **Storage**: the database size, the repo mirrors and checkouts on disk, each table's data and index bytes, and each index with its kind (the vector index is `hnsw`, the full-text index `gin`).
 
 Push progress is kept in memory, so a restart forgets it, and only repo pushes are tracked. The CLI stops waiting for a push after 15 minutes, but the server finishes it; the page shows when it does.
@@ -234,7 +243,7 @@ curl -H "Authorization: Bearer $LORE_ADMIN_TOKEN" localhost:8080/v1/admin/pushes
 
 `GET /v1/admin/pushes` answers `{"now", "since", "running", "recent"}`, newest first. `since` is when the server started. A push has `id`, `tenant` (null when the tenant is gone), `tenant_id`, `source`, `source_id`, `commit`, `full`, `state`, `started_at`, `finished_at`, `files_total` (null until the bundle is fetched), `files_done`, `chunks`, `chunks_embedded`, `embed_ms` and `error`. `embed_ms` is wall-clock time in the embedder, including waits while another push uses it. CPU and memory are not measured per push: pushes and searches share one process.
 
-Keys are created and revoked with the existing `POST /v1/admin/tenants/{id}/keys` and `DELETE /v1/admin/keys/{id}`. The page sets `Content-Security-Policy` so it can only talk to its own server and cannot be framed, and `Cache-Control: no-store`. Its logic is checked by `tests/web.rs`, which runs `tests/web_admin_pure.js` under node when node is installed.
+Keys are created and revoked with the existing `POST /v1/admin/tenants/{id}/keys` and `DELETE /v1/admin/keys/{id}`, tenants created with `POST /v1/admin/tenants`, and tenants and sources deleted with `DELETE /v1/admin/tenants/{id}` and `DELETE /v1/admin/sources/{id}` (see [Deleting tenants and sources](#deleting-tenants-and-sources)). The page sets `Content-Security-Policy` so it can only talk to its own server and cannot be framed, and `Cache-Control: no-store`. Its logic is checked by `tests/web.rs`, which runs `tests/web_admin_pure.js` under node when node is installed.
 
 ## Use lore from agents
 
@@ -255,7 +264,7 @@ The tools are written for agents. `search` runs no language model, answers in we
 | Tool | Input | Returns |
 | --- | --- | --- |
 | `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`), `source` | One text item, `No hits.` or one block per hit: a header `[1] <source> <path>:<start>-<end> (<kind>: <symbols>) id=<document id>` (the title in place of the path for documents without one), then at most 12 lines of the hit, numbered: the window with the most query words, or the whole hit when it is at most 15 lines. Common indentation is removed and lines are cut at 160 characters |
-| `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop), `source` | One text item: the answer, a `Sources:` list with one line per citation, and `(fast mode, <model>, 4.9 s)` (deep mode adds the number of tool calls) |
+| `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop), `source` | One text item: the answer, a `Sources:` list with one line per citation, and `(fast mode, <model>, 4321 in / 381 out, 4.9 s)` (deep mode adds the number of tool calls) |
 | `get_document` | `document_id` (the id of a search hit or a citation) | The document's text under a `# <title>` header with its kind and path, cut to 100,000 characters. An unknown id, or another tenant's, is the tool error `document not found` |
 | `list_sources` | none | One text item: a JSON array of `{name, kind, indexed_commit, documents}` |
 

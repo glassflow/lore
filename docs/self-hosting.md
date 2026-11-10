@@ -30,7 +30,7 @@ make prod-local-down       # stops the stack and deletes its volumes
    make deploy-prod HOST=root@<ip> LORE_DOMAIN=<domain> VERSION=<tag>
    ```
 
-   It builds the image for arm64, sends it over ssh, copies `compose.prod.yml` and `Caddyfile` to `/opt/lore`, starts the stack and prints `/healthz`. The first start downloads the embedding model (about 130 MB) into the `loredata` volume, which is why the `lore` health check has a 180 second start period.
+   It builds the image for arm64, sends it over ssh, copies `compose.prod.yml` and `Caddyfile` to `/opt/lore`, starts the stack and prints `/healthz`. The first start downloads the embedding model (about 130 MB) into the `loredata` volume, which is why the `lore` health check has a 180 second start period. A download that does not finish within `LORE_MODEL_DOWNLOAD_TIMEOUT_SECS` (5 minutes) stops the start with an error. To skip the download, copy the model directory of another install into the volume first, as described in [the configuration](configuration.md#the-embedding-model-download).
 
 ## Admin commands
 
@@ -39,6 +39,8 @@ Caddy blocks `/v1/admin`, so admin commands run on the server. The container alr
 ```sh
 ssh <host> 'cd /opt/lore && VERSION=<deployed tag> LORE_DOMAIN=<domain> docker compose --env-file .env.prod -f compose.prod.yml exec lore lore --url http://localhost:8080 admin tenant create --name <tenant>'
 ```
+
+`admin tenant delete <id>` and `admin source delete <id>` run the same way, and the [admin page](usage.md#admin-page) does all of this too when you reach it on the server (for example over an ssh tunnel). Deleting frees space inside Postgres for new rows but does not shrink its files (see [Deleting tenants and sources](usage.md#deleting-tenants-and-sources)).
 
 Everything else (`repo push`, `search`, `ask`, MCP) goes through `https://<domain>` with a tenant key.
 

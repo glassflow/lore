@@ -37,7 +37,7 @@ enum Command {
     Serve,
     /// Apply database migrations and exit
     Migrate,
-    /// Manage tenants and API keys (needs the admin token)
+    /// Manage tenants, sources and API keys (needs the admin token)
     Admin {
         #[command(subcommand)]
         command: AdminCommand,

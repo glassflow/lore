@@ -93,10 +93,7 @@ pub async fn answer(
         citations,
         sources_considered: included,
         tool_calls: 0,
-        usage: UsageOut {
-            input_tokens: res.usage.input_tokens,
-            output_tokens: res.usage.output_tokens,
-        },
+        usage: UsageOut::from(res.usage),
         latency_ms: 0,
     })
 }

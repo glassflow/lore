@@ -389,6 +389,28 @@ async fn a_push_that_ended_is_listed_with_its_counts(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn the_same_repo_pushed_into_another_tenant_embeds_nothing(pool: PgPool) {
+    let env = env(pool);
+    let (_, acme) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;
+    let (_, globex) = create_tenant_key(&env.router, "globex", &["ingest", "read"]).await;
+    push_fixture(&env.router, &acme).await;
+    push_fixture(&env.router, &globex).await;
+
+    let pushes = admin_get(&env.router, "/v1/admin/pushes").await;
+    let recent = pushes["recent"].as_array().unwrap();
+    let (second, first) = (&recent[0], &recent[1]);
+    assert_eq!(
+        (&first["tenant"], &second["tenant"]),
+        (&json!("acme"), &json!("globex"))
+    );
+    assert_eq!(first["chunks"], second["chunks"]);
+    assert_eq!(first["chunks_embedded"], first["chunks"]);
+    assert_eq!(
+        second["chunks_embedded"], 0,
+        "every vector came from the cache: {second}"
+    );
+}
+#[sqlx::test(migrations = "./migrations")]
 async fn a_failed_push_is_listed_with_why(pool: PgPool) {
     let env = env(pool);
     let (_, key) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;

@@ -220,6 +220,7 @@ struct WireUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -279,6 +280,7 @@ fn parse_response(body: &[u8]) -> Result<LlmResponse> {
             input_tokens: usage.input_tokens.unwrap_or(0),
             output_tokens: usage.output_tokens.unwrap_or(0),
             cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+            cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
         },
         model: wire.model,
     })
@@ -435,7 +437,8 @@ mod tests {
             "model": "claude-opus-5-5",
             "content": [{"type": "text", "text": text}],
             "stop_reason": "end_turn",
-            "usage": {"input_tokens": 11, "output_tokens": 7, "cache_read_input_tokens": 3}
+            "usage": {"input_tokens": 11, "output_tokens": 7, "cache_read_input_tokens": 3,
+                      "cache_creation_input_tokens": 5}
         })
     }
 
@@ -487,7 +490,8 @@ mod tests {
             Usage {
                 input_tokens: 11,
                 output_tokens: 7,
-                cache_read_input_tokens: 3
+                cache_read_input_tokens: 3,
+                cache_creation_input_tokens: 5
             }
         );
 
@@ -625,6 +629,7 @@ mod tests {
 
         assert_eq!(res.stop_reason, "tool_use");
         assert_eq!(res.usage.cache_read_input_tokens, 0);
+        assert_eq!(res.usage.cache_creation_input_tokens, 0);
         assert_eq!(
             res.content,
             vec![

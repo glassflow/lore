@@ -152,6 +152,13 @@ test('footerText has model, latency and token counts', () => {
   assert.strictEqual(out, 'fake · 12 ms · 3 in / 4 out');
 });
 
+test('footerText counts cache reads and writes in the input', () => {
+  const usage = { input_tokens: 4, output_tokens: 381, cache_read_input_tokens: 9000, cache_creation_input_tokens: 1200 };
+  assert.strictEqual(lore.footerText({ model: 'm', latency_ms: 5, usage }), 'm · 5 ms · 10204 in (9000 cached) / 381 out');
+  usage.cache_read_input_tokens = 0;
+  assert.strictEqual(lore.footerText({ model: 'm', latency_ms: 5, usage }), 'm · 5 ms · 1204 in / 381 out');
+});
+
 test('footerText in sources mode says no model', () => {
   const out = lore.footerText({ mode: 'sources', model: 'none', latency_ms: 7, usage: { input_tokens: 0, output_tokens: 0 } });
   assert.strictEqual(out, 'no model · 7 ms');
