@@ -12,6 +12,7 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_LOG_FORMAT` | `text` | `text` or `json`. Anything else is a startup error |
 | `LORE_EMBEDDER` | `fastembed` | `fastembed` (bge-small-en-v1.5 on CPU) or `hash` (deterministic, for tests and `make run`). Anything else is a startup error. The first start with `fastembed` downloads about 130 MB into `$LORE_DATA_DIR/models` before the server listens; see [the embedding model download](#the-embedding-model-download) |
 | `LORE_EMBED_MODEL` | `bge-small-en-v1.5` | Embedding model. Only the default is supported in v1; any other value is a startup error |
+| `LORE_EMBEDDING_CACHE` | `shared` | Who reuses a vector already computed for the same text: `shared` (every tenant, so pushing a repo another tenant has is nearly free, but a push is faster when its text exists elsewhere), `tenant` (each tenant only its own) or `off` (only the chunks a document already holds). Anything else is a startup error. See [the embedding cache](architecture.md#the-embedding-cache-and-tenant-isolation) |
 | `LORE_MODEL_DOWNLOAD_TIMEOUT_SECS` | `300` | Seconds the first-start download of the embedding model may take, retries included. When they run out, `lore serve` exits with an error naming the URL and the model directory. Must be a positive integer |
 | `HF_ENDPOINT` | `https://huggingface.co` | Where the embedding model is downloaded from, for example a Hugging Face mirror |
 | `HF_HOME` | unset | When set, the embedding model is kept in this directory instead of `$LORE_DATA_DIR/models` |
