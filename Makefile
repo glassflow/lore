@@ -5,7 +5,7 @@ GEN = deploy/k8s/overlays/generated
 DATABASE_URL ?= postgres://lore:lore@localhost:5434/lore
 export DATABASE_URL
 
-.PHONY: db-up run test lint check image kind-up kind-load kind-secret kind-deploy kind-rollback kind-logs kind-delete prod-local prod-local-backup prod-local-down deploy-prod
+.PHONY: db-up run test lint check eval eval-test image kind-up kind-load kind-secret kind-deploy kind-rollback kind-logs kind-delete prod-local prod-local-backup prod-local-down deploy-prod
 
 db-up:
 	docker compose up -d --wait db
@@ -21,6 +21,14 @@ lint:
 	cargo clippy --all-targets -- -D warnings
 
 check: lint test
+
+# The search eval on the public question set, against the server at LORE_URL (default
+# http://localhost:8080). Real numbers need the fastembed embedder; see bench/eval/README.md.
+eval:
+	bench/eval/local.sh $(EVAL_LABEL)
+
+eval-test:
+	python3 -m unittest discover -s bench/eval -p 'test_*.py'
 
 image:
 	docker build --build-arg VERSION=$(VERSION) -t lore:$(VERSION) .
