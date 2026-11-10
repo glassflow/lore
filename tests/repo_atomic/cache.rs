@@ -257,14 +257,14 @@ async fn standalone_cache_publication_error_keeps_document_visible(pool: PgPool)
     let (status, body) = send(
         &env.router,
         "GET",
-        "/v1/search?q=cachenotefresh&limit=20",
+        "/v1/search?q=cachenotefresh&k=50",
         &env.key,
         Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["hits"].as_array().unwrap().iter().any(|hit| {
-        hit["text"]
+        hit["snippet"]
             .as_str()
             .is_some_and(|text| text.contains("cachenotefresh remains published"))
     }));
