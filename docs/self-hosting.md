@@ -40,6 +40,8 @@ Caddy blocks `/v1/admin`, so admin commands run on the server. The container alr
 ssh <host> 'cd /opt/lore && VERSION=<deployed tag> LORE_DOMAIN=<domain> docker compose --env-file .env.prod -f compose.prod.yml exec lore lore --url http://localhost:8080 admin tenant create --name <tenant>'
 ```
 
+`admin tenant delete <id>` and `admin source delete <id>` run the same way, and the [admin page](usage.md#admin-page) does all of this too when you reach it on the server (for example over an ssh tunnel). Deleting frees space inside Postgres for new rows but does not shrink its files (see [Deleting tenants and sources](usage.md#deleting-tenants-and-sources)).
+
 Everything else (`repo push`, `search`, `ask`, MCP) goes through `https://<domain>` with a tenant key.
 
 ## Backups and restore

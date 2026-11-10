@@ -69,6 +69,8 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/tenants",
             post(admin::create_tenant).get(admin::list_tenants),
         )
+        .route("/v1/admin/tenants/{id}", delete(admin::delete_tenant))
+        .route("/v1/admin/sources/{id}", delete(admin::delete_source))
         .route(
             "/v1/admin/tenants/{id}/keys",
             post(admin::create_key).get(admin::list_keys),

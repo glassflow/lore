@@ -142,6 +142,11 @@ impl PushRegistry {
         }
     }
 
+    /// Whether a push matching `pred` is running (waiting for its lock included).
+    pub fn any_running(&self, pred: impl Fn(&PushProgress) -> bool) -> bool {
+        self.lock().running.iter().any(pred)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
