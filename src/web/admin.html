@@ -114,6 +114,8 @@
   }
   .card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
   .card-head .mono { color: var(--muted); overflow-wrap: anywhere; }
+  .card-head .push-right { margin-left: auto; }
+  .reveal.danger-box { border-color: var(--error); }
   .card > p { margin: 4px 0 0; font-size: 14px; }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -237,6 +239,14 @@
       <div class="section-head">
         <h2 id="tenants-title">Tenants</h2>
       </div>
+      <form id="new-tenant" class="card" autocomplete="off">
+        <label class="field" for="tenant-name">New tenant</label>
+        <div class="inline">
+          <input type="text" id="tenant-name" name="name" placeholder="name" maxlength="64" spellcheck="false" autocomplete="off">
+          <button type="submit" id="create-tenant" class="small">Create tenant</button>
+        </div>
+        <p class="hint">1 to 64 characters of a-z, 0-9 and -.</p>
+      </form>
       <div id="tenants"></div>
     </section>
 
@@ -314,6 +324,26 @@ function shortSha(sha) {
 function commitText(source) {
   if (source.indexed_commit) return shortSha(source.indexed_commit);
   return source.kind === 'repo' ? 'not indexed' : '';
+}
+
+// The sync column of a source: how the last fetch of its remote went. Only repos have one.
+function syncText(source, nowIso) {
+  if (source.kind !== 'repo') return '';
+  if (!source.remote_url) return 'no remote';
+  if (!source.last_sync_at) return 'not synced yet';
+  var when = ago(source.last_sync_at, nowIso);
+  if (source.last_sync_error) return 'failed ' + when;
+  var at = source.last_sync_commit ? ' at ' + shortSha(source.last_sync_commit) : '';
+  return 'ok ' + when + at;
+}
+
+// The sync column's tooltip: the remote, the last synced commit and why the last sync failed.
+function syncTitle(source) {
+  return [
+    source.remote_url,
+    source.last_sync_commit ? 'commit ' + source.last_sync_commit : '',
+    source.last_sync_error || ''
+  ].filter(Boolean).join('\n');
 }
 
 function parseTime(iso) {
@@ -525,6 +555,30 @@ function keysUrl(tenantId) {
 function revokeUrl(keyId) {
   return '/v1/admin/keys/' + encodeURIComponent(keyId);
 }
+
+function tenantUrl(tenantId) {
+  return '/v1/admin/tenants/' + encodeURIComponent(tenantId);
+}
+
+function sourceUrl(sourceId) {
+  return '/v1/admin/sources/' + encodeURIComponent(sourceId);
+}
+
+// A delete goes ahead only once the operator has typed the exact name.
+function confirmMatches(typed, name) {
+  return typeof typed === 'string' && typeof name === 'string' && name !== '' && typed.trim() === name;
+}
+
+// What deleting a tenant or a source takes with it, for the confirmation.
+function deleteQuestion(kind, item) {
+  if (kind === 'tenant') {
+    return 'Delete tenant ' + item.name + ' and everything it holds (' + tenantSummary(item) +
+      ')? Its keys stop working at once. This cannot be undone.';
+  }
+  return 'Delete source ' + item.name + ' with its ' + plural(item.documents || 0, 'document', 'documents') +
+    ' and ' + plural(item.chunks || 0, 'chunk', 'chunks') +
+    (item.kind === 'repo' ? ', and its repo directory' : '') + '? This cannot be undone.';
+}
 </script>
 
 <script>
@@ -541,6 +595,9 @@ function revokeUrl(keyId) {
   var pushesEl = document.getElementById('pushes');
   var pushesNote = document.getElementById('pushes-note');
   var tenantsEl = document.getElementById('tenants');
+  var tenantForm = document.getElementById('new-tenant');
+  var tenantName = document.getElementById('tenant-name');
+  var tenantCreate = document.getElementById('create-tenant');
 
   var token = loadToken();
   var overview = null;
@@ -549,7 +606,7 @@ function revokeUrl(keyId) {
   // Bumped on every open and forget, so answers to an older token are dropped.
   var generation = 0;
   // What the operator is doing: the key shown once, the key being revoked, the ticked scopes.
-  var ui = { reveal: null, confirm: null, scopes: {} };
+  var ui = { reveal: null, confirm: null, remove: null, scopes: {} };
 
   tokenInput.value = token;
 
@@ -616,7 +673,7 @@ function revokeUrl(keyId) {
     generation += 1;
     overview = null;
     pushes = null;
-    ui = { reveal: null, confirm: null, scopes: {} };
+    ui = { reveal: null, confirm: null, remove: null, scopes: {} };
     contentEl.hidden = true;
     factsEl.textContent = '';
     storageEl.textContent = '';
@@ -946,14 +1003,94 @@ function revokeUrl(keyId) {
     return box;
   }
 
+  // The confirmation of a delete: what it takes with it, a field for the name, and the buttons.
+  // The Delete button stays off until the typed name matches.
+  function deleteBox(kind, item) {
+    var box = el('div', 'reveal danger-box');
+    box.setAttribute('role', 'region');
+    box.setAttribute('aria-label', 'Delete ' + kind + ' ' + item.name);
+    box.appendChild(el('p', null, deleteQuestion(kind, item)));
+    var label = el('label', 'field', 'Type ' + item.name + ' to confirm');
+    label.htmlFor = 'confirm-delete';
+    box.appendChild(label);
+    var row = el('div', 'inline');
+    var input = el('input');
+    input.type = 'text';
+    input.id = 'confirm-delete';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.value = ui.remove.typed;
+    var yes = button('Delete', 'danger small');
+    var no = button('Cancel', 'secondary small', function () {
+      ui.remove = null;
+      renderTenants();
+    });
+    yes.disabled = ui.remove.busy || !confirmMatches(input.value, item.name);
+    no.disabled = input.disabled = !!ui.remove.busy;
+    input.addEventListener('input', function () {
+      ui.remove.typed = input.value;
+      yes.disabled = !confirmMatches(input.value, item.name);
+    });
+    function go() {
+      if (ui.remove.busy || !confirmMatches(input.value, item.name)) return;
+      ui.remove.busy = true;
+      yes.disabled = true;
+      no.disabled = true;
+      input.disabled = true;
+      var gen = generation;
+      api('DELETE', kind === 'tenant' ? tenantUrl(item.id) : sourceUrl(item.id))
+        .then(function () {
+          if (gen !== generation) return null;
+          ui.remove = null;
+          if (ui.reveal && ui.reveal.tenantId === item.id) ui.reveal = null;
+          setStatus('Deleted ' + kind + ' ' + item.name, false);
+          return loadOverview(gen);
+        })
+        .catch(function (e) {
+          if (gen !== generation) return;
+          if (ui.remove) ui.remove.busy = false;
+          failed(e);
+          if (overview) renderTenants();
+        });
+    }
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        go();
+      }
+    });
+    yes.addEventListener('click', go);
+    row.appendChild(input);
+    row.appendChild(yes);
+    row.appendChild(no);
+    box.appendChild(row);
+    return box;
+  }
+
+  function startDelete(kind, item) {
+    if (ui.remove && ui.remove.busy) return;
+    ui.remove = { kind: kind, id: item.id, typed: '', busy: false };
+    renderTenants();
+    var input = document.getElementById('confirm-delete');
+    if (input) input.focus();
+  }
+
+  function removing(kind, id) {
+    return !!ui.remove && ui.remove.kind === kind && ui.remove.id === id;
+  }
+
   function tenantCard(t, nowIso) {
     var card = el('section', 'card');
     card.setAttribute('aria-label', 'Tenant ' + t.name);
     var head = el('div', 'card-head');
     head.appendChild(el('h3', null, t.name));
     head.appendChild(el('span', 'mono', t.id));
+    var del = button('Delete tenant', 'secondary small push-right', function () { startDelete('tenant', t); });
+    del.setAttribute('aria-label', 'Delete tenant ' + t.name);
+    head.appendChild(del);
     card.appendChild(head);
     card.appendChild(el('p', 'muted', 'Created ' + formatDate(t.created_at) + ' · ' + tenantSummary(t)));
+    if (removing('tenant', t.id)) card.appendChild(deleteBox('tenant', t));
 
     var sources = Array.isArray(t.sources) ? t.sources : [];
     card.appendChild(el('h4', null, 'Sources'));
@@ -966,11 +1103,18 @@ function revokeUrl(keyId) {
           { label: 'Documents', cls: 'num' },
           { label: 'Chunks', cls: 'num' },
           { label: 'On disk', cls: 'num' },
-          { label: 'Last indexed' }
+          { label: 'Last indexed' },
+          { label: 'Sync' },
+          { label: '', cls: 'action' }
         ],
         sources.map(function (s) {
           var commit = el('span', null, commitText(s));
           if (s.indexed_commit) commit.title = s.indexed_commit;
+          var sync = el('span', null, syncText(s, nowIso));
+          var syncTip = syncTitle(s);
+          if (syncTip) sync.title = syncTip;
+          var del = button('Delete', 'secondary small', function () { startDelete('source', s); });
+          del.setAttribute('aria-label', 'Delete source ' + s.name);
           return [
             s.name,
             s.kind,
@@ -978,10 +1122,15 @@ function revokeUrl(keyId) {
             formatCount(s.documents),
             formatCount(s.chunks),
             formatBytes(s.disk_bytes),
-            timeCell(s.last_indexed_at, nowIso)
+            timeCell(s.last_indexed_at, nowIso),
+            sync,
+            del
           ];
         })
       ));
+      sources.forEach(function (s) {
+        if (removing('source', s.id)) card.appendChild(deleteBox('source', s));
+      });
     } else {
       card.appendChild(el('p', 'empty', 'No sources yet.'));
     }
@@ -1016,13 +1165,29 @@ function revokeUrl(keyId) {
   }
 
   function renderTenants() {
+    // Polling redraws the cards, so a confirmation being typed keeps its focus.
+    var typing = document.activeElement && document.activeElement.id === 'confirm-delete';
     tenantsEl.textContent = '';
     var tenants = overview && Array.isArray(overview.tenants) ? overview.tenants : [];
+    // A tenant or source deleted elsewhere takes its confirmation with it.
+    if (ui.remove && !tenants.some(function (t) {
+      return (ui.remove.kind === 'tenant' && t.id === ui.remove.id) ||
+        (ui.remove.kind === 'source' && (t.sources || []).some(function (s) { return s.id === ui.remove.id; }));
+    })) {
+      ui.remove = null;
+    }
     if (!tenants.length) {
-      tenantsEl.appendChild(el('p', 'empty', 'No tenants yet. Create one with lore admin tenant create --name <name>.'));
+      tenantsEl.appendChild(el('p', 'empty', 'No tenants yet. Create one above.'));
       return;
     }
     tenants.forEach(function (t) { tenantsEl.appendChild(tenantCard(t, overview.now)); });
+    if (typing) {
+      var input = document.getElementById('confirm-delete');
+      if (input) {
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+      }
+    }
   }
 
   function loadOverview(gen) {
@@ -1089,6 +1254,28 @@ function revokeUrl(keyId) {
     });
   }
 
+  tenantForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var name = tenantName.value.trim();
+    if (!name) {
+      setStatus('Type a name for the new tenant', true);
+      return;
+    }
+    tenantCreate.disabled = true;
+    var gen = generation;
+    api('POST', '/v1/admin/tenants', { name: name })
+      .then(function () {
+        tenantCreate.disabled = false;
+        if (gen !== generation) return null;
+        tenantName.value = '';
+        setStatus('Created tenant ' + name + '. Create a key for it below.', false);
+        return loadOverview(gen);
+      })
+      .catch(function (e) {
+        tenantCreate.disabled = false;
+        if (gen === generation) failed(e);
+      });
+  });
   tokenForm.addEventListener('submit', function (e) {
     e.preventDefault();
     open();

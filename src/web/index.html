@@ -254,11 +254,15 @@ function citationView(c) {
   };
 }
 
+// The input count is the whole prompt: the uncached part plus cache reads and writes.
 function footerText(res) {
   if (res.mode === 'sources') return 'no model · ' + res.latency_ms + ' ms';
   var usage = res.usage || {};
+  var cached = usage.cache_read_input_tokens || 0;
+  var input = (usage.input_tokens || 0) + cached + (usage.cache_creation_input_tokens || 0);
   return res.model + ' · ' + res.latency_ms + ' ms · ' +
-    usage.input_tokens + ' in / ' + usage.output_tokens + ' out';
+    input + ' in' + (cached > 0 ? ' (' + cached + ' cached)' : '') +
+    ' / ' + (usage.output_tokens || 0) + ' out';
 }
 
 // The message for a failed request: the server's own `error`, or something sensible

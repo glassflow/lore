@@ -1,5 +1,8 @@
 mod common;
 
+#[path = "repo_atomic/cache.rs"]
+mod cache;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -244,6 +247,18 @@ async fn changed_new_deleted_and_unchanged_files_publish_together(pool: PgPool) 
     gate.wait().await;
     assert_eq!(contents(&env.search().await), contents(&old));
     assert_eq!(env.commit().await, old_commit);
+    for path in [
+        format!("/v1/admin/sources/{}", env.source),
+        format!("/v1/admin/tenants/{}", env.tenant),
+    ] {
+        let (status, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            send(&env.router, "DELETE", &path, "t", Vec::new()),
+        )
+        .await
+        .expect("busy delete must not wait for embedding");
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
 
     // Stored document reads must not use the already-updated checkout.
     for hit in old["hits"].as_array().unwrap() {
@@ -586,4 +601,62 @@ async fn large_push_leaves_the_other_pool_connection_available_for_search(pool: 
         started.elapsed(),
         env.state.pool.size(),
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn remote_sync_uses_atomic_publication_and_busy_delete_admission(pool: PgPool) {
+    let env = Env::new(pool, true).await;
+    let old = env.search().await;
+    let old_commit = env.commit().await;
+    let mut state = env.state.clone();
+    Arc::make_mut(&mut state.config).sync_allow_file_remotes = true;
+    let router = test_router(state.clone());
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/repos",
+        &env.key,
+        json!({"name":"sample","remote_url":format!("file://{}", env.repo.path().display())})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    env.change();
+    for fail in [true, false] {
+        let gate = Gate::new(Some("repoatomic new beta"), false, fail);
+        let mut sync_state = state.clone();
+        sync_state.embedder = gate.clone();
+        let sync_router = test_router(sync_state);
+        let key = env.key.clone();
+        let uri = format!("/v1/repos/{}/sync", env.source);
+        let sync =
+            tokio::spawn(async move { send(&sync_router, "POST", &uri, &key, Vec::new()).await });
+        gate.wait().await;
+        assert_eq!(env.search().await, old);
+        assert_eq!(env.commit().await, old_commit);
+        for path in [
+            format!("/v1/admin/sources/{}", env.source),
+            format!("/v1/admin/tenants/{}", env.tenant),
+        ] {
+            let (status, _) = tokio::time::timeout(
+                Duration::from_secs(1),
+                send(&router, "DELETE", &path, "t", Vec::new()),
+            )
+            .await
+            .expect("sync busy delete must be immediate");
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+        gate.release();
+        let (status, result) = sync.await.unwrap();
+        if fail {
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{result}");
+            assert_eq!(env.search().await, old);
+            assert_eq!(env.commit().await, old_commit);
+        } else {
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(contents(&env.search().await), new_contents());
+            assert_eq!(env.commit().await, Some(head(&env.repo)));
+        }
+    }
 }

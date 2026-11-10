@@ -204,8 +204,7 @@ pub async fn answer(
             Err(_) if !in_hand.is_empty() => break in_hand,
             Err(_) => return Err(AppError::Internal(anyhow::anyhow!("deep mode timed out"))),
         };
-        usage.input_tokens += res.usage.input_tokens;
-        usage.output_tokens += res.usage.output_tokens;
+        usage.add(res.usage);
         model.clone_from(&res.model);
         let text = response_text(&res);
         if !text.is_empty() {

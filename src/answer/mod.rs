@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::http::AppState;
+use crate::llm::Usage;
 use crate::search::MAX_QUERY_CHARS;
 
 pub mod deep;
@@ -57,10 +58,53 @@ pub struct Citation {
     pub url: Option<String>,
 }
 
+/// Tokens used by the model calls behind an answer. `input_tokens` counts only the uncached part
+/// of the prompt: the whole prompt is that plus the two cache counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageOut {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Default 0: servers before these fields did not send them.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+}
+
+impl UsageOut {
+    /// The whole prompt: uncached, read from the cache and written to it.
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+
+    pub fn add(&mut self, u: Usage) {
+        self.input_tokens += u.input_tokens;
+        self.output_tokens += u.output_tokens;
+        self.cache_read_input_tokens += u.cache_read_input_tokens;
+        self.cache_creation_input_tokens += u.cache_creation_input_tokens;
+    }
+
+    /// `4321 in / 381 out`, with `(4000 cached)` after the input when part of it came from the
+    /// prompt cache.
+    pub fn tokens_text(&self) -> String {
+        let total = self.total_input_tokens();
+        if self.cache_read_input_tokens > 0 {
+            format!(
+                "{total} in ({} cached) / {} out",
+                self.cache_read_input_tokens, self.output_tokens
+            )
+        } else {
+            format!("{total} in / {} out", self.output_tokens)
+        }
+    }
+}
+
+impl From<Usage> for UsageOut {
+    fn from(u: Usage) -> Self {
+        let mut out = UsageOut::default();
+        out.add(u);
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

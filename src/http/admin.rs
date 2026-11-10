@@ -212,6 +212,104 @@ pub async fn revoke_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Holds the locks of `source_ids` so no push to them starts while they are deleted. A running
+/// push is a 409: it is registered before it waits for its lock, so checking the registry first
+/// and then trying each lock leaves no push unseen.
+fn hold_sources(
+    state: &AppState,
+    source_ids: &[Uuid],
+    running: bool,
+    what: &str,
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, AppError> {
+    let busy = || {
+        AppError::Conflict(format!(
+            "a push to this {what} is running; try again when it ends"
+        ))
+    };
+    if running {
+        return Err(busy());
+    }
+    source_ids
+        .iter()
+        .map(|id| {
+            state
+                .source_locks
+                .get(*id)
+                .try_lock_owned()
+                .map_err(|_| busy())
+        })
+        .collect()
+}
+
+/// Deletes a tenant with everything it holds: its sources, documents, chunks, spans, session
+/// queue and keys go with it (every foreign key cascades), then its repo directories.
+pub async fn delete_tenant(
+    _admin: Admin,
+    State(state): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let mut tx = state.pool.begin().await?;
+    // Block new sources (their foreign-key check takes a key-share lock) before listing them.
+    // A push may already hold a tenant key-share lock: reject it rather than waiting.
+    let tenant: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| match &e {
+                sqlx::Error::Database(db) if db.code().as_deref() == Some("55P03") => {
+                    AppError::Conflict("this tenant is busy; try again when its work ends".into())
+                }
+                _ => AppError::from(e),
+            })?;
+    tenant.ok_or(AppError::NotFound)?;
+    let mut ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM sources WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    ids.sort_unstable();
+    let running = state.pushes.any_running(|p| p.tenant_id == tenant_id);
+    let _guards = hold_sources(&state, &ids, running, "tenant")?;
+
+    // Keep the ids for filesystem cleanup after committing the cascades.
+    let deleted: Vec<Uuid> =
+        sqlx::query_scalar("DELETE FROM sources WHERE tenant_id = $1 RETURNING id")
+            .bind(tenant_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let done = sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    tx.commit().await?;
+    tracing::info!(tenant = %tenant_id, sources = deleted.len(), "tenant deleted");
+    repo::remove_repo_dirs(&state.config.data_dir, &deleted).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes a source with its documents and chunks, then its repo directory.
+pub async fn delete_source(
+    _admin: Admin,
+    State(state): State<AppState>,
+    Path(source_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let running = state.pushes.any_running(|p| p.source_id == source_id);
+    let _guards = hold_sources(&state, &[source_id], running, "source")?;
+    let done = sqlx::query("DELETE FROM sources WHERE id = $1")
+        .bind(source_id)
+        .execute(&state.pool)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    tracing::info!(source = %source_id, "source deleted");
+    repo::remove_repo_dirs(&state.config.data_dir, &[source_id]).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// What the server runs and holds, for the admin page.
 #[derive(Serialize)]
 pub struct Overview {
@@ -301,6 +399,14 @@ pub struct SourceOverview {
     /// The later of a repo's last push and the source's newest document write. `None` when
     /// nothing was indexed yet.
     last_indexed_at: Option<DateTime<Utc>>,
+    /// A repo's remote, fetched by sync. `None` when it has none.
+    remote_url: Option<String>,
+    /// When the last sync ended, whether it worked or not.
+    last_sync_at: Option<DateTime<Utc>>,
+    /// The remote's head at the last sync that worked.
+    last_sync_commit: Option<String>,
+    /// Why the last sync failed; `None` when it worked.
+    last_sync_error: Option<String>,
     /// A repo's mirror and checkout on disk. `None` for other kinds, which keep nothing there.
     #[sqlx(skip)]
     disk_bytes: Option<u64>,
@@ -321,6 +427,7 @@ const TENANTS_SQL: &str = "SELECT id, name, created_at FROM tenants ORDER BY cre
 /// when the source was created.
 const SOURCES_SQL: &str = "
     SELECT s.tenant_id, s.id, s.name, s.kind, s.indexed_commit,
+           s.remote_url, s.last_sync_at, s.last_sync_commit, s.last_sync_error,
            count(d.id) AS documents,
            COALESCE(sum(c.n), 0)::bigint AS chunks,
            GREATEST(CASE WHEN s.indexed_commit IS NOT NULL THEN s.updated_at END,

@@ -8,6 +8,7 @@ lore finds the relevant code once, when you index, so a question skips the grep-
 - **deep** matched Claude Code's answers on every question we scored, and was faster in 4 of 5 runs.
 - **One index covers every repo you push**, so an answer can connect a service to the client that calls it.
 - **Claude Code with lore over MCP** answered the same questions 20% faster than Claude Code alone, and up to 29% faster on the broadest one.
+- **Search quality is measured** by a [labelled retrieval eval](#retrieval-eval) that `make eval` reproduces against a local server.
 
 ## A 1,816-file service
 
@@ -85,6 +86,41 @@ Indexing ran on an Apple M2 Pro (10 cores, 16 GB). Nearly all of the time goes t
 - Times are wall clock as each tool reports them: `latency_ms` from `/v1/ask`, `duration_ms` from Claude Code. Retrieval only is the median of 5 `GET /v1/search` calls.
 - Each cell is one run, taken on 2026-10-22.
 - Claude Code's cost is the `total_cost_usd` it reports. lore does not report its cost yet: `/v1/ask` returns only uncached input tokens, and a fast answer sends at most 60,000 characters of passages in one call.
+
+## Retrieval eval
+
+Search changes are measured with a labelled eval and a Claude Code comparison, both in [`bench/eval/`](../bench/eval/README.md). The eval asks each question once with `GET /v1/search?k=50` and finds the rank of the first result whose lines overlap a hand-checked gold range. One command reproduces the public-set numbers against a local server, from a fresh checkout:
+
+```bash
+make db-up && cargo build --release
+LORE_EMBEDDER=fastembed LORE_LLM=fake LORE_ADMIN_TOKEN=dev-admin target/release/lore serve   # in another shell
+make eval
+```
+
+### Public set: 20 questions about lore
+
+Measured on 2026-11-03 at commit `105500e` (both the server and the indexed code), on an Apple M2 Pro. The result is committed as `bench/eval/results/baseline-fastembed-105500e.json`, so `bench/eval/eval --diff baseline-fastembed-105500e <label>` shows what a change moved.
+
+| Embedder | hit@5 | hit@12 | hit@50 | MRR | Median search |
+|---|---|---|---|---|---|
+| fastembed (bge-small-en-v1.5) | 8/20 | 13/20 | 18/20 | 0.365 | 25 ms |
+| hash (`make run`) | 3/20 | 7/20 | 13/20 | 0.113 | 17 ms |
+
+With fastembed, by category (4 questions each), hit@12: `where` 3, `config` 3, `how` 3, `enumeration` 2, `schema` 2. The two misses at 50 are both `enumeration`: the deep-mode tool list, and the repo skip lists, which need two ranges found (`need: all`). The hash embedder is only for tests; compare runs that use the same embedder.
+
+### Historical reference: the private set
+
+These numbers justified #28, #29 and #31. They come from a private set of 33 questions over three repos, run on an Apple M2 Pro with the scripts that `bench/eval/` now replaces.
+
+- Search, before and after #28: hit@12 went from 11/33 to 18/33, and MRR from 0.205 to 0.355.
+- Claude Code with 8 questions in one prompt, after #28:
+
+| Setup | Wall time | Final context | Cost | Correct |
+|---|---|---|---|---|
+| No lore | 67 s | 54k | $0.30 | 13/16 |
+| lore, search first | **28 s** | **42k** | **$0.18** | **15/16** |
+
+`bench/eval/agents.py` runs this comparison on any set: single questions and prompts of 4 and 8, each with and without lore, every answer graded against the reference by a second `claude -p`. It costs money, so it is not part of `make eval`.
 
 ## Run it on your repo
 
