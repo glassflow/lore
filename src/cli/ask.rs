@@ -91,8 +91,10 @@ fn format_answer(res: &AskResponse, dim: bool) -> String {
     let stats = match res.mode {
         Mode::Sources => format!("no model \u{b7} {} ms", res.latency_ms),
         Mode::Fast | Mode::Deep => format!(
-            "{} \u{b7} {} ms \u{b7} {} in / {} out",
-            res.model, res.latency_ms, res.usage.input_tokens, res.usage.output_tokens
+            "{} \u{b7} {} ms \u{b7} {}",
+            res.model,
+            res.latency_ms,
+            res.usage.tokens_text()
         ),
     };
     if dim {
@@ -132,6 +134,7 @@ mod tests {
             usage: UsageOut {
                 input_tokens: 120,
                 output_tokens: 15,
+                ..UsageOut::default()
             },
             latency_ms: 42,
         }
@@ -159,6 +162,24 @@ mod tests {
         assert_eq!(
             out,
             "There are 3 plans [1].\n\nfake \u{b7} 42 ms \u{b7} 120 in / 15 out\n"
+        );
+    }
+
+    #[test]
+    fn the_stats_line_counts_the_cached_prompt() {
+        let mut res = response(Vec::new());
+        res.usage.cache_read_input_tokens = 9000;
+        res.usage.cache_creation_input_tokens = 1200;
+        assert!(
+            format_answer(&res, false)
+                .ends_with("fake \u{b7} 42 ms \u{b7} 10320 in (9000 cached) / 15 out\n"),
+            "{res:?}"
+        );
+        // Written to the cache but not read from it: in the total, not called cached.
+        res.usage.cache_read_input_tokens = 0;
+        assert!(
+            format_answer(&res, false).ends_with("fake \u{b7} 42 ms \u{b7} 1320 in / 15 out\n"),
+            "{res:?}"
         );
     }
 

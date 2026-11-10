@@ -7,3 +7,6 @@
 deploy/.env.prod
 deploy/backups/
 deploy/k8s/overlays/generated/
+__pycache__/
+/bench/eval/results/*
+!/bench/eval/results/baseline-*.json

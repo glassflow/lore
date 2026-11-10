@@ -191,6 +191,7 @@ impl Llm for OpenAiLlm {
                     .and_then(|u| u.completion_tokens)
                     .unwrap_or(0),
                 cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
             model: wire.model.unwrap_or(req.model),
         })
@@ -276,7 +277,8 @@ mod tests {
             Usage {
                 input_tokens: 30,
                 output_tokens: 4,
-                cache_read_input_tokens: 0
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0
             }
         );
 

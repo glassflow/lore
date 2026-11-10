@@ -58,8 +58,8 @@ pub struct PushProgress {
     pub files_done: usize,
     /// Chunks written by this push so far (unchanged files add none).
     pub chunks: usize,
-    /// How many of those chunks the embedder computed a vector for. The others were unchanged
-    /// within a changed file and kept their stored vector.
+    /// How many vectors the embedder computed for those chunks. The others reused a vector from
+    /// the embedding cache or from the file's earlier chunks.
     pub chunks_embedded: usize,
     /// Wall-clock milliseconds spent embedding, the CPU-heavy part of a push. It includes waits
     /// for the embedder while another push uses it.

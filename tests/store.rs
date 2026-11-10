@@ -1,17 +1,19 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use common::{create_tenant_key, test_router, test_state};
+use common::{create_tenant_key, test_router, test_state, test_state_with};
 use lore::chunk::{Chunk, ChunkKind, chunk_file, chunk_markdown, embed_text};
+use lore::config::EmbeddingCache;
 use lore::embed::{DIM, Embedder, HashEmbedder};
 use lore::error::AppError;
 use lore::http::AppState;
 use lore::store::{
-    NewDocument, Source, delete_document, document_hash, document_text, ensure_source,
-    find_session_document, get_source, index_text, list_source_summaries, list_sources,
-    replace_chunks, set_indexed_commit, upsert_document,
+    NewDocument, Source, delete_document, document_hash, document_text, embedding_cache_key,
+    ensure_source, find_session_document, get_source, index_text, index_text_with_stats,
+    list_source_summaries, list_sources, replace_chunks, set_indexed_commit, upsert_document,
 };
 use pgvector::Vector;
 use serde_json::json;
@@ -1198,4 +1200,279 @@ async fn a_pending_copy_after_a_finished_one_in_the_same_batch_loses(pool: PgPoo
     assert_eq!(stored_span(&pool, other).await, "two");
     put_spans(&pool, other, &[span("three", true), span("four", true)]).await;
     assert_eq!(stored_span(&pool, other).await, "two");
+}
+
+/// The hash embedder under the same name, counting the texts it embeds.
+#[derive(Default)]
+struct CountingEmbedder {
+    texts: std::sync::atomic::AtomicUsize,
+}
+
+impl Embedder for CountingEmbedder {
+    fn name(&self) -> &str {
+        HashEmbedder.name()
+    }
+
+    fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.texts
+            .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+        HashEmbedder.embed_documents(texts)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        HashEmbedder.embed_query(text)
+    }
+}
+
+/// A state with this cache mode and a counting embedder, which it also returns.
+fn counting_state(pool: &PgPool, mode: EmbeddingCache) -> (AppState, Arc<CountingEmbedder>) {
+    let mut state = test_state_with(pool.clone(), &std::env::temp_dir(), |c| {
+        c.embedding_cache = mode;
+    });
+    let counter = Arc::new(CountingEmbedder::default());
+    state.embedder = counter.clone();
+    (state, counter)
+}
+
+fn embedded_texts(counter: &CountingEmbedder) -> usize {
+    counter.texts.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+async fn vectors_of(pool: &PgPool, tenant: Uuid) -> Vec<Vector> {
+    sqlx::query_scalar("SELECT embedding FROM chunks WHERE tenant_id = $1 ORDER BY ord")
+        .bind(tenant)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_same_text_in_another_tenant_reuses_the_cached_vectors(pool: PgPool) {
+    let (state, counter) = counting_state(&pool, EmbeddingCache::Shared);
+    let a = tenant(&state, "acme").await;
+    let b = tenant(&state, "globex").await;
+    let src_a = ensure_source(&pool, a, "repo", "app", None).await.unwrap();
+    let src_b = ensure_source(&pool, b, "repo", "fork", None).await.unwrap();
+
+    let first = index_text_with_stats(
+        &state,
+        a,
+        &src_a,
+        doc(&src_a, "a.rs", "h1"),
+        two_chunks(),
+        "src/a.rs",
+    )
+    .await
+    .unwrap();
+    assert_eq!((first.chunks, first.embedded), (2, 2));
+    assert_eq!(count(&pool, "embedding_cache").await, 2);
+
+    let second = index_text_with_stats(
+        &state,
+        b,
+        &src_b,
+        doc(&src_b, "a.rs", "h1"),
+        two_chunks(),
+        "src/a.rs",
+    )
+    .await
+    .unwrap();
+    assert_eq!((second.chunks, second.embedded), (2, 0));
+    assert_eq!(second.embed_time, Duration::ZERO);
+    assert_eq!(
+        embedded_texts(&counter),
+        2,
+        "the embedder ran for tenant a only"
+    );
+    assert_eq!(vectors_of(&pool, a).await, vectors_of(&pool, b).await);
+    // The reused vectors are what the embedder gives for that text.
+    for (i, c) in two_chunks().iter().enumerate() {
+        let want = HashEmbedder
+            .embed_query(&embed_text("src/a.rs", c))
+            .unwrap();
+        assert_eq!(vectors_of(&pool, b).await[i].as_slice(), want.as_slice());
+    }
+
+    // A new chunk next to a cached one: only the new one is embedded.
+    let mut chunks = two_chunks();
+    chunks.push(chunk("fn brand_new() {}", (7, 7), &["brand_new"]));
+    let third = index_text_with_stats(
+        &state,
+        b,
+        &src_b,
+        doc(&src_b, "b.rs", "h2"),
+        chunks,
+        "src/a.rs",
+    )
+    .await
+    .unwrap();
+    assert_eq!((third.chunks, third.embedded), (3, 1));
+    assert_eq!(count(&pool, "embedding_cache").await, 3);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_cache_key_holds_the_model_and_the_exact_embed_text(pool: PgPool) {
+    let (state, counter) = counting_state(&pool, EmbeddingCache::Shared);
+    let t = tenant(&state, "acme").await;
+    let src = ensure_source(&pool, t, "repo", "app", None).await.unwrap();
+    index_text(
+        &state,
+        t,
+        &src,
+        doc(&src, "a.rs", "h1"),
+        two_chunks(),
+        "a.rs",
+    )
+    .await
+    .unwrap();
+    assert_eq!(embedded_texts(&counter), 2);
+
+    let keys: Vec<Vec<u8>> = sqlx::query_scalar("SELECT key FROM embedding_cache ORDER BY key")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let mut want: Vec<Vec<u8>> = two_chunks()
+        .iter()
+        .map(|c| embedding_cache_key(None, "hash", &embed_text("a.rs", c)).to_vec())
+        .collect();
+    want.sort();
+    assert_eq!(keys, want);
+
+    // Another path is another embed text: embedded again.
+    index_text(
+        &state,
+        t,
+        &src,
+        doc(&src, "b.rs", "h1"),
+        two_chunks(),
+        "b.rs",
+    )
+    .await
+    .unwrap();
+    assert_eq!(embedded_texts(&counter), 4);
+
+    // Another embedder never gets the hash embedder's vectors.
+    let mut other = state.clone();
+    other.embedder = Arc::new(OddEmbedder {
+        dim: 384,
+        count: None,
+    });
+    let stats = index_text_with_stats(
+        &other,
+        t,
+        &src,
+        doc(&src, "c.rs", "h1"),
+        two_chunks(),
+        "a.rs",
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.embedded, 2);
+    assert_eq!(count(&pool, "embedding_cache").await, 6);
+
+    assert_ne!(
+        embedding_cache_key(None, "hash", "x"),
+        embedding_cache_key(None, "odd", "x")
+    );
+    assert_ne!(
+        embedding_cache_key(None, "hash", "x"),
+        embedding_cache_key(Some(t), "hash", "x")
+    );
+    assert_ne!(
+        embedding_cache_key(Some(t), "hash", "x"),
+        embedding_cache_key(Some(Uuid::new_v4()), "hash", "x")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_tenant_scoped_cache_is_not_shared_across_tenants(pool: PgPool) {
+    let (state, counter) = counting_state(&pool, EmbeddingCache::Tenant);
+    let a = tenant(&state, "acme").await;
+    let b = tenant(&state, "globex").await;
+    let src_a = ensure_source(&pool, a, "repo", "app", None).await.unwrap();
+    let src_a2 = ensure_source(&pool, a, "repo", "copy", None).await.unwrap();
+    let src_b = ensure_source(&pool, b, "repo", "app", None).await.unwrap();
+    for (t, src) in [(a, &src_a), (b, &src_b), (a, &src_a2)] {
+        index_text(&state, t, src, doc(src, "a.rs", "h1"), two_chunks(), "a.rs")
+            .await
+            .unwrap();
+    }
+    // Tenant b embeds its own copy; tenant a's second source reuses tenant a's vectors.
+    assert_eq!(embedded_texts(&counter), 4);
+    assert_eq!(count(&pool, "embedding_cache").await, 4);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn with_the_cache_off_only_the_documents_own_chunks_are_reused(pool: PgPool) {
+    let (state, counter) = counting_state(&pool, EmbeddingCache::Off);
+    let t = tenant(&state, "acme").await;
+    let src = ensure_source(&pool, t, "repo", "app", None).await.unwrap();
+    let src2 = ensure_source(&pool, t, "repo", "copy", None).await.unwrap();
+    for (s, hash) in [(&src, "h1"), (&src2, "h1"), (&src, "h2")] {
+        // The stored vectors are reused only when the stored title is the one embedded with.
+        let mut d = doc(s, "a.rs", hash);
+        d.title = "a.rs".to_string();
+        index_text(&state, t, s, d, two_chunks(), "a.rs")
+            .await
+            .unwrap();
+    }
+    // The second source embeds again; re-indexing the first keeps its stored vectors.
+    assert_eq!(embedded_texts(&counter), 4);
+    assert_eq!(count(&pool, "embedding_cache").await, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn repeated_chunks_are_embedded_once(pool: PgPool) {
+    let (state, counter) = counting_state(&pool, EmbeddingCache::Shared);
+    let t = tenant(&state, "acme").await;
+    let src = ensure_source(&pool, t, "repo", "app", None).await.unwrap();
+    let same = chunk("// generated, do not edit", (1, 1), &[]);
+    let chunks = vec![same.clone(), chunk("fn a() {}", (2, 2), &["a"]), same];
+    let stats = index_text_with_stats(&state, t, &src, doc(&src, "a.rs", "h1"), chunks, "a.rs")
+        .await
+        .unwrap();
+    assert_eq!((stats.chunks, stats.embedded), (3, 2));
+    assert_eq!(embedded_texts(&counter), 2);
+    let v = vectors_of(&pool, t).await;
+    assert_eq!(v[0], v[2]);
+    assert_eq!(count(&pool, "embedding_cache").await, 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cache_entries_outlive_the_tenant_that_made_them(pool: PgPool) {
+    let (state, counter) = counting_state(&pool, EmbeddingCache::Shared);
+    let a = tenant(&state, "acme").await;
+    let b = tenant(&state, "globex").await;
+    let src_a = ensure_source(&pool, a, "repo", "app", None).await.unwrap();
+    index_text(
+        &state,
+        a,
+        &src_a,
+        doc(&src_a, "a.rs", "h1"),
+        two_chunks(),
+        "a.rs",
+    )
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count(&pool, "chunks").await, 0);
+    assert_eq!(count(&pool, "embedding_cache").await, 2);
+
+    let src_b = ensure_source(&pool, b, "repo", "app", None).await.unwrap();
+    let stats = index_text_with_stats(
+        &state,
+        b,
+        &src_b,
+        doc(&src_b, "a.rs", "h1"),
+        two_chunks(),
+        "a.rs",
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.embedded, 0);
+    assert_eq!(embedded_texts(&counter), 2);
 }

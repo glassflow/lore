@@ -5,16 +5,18 @@
 //! Vocabulary: a "source kind" is `sources.kind` (`repo`, `traces`, `documents`); a "document kind"
 //! is `documents.kind` (`code`, `doc`, `session`, `note`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use pgvector::Vector;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::chunk::{Chunk, embed_text, lexical_text};
+use crate::config::EmbeddingCache;
 use crate::embed::{DIM, embed_documents_async};
 use crate::error::AppError;
 use crate::http::AppState;
@@ -441,6 +443,74 @@ pub async fn delete_document(
     Ok(res.rows_affected() > 0)
 }
 
+/// Who shares a cache entry: everyone (`Some(None)`), one tenant (`Some(Some(id))`), or nobody
+/// because the cache is off (`None`).
+fn cache_scope(mode: EmbeddingCache, tenant_id: Uuid) -> Option<Option<Uuid>> {
+    match mode {
+        EmbeddingCache::Shared => Some(None),
+        EmbeddingCache::Tenant => Some(Some(tenant_id)),
+        EmbeddingCache::Off => None,
+    }
+}
+
+/// The `embedding_cache` key of `text` embedded by the embedder named `model`: sha256 of the
+/// model name and the exact text, so a different embedder never finds another's vectors. With a
+/// tenant (`LORE_EMBEDDING_CACHE=tenant`) the tenant id goes in too, and the leading byte keeps
+/// the two kinds of key apart.
+pub fn embedding_cache_key(tenant: Option<Uuid>, model: &str, text: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    match tenant {
+        None => h.update([0u8]),
+        Some(t) => {
+            h.update([1u8]);
+            h.update(t.as_bytes());
+        }
+    }
+    h.update(model.as_bytes());
+    h.update([0u8]);
+    h.update(text.as_bytes());
+    h.finalize().into()
+}
+
+/// The cached vectors of those `keys` that have one, by key.
+async fn cached_embeddings(
+    pool: &PgPool,
+    keys: &[[u8; 32]],
+) -> sqlx::Result<HashMap<Vec<u8>, Vec<f32>>> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let keys: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let rows: Vec<(Vec<u8>, Vector)> =
+        sqlx::query_as("SELECT key, embedding FROM embedding_cache WHERE key = ANY($1)")
+            .bind(&keys)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(k, v)| (k, v.to_vec()))
+        .filter(|(_, v)| v.len() == DIM)
+        .collect())
+}
+
+/// Rows per `INSERT` into `embedding_cache` (2 binds each).
+const CACHE_INSERT_CHUNK: usize = 1000;
+
+/// Adds vectors to the cache. A key that is already there keeps its row: the same embedder gave
+/// the same text the same vector.
+async fn put_cached_embeddings(pool: &PgPool, entries: &[(&[u8], &Vec<f32>)]) -> sqlx::Result<()> {
+    for chunk in entries.chunks(CACHE_INSERT_CHUNK) {
+        let mut q =
+            sqlx::QueryBuilder::<Postgres>::new("INSERT INTO embedding_cache (key, embedding) ");
+        q.push_values(chunk, |mut b, (key, v)| {
+            b.push_bind(*key).push_bind(Vector::from((*v).clone()));
+        });
+        q.push(" ON CONFLICT (key) DO NOTHING");
+        q.build().execute(pool).await?;
+    }
+    Ok(())
+}
+
 /// The key under which a stored embedding is found again: the part of `embed_text` that comes
 /// after the title (the symbols, then the text).
 fn embedding_key(text: &str, symbols: &[String]) -> String {
@@ -480,9 +550,12 @@ async fn stored_embeddings(
 /// The shared indexing path (repos, sessions, documents): embeds the chunks, then stores the
 /// document and its chunks in one short transaction. Returns the chunk count.
 ///
-/// A chunk whose text and symbols equal those of a chunk the document already has (and whose
-/// title is unchanged) keeps the stored embedding, so only new or changed chunks reach the
-/// embedder. This is what keeps a growing session cheap to index again.
+/// A chunk reaches the embedder only when no vector is found for it elsewhere: first in the
+/// embedding cache (see [`embedding_cache_key`]), which holds every vector computed before for
+/// the same embedder and `embed_text`, whatever the tenant or source; then among the chunks the
+/// document already holds (text, symbols and title unchanged), which covers rows indexed before
+/// the cache existed. This is what keeps a growing session, or the same repo in a second tenant,
+/// cheap to index. A moved file is embedded again, because its path is part of `embed_text`.
 ///
 /// The embedding runs before the transaction opens, so no connection is held while the model
 /// works. `title_for_embed` is the path or title passed to `embed_text`.
@@ -504,7 +577,8 @@ pub async fn index_text(
 pub struct IndexStats {
     /// Chunks stored.
     pub chunks: usize,
-    /// Chunks the embedder computed a vector for. The others kept their stored vector.
+    /// Vectors the embedder computed. The other chunks reused a vector from the embedding cache
+    /// or from the document's stored chunks, or repeat the text of a chunk embedded in this call.
     pub embedded: usize,
     /// Wall-clock time spent embedding, including any wait for the embedder while other pushes
     /// use it.
@@ -524,45 +598,85 @@ pub async fn index_text_with_stats(
         bail!("document does not belong to the source and tenant");
     }
     let lexicals: Vec<String> = chunks.iter().map(lexical_text).collect();
-    let stored = stored_embeddings(
-        &state.pool,
-        tenant_id,
-        source.id,
-        &doc.external_id,
-        title_for_embed,
-    )
-    .await?;
-    let mut embeddings: Vec<Option<Vec<f32>>> = chunks
+    let texts: Vec<String> = chunks
         .iter()
-        .map(|c| {
-            stored
-                .get(&embedding_key(&c.text, &c.symbols))
-                .filter(|v| v.len() == DIM)
-                .cloned()
-        })
+        .map(|c| embed_text(title_for_embed, c))
         .collect();
-    let missing: Vec<usize> = (0..chunks.len())
-        .filter(|i| embeddings[*i].is_none())
+    let model = state.embedder.name().to_string();
+    let keys: Option<Vec<[u8; 32]>> =
+        cache_scope(state.config.embedding_cache, tenant_id).map(|scope| {
+            texts
+                .iter()
+                .map(|t| embedding_cache_key(scope, &model, t))
+                .collect()
+        });
+
+    let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
+    if let Some(keys) = &keys {
+        let cached = cached_embeddings(&state.pool, keys).await?;
+        for (i, key) in keys.iter().enumerate() {
+            embeddings[i] = cached.get(key.as_slice()).cloned();
+        }
+    }
+    if embeddings.iter().any(Option::is_none) {
+        let stored = stored_embeddings(
+            &state.pool,
+            tenant_id,
+            source.id,
+            &doc.external_id,
+            title_for_embed,
+        )
+        .await?;
+        for (i, c) in chunks.iter().enumerate() {
+            if embeddings[i].is_none() {
+                embeddings[i] = stored
+                    .get(&embedding_key(&c.text, &c.symbols))
+                    .filter(|v| v.len() == DIM)
+                    .cloned();
+            }
+        }
+    }
+
+    // Chunks with the same embed text (repeated blocks in one file) are embedded once.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let unique: Vec<usize> = (0..chunks.len())
+        .filter(|i| embeddings[*i].is_none() && seen.insert(texts[*i].as_str()))
         .collect();
-    let embedded = missing.len();
+    let embedded = unique.len();
     let mut embed_time = Duration::ZERO;
-    if !missing.is_empty() {
-        let texts: Vec<String> = missing
-            .iter()
-            .map(|i| embed_text(title_for_embed, &chunks[*i]))
-            .collect();
+    if !unique.is_empty() {
+        let batch: Vec<String> = unique.iter().map(|i| texts[*i].clone()).collect();
         let started = Instant::now();
-        let fresh = embed_documents_async(state.embedder.clone(), texts).await?;
+        let fresh = embed_documents_async(state.embedder.clone(), batch).await?;
         embed_time = started.elapsed();
-        if fresh.len() != missing.len() {
+        if fresh.len() != unique.len() {
             bail!(
                 "embedder returned {} vectors for {} chunks",
                 fresh.len(),
-                missing.len()
+                unique.len()
             );
         }
-        for (i, v) in missing.into_iter().zip(fresh) {
-            embeddings[i] = Some(v);
+        // Only vectors the embedder just computed go into the cache: a stored chunk vector may
+        // predate an embedder change, and the cache must never hand one tenant a vector that
+        // did not come from the embedder.
+        if let Some(keys) = &keys {
+            let entries: Vec<(&[u8], &Vec<f32>)> = unique
+                .iter()
+                .zip(&fresh)
+                .filter(|(_, v)| v.len() == DIM)
+                .map(|(i, v)| (keys[*i].as_slice(), v))
+                .collect();
+            put_cached_embeddings(&state.pool, &entries).await?;
+        }
+        let fresh_of: HashMap<&str, Vec<f32>> = unique
+            .iter()
+            .map(|i| texts[*i].as_str())
+            .zip(fresh)
+            .collect();
+        for (i, slot) in embeddings.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = fresh_of.get(texts[i].as_str()).cloned();
+            }
         }
     }
     let embeddings: Vec<Vec<f32>> = embeddings.into_iter().flatten().collect();

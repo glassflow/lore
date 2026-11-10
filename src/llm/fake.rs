@@ -91,6 +91,7 @@ fn usage(req: &LlmRequest, output_chars: usize) -> Usage {
         input_tokens: request_chars(req) / 4,
         output_tokens: output_chars as u64 / 4,
         cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     }
 }
 

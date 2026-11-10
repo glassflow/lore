@@ -9,6 +9,8 @@ make test       # cargo test --all-targets (DB tests read DATABASE_URL, set by t
 make lint       # cargo fmt --check and cargo clippy -D warnings
 make check      # lint + test: the pre-push gate, and what CI runs
 make image VERSION=dev   # docker build, tagged lore:dev
+make eval       # the search eval on the public question set, against LORE_URL (bench/eval/README.md)
+make eval-test  # the eval's own unit tests (python3; cargo test runs them too)
 ```
 
 `docker compose up -d --build` starts both Postgres and lore in containers.

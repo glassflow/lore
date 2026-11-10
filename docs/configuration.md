@@ -10,8 +10,12 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_ADMIN_TOKEN` | unset | Admin bearer token, for the admin API and the [admin page](usage.md#admin-page) at `/admin`. On the server, an empty value counts as unset and the admin API answers 403. The CLI reads it as the default of `--admin-token` |
 | `LORE_LOG` | `info` | Log filter, in `tracing` `EnvFilter` syntax |
 | `LORE_LOG_FORMAT` | `text` | `text` or `json`. Anything else is a startup error |
-| `LORE_EMBEDDER` | `fastembed` | `fastembed` (bge-small-en-v1.5 on CPU) or `hash` (deterministic, for tests and `make run`). Anything else is a startup error. The first start with `fastembed` downloads about 130 MB into `$LORE_DATA_DIR/models` before the server listens |
+| `LORE_EMBEDDER` | `fastembed` | `fastembed` (bge-small-en-v1.5 on CPU) or `hash` (deterministic, for tests and `make run`). Anything else is a startup error. The first start with `fastembed` downloads about 130 MB into `$LORE_DATA_DIR/models` before the server listens; see [the embedding model download](#the-embedding-model-download) |
 | `LORE_EMBED_MODEL` | `bge-small-en-v1.5` | Embedding model. Only the default is supported in v1; any other value is a startup error |
+| `LORE_EMBEDDING_CACHE` | `shared` | Who reuses a vector already computed for the same text: `shared` (every tenant, so pushing a repo another tenant has is nearly free, but a push is faster when its text exists elsewhere), `tenant` (each tenant only its own) or `off` (only the chunks a document already holds). Anything else is a startup error. See [the embedding cache](architecture.md#the-embedding-cache-and-tenant-isolation) |
+| `LORE_MODEL_DOWNLOAD_TIMEOUT_SECS` | `300` | Seconds the first-start download of the embedding model may take, retries included. When they run out, `lore serve` exits with an error naming the URL and the model directory. Must be a positive integer |
+| `HF_ENDPOINT` | `https://huggingface.co` | Where the embedding model is downloaded from, for example a Hugging Face mirror |
+| `HF_HOME` | unset | When set, the embedding model is kept in this directory instead of `$LORE_DATA_DIR/models` |
 | `LORE_MAX_BUNDLE_BYTES` | `536870912` (512 MiB) | Largest accepted body of `PUT /v1/repos/{id}/bundle`; a bigger upload is a 413. Must be a positive integer, otherwise a startup error |
 | `LORE_LLM` | `anthropic` | Model provider: `anthropic`, `openai` (an OpenAI-compatible server such as llama-server, text only) or `fake` (deterministic, for tests and `make run`). Anything else is a startup error |
 | `ANTHROPIC_API_KEY` | unset | Anthropic API key. Required when `LORE_LLM=anthropic`: `lore serve` exits at startup with an error naming the variable when it is missing |
@@ -33,3 +37,22 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
 | `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |
 
+## The embedding model download
+
+With `LORE_EMBEDDER=fastembed`, the first start downloads bge-small-en-v1.5 (about 130 MB, five files of the `Xenova/bge-small-en-v1.5` repo) from `$HF_ENDPOINT` into `$LORE_DATA_DIR/models` before the server listens. Later starts find the files there and do not use the network.
+
+- The log shows where the download goes when it starts, then a line for every 10 MB of the model file.
+- A connection that sends nothing for 30 seconds is dropped. Each file is tried up to 5 times, with waits of 1, 2, 4 and 8 seconds in between, and a retry continues a partly downloaded file where it stopped.
+- The whole download, retries included, must finish within `LORE_MODEL_DOWNLOAD_TIMEOUT_SECS` (5 minutes by default). Otherwise `lore serve` exits with an error that names the URL it was downloading and the model directory.
+
+The model directory uses the Hugging Face cache layout (`models--Xenova--bge-small-en-v1.5/` with `refs/main` and `snapshots/<commit>/`). To start a machine that cannot reach Hugging Face, or to skip the download, copy that directory from another install before the first start:
+
+```sh
+# from a machine where lore has started once
+tar -C "$LORE_DATA_DIR/models" -czf lore-models.tgz models--Xenova--bge-small-en-v1.5
+# on the new machine
+mkdir -p "$LORE_DATA_DIR/models"
+tar -C "$LORE_DATA_DIR/models" -xzf lore-models.tgz
+```
+
+`tar` keeps the symlinks of `snapshots/` that point into `blobs/`. For the Docker image, unpack it into the data volume, which is mounted at `/var/lib/lore`, so the directory is `/var/lib/lore/models`. The files must be readable by the `lore` user (uid 10001).
