@@ -1,0 +1,3 @@
+#!/bin/sh
+# The search eval: see bench/eval/README.md.
+exec python3 "$(dirname "$0")/retrieval.py" "$@"

@@ -14,6 +14,9 @@ pub struct Config {
     pub log_format: LogFormat,
     pub embedder: EmbedderKind,
     pub embed_model: String,
+    /// `LORE_MODEL_DOWNLOAD_TIMEOUT_SECS`: how long the first-start download of the embedding
+    /// model may take, retries included, before the start fails.
+    pub model_download_timeout_secs: u64,
     /// Largest accepted git bundle upload, in bytes.
     pub max_bundle_bytes: u64,
     pub version: String,
@@ -91,6 +94,9 @@ pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 /// Default `ANTHROPIC_BASE_URL`.
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 
+/// Default `LORE_MODEL_DOWNLOAD_TIMEOUT_SECS`: 5 minutes.
+pub const DEFAULT_MODEL_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+
 /// Default `LORE_MAX_BUNDLE_BYTES`: 512 MiB.
 pub const DEFAULT_MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -158,6 +164,12 @@ impl Config {
             );
         }
 
+        let model_download_timeout_secs = positive(
+            &f,
+            "LORE_MODEL_DOWNLOAD_TIMEOUT_SECS",
+            DEFAULT_MODEL_DOWNLOAD_TIMEOUT_SECS,
+        )?;
+
         let max_bundle_bytes = match f("LORE_MAX_BUNDLE_BYTES") {
             None => DEFAULT_MAX_BUNDLE_BYTES,
             Some(v) => match v.trim().parse::<u64>() {
@@ -212,6 +224,7 @@ impl Config {
             log_format,
             embedder,
             embed_model,
+            model_download_timeout_secs,
             max_bundle_bytes,
             version: get("LORE_VERSION", env!("CARGO_PKG_VERSION")),
             llm,
@@ -272,6 +285,7 @@ mod tests {
         assert_eq!(c.log_format, LogFormat::Text);
         assert_eq!(c.embedder, EmbedderKind::Fastembed);
         assert_eq!(c.embed_model, "bge-small-en-v1.5");
+        assert_eq!(c.model_download_timeout_secs, 300);
         assert_eq!(c.max_bundle_bytes, 512 * 1024 * 1024);
         assert_eq!(c.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(c.llm, LlmKind::Anthropic);
@@ -465,6 +479,23 @@ mod tests {
     fn unknown_embed_model_is_an_error() {
         let err = lookup(&[("LORE_EMBED_MODEL", "all-MiniLM-L6-v2")]).unwrap_err();
         assert!(err.to_string().contains("LORE_EMBED_MODEL"), "{err}");
+    }
+
+    #[test]
+    fn model_download_timeout_is_read() {
+        let c = lookup(&[("LORE_MODEL_DOWNLOAD_TIMEOUT_SECS", " 900 ")]).unwrap();
+        assert_eq!(c.model_download_timeout_secs, 900);
+    }
+
+    #[test]
+    fn bad_model_download_timeout_is_an_error() {
+        for bad in ["", "0", "-1", "forever", "1.5"] {
+            let err = lookup(&[("LORE_MODEL_DOWNLOAD_TIMEOUT_SECS", bad)]).unwrap_err();
+            assert!(
+                err.to_string().contains("LORE_MODEL_DOWNLOAD_TIMEOUT_SECS"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

@@ -1,11 +1,26 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
-use ::fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-use anyhow::{Result, anyhow};
+use ::fastembed::{
+    EmbeddingModel, InitOptionsUserDefined, TextEmbedding, TokenizerFiles,
+    UserDefinedEmbeddingModel,
+};
+use anyhow::{Context, Result, anyhow};
 
 use super::Embedder;
+use super::download::{self, Download};
+use crate::config::DEFAULT_MODEL_DOWNLOAD_TIMEOUT_SECS;
 
+const MODEL: EmbeddingModel = EmbeddingModel::BGESmallENV15;
+/// The tokenizer files fastembed reads, small ones first: the first file downloaded fixes the
+/// commit of the others.
+const TOKENIZER_FILES: [&str; 4] = [
+    "config.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+];
 const BATCH_SIZE: usize = 64;
 const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 /// ONNX Runtime threads of the query instance. A query is one short text, which more threads
@@ -25,30 +40,56 @@ pub struct FastEmbedder {
 }
 
 impl FastEmbedder {
-    /// Loads the model from `cache_dir`, downloading it (about 130 MB) when it is missing.
+    /// Loads the model from `cache_dir`, downloading it (about 130 MB) from `HF_ENDPOINT` when
+    /// it is missing, within the default deadline.
     pub fn new(cache_dir: &Path) -> Result<Self> {
+        let deadline = Duration::from_secs(DEFAULT_MODEL_DOWNLOAD_TIMEOUT_SECS);
+        Self::with_download(cache_dir, &Download::new(deadline))
+    }
+
+    /// Loads the model from `cache_dir` (`$HF_HOME` instead, when that is set), downloading it
+    /// as `download` says when it is missing.
+    pub fn with_download(cache_dir: &Path, download: &Download) -> Result<Self> {
+        // fastembed's own loader let HF_HOME replace the cache directory, and the docs say so.
+        let cache_dir = std::env::var_os("HF_HOME")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| cache_dir.to_path_buf(), PathBuf::from);
+        let info = TextEmbedding::get_model_info(&MODEL)?;
+        let mut files = TOKENIZER_FILES.to_vec();
+        files.push(&info.model_file);
+        let snapshot = download::fetch(&info.model_code, &files, &cache_dir, download)?;
         Ok(Self {
-            documents: Mutex::new(load(cache_dir, None)?),
-            queries: Mutex::new(load(cache_dir, Some(QUERY_THREADS))?),
+            documents: Mutex::new(load(&snapshot, None)?),
+            queries: Mutex::new(load(&snapshot, Some(QUERY_THREADS))?),
         })
     }
 }
 
-/// One instance of the model; `threads` caps its ONNX Runtime threads (`None`: the runtime's
-/// default, one per core).
-fn load(cache_dir: &Path, threads: Option<usize>) -> Result<TextEmbedding> {
-    let mut options = TextInitOptions::new(EmbeddingModel::BGESmallENV15)
-        .with_cache_dir(cache_dir.to_path_buf())
-        .with_show_download_progress(false);
+/// One instance of the model, from the files in `snapshot`, with the settings
+/// `TextEmbedding::try_new` uses for it. fastembed never touches the network this way.
+/// `threads` caps its ONNX Runtime threads (`None`: the runtime's default, one per core).
+fn load(snapshot: &Path, threads: Option<usize>) -> Result<TextEmbedding> {
+    let read = |file: &str| {
+        let path = snapshot.join(file);
+        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
+    };
+    let info = TextEmbedding::get_model_info(&MODEL)?;
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: read("tokenizer.json")?,
+        config_file: read("config.json")?,
+        special_tokens_map_file: read("special_tokens_map.json")?,
+        tokenizer_config_file: read("tokenizer_config.json")?,
+    };
+    let mut model = UserDefinedEmbeddingModel::new(read(&info.model_file)?, tokenizer_files)
+        .with_quantization(TextEmbedding::get_quantization_mode(&MODEL));
+    model.pooling = TextEmbedding::get_default_pooling_method(&MODEL);
+    model.output_key = info.output_key.clone();
+    let mut options = InitOptionsUserDefined::new();
     if let Some(threads) = threads {
         options = options.with_intra_threads(threads);
     }
-    TextEmbedding::try_new(options).map_err(|e| {
-        anyhow!(
-            "loading bge-small-en-v1.5 into {}: {e}",
-            cache_dir.display()
-        )
-    })
+    TextEmbedding::try_new_from_user_defined(model, options)
+        .map_err(|e| anyhow!("loading bge-small-en-v1.5 from {}: {e}", snapshot.display()))
 }
 
 /// Embeds `texts` (at most one batch) while holding `model`'s lock.
@@ -87,6 +128,38 @@ impl Embedder for FastEmbedder {
 mod tests {
     use super::*;
     use crate::embed::DIM;
+
+    /// The load goes through the download with its deadline: a hub that accepts the
+    /// connection and then says nothing stops it in time, with the URL in the error.
+    #[test]
+    fn a_silent_hub_stops_the_load_at_the_deadline() {
+        // HF_HOME replaces the cache directory, and may already hold the model.
+        if std::env::var_os("HF_HOME").is_some() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                held.push(stream);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let download = Download::with_endpoint(&base, Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let err = FastEmbedder::with_download(dir.path(), &download)
+            .err()
+            .expect("the load fails")
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(3), "{err}");
+        assert!(
+            err.contains(&format!(
+                "{base}/Xenova/bge-small-en-v1.5/resolve/main/config.json"
+            )),
+            "{err}"
+        );
+    }
 
     /// Downloads the model (about 130 MB) into a temp dir. Run with
     /// `cargo test -- --ignored fastembed_smoke`.

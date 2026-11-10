@@ -2,14 +2,17 @@
 //! stand-in so tests never download a model.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::config::{Config, EmbedderKind};
 
+pub mod download;
 pub mod fastembed;
 pub mod hash;
 
+pub use self::download::Download;
 pub use self::fastembed::FastEmbedder;
 pub use self::hash::HashEmbedder;
 
@@ -24,7 +27,8 @@ pub trait Embedder: Send + Sync {
 }
 
 /// Builds the embedder chosen by `LORE_EMBEDDER`. For fastembed this creates
-/// `<data_dir>/models` and loads the model, downloading it on first use.
+/// `<data_dir>/models` and loads the model, downloading it on first use within
+/// `LORE_MODEL_DOWNLOAD_TIMEOUT_SECS`.
 pub fn from_config(cfg: &Config) -> Result<Arc<dyn Embedder>> {
     match cfg.embedder {
         EmbedderKind::Hash => Ok(Arc::new(HashEmbedder)),
@@ -32,7 +36,8 @@ pub fn from_config(cfg: &Config) -> Result<Arc<dyn Embedder>> {
             let dir = cfg.data_dir.join("models");
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("creating model directory {}", dir.display()))?;
-            Ok(Arc::new(FastEmbedder::new(&dir)?))
+            let download = Download::new(Duration::from_secs(cfg.model_download_timeout_secs));
+            Ok(Arc::new(FastEmbedder::with_download(&dir, &download)?))
         }
     }
 }

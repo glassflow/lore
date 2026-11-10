@@ -1,0 +1,468 @@
+{
+  "label": "baseline-fastembed-105500e",
+  "date": "2026-11-03T18:08:49+00:00",
+  "url": "http://localhost:8080",
+  "k": 50,
+  "server": {
+    "version": "0.1.0",
+    "llm": "fake",
+    "embedder": "fastembed:bge-small-en-v1.5",
+    "modes": [
+      "fast",
+      "sources",
+      "deep"
+    ]
+  },
+  "sets": [
+    {
+      "file": "bench/eval/questions/lore.json",
+      "commits": {
+        "*": "105500e75cdf3d65886d5220ca070440735b50bb"
+      },
+      "questions": 20
+    }
+  ],
+  "latency_ms_median": 24.9,
+  "summary": {
+    "overall": {
+      "n": 20,
+      "hit@5": 8,
+      "hit@12": 13,
+      "hit@50": 18,
+      "mrr": 0.365
+    },
+    "categories": {
+      "enumeration": {
+        "n": 4,
+        "hit@5": 1,
+        "hit@12": 2,
+        "hit@50": 2,
+        "mrr": 0.275
+      },
+      "schema": {
+        "n": 4,
+        "hit@5": 1,
+        "hit@12": 2,
+        "hit@50": 4,
+        "mrr": 0.176
+      },
+      "where": {
+        "n": 4,
+        "hit@5": 3,
+        "hit@12": 3,
+        "hit@50": 4,
+        "mrr": 0.634
+      },
+      "config": {
+        "n": 4,
+        "hit@5": 1,
+        "hit@12": 3,
+        "hit@50": 4,
+        "mrr": 0.189
+      },
+      "how": {
+        "n": 4,
+        "hit@5": 2,
+        "hit@12": 3,
+        "hit@50": 4,
+        "mrr": 0.551
+      }
+    }
+  },
+  "questions": [
+    {
+      "id": "lore-01",
+      "repo": "lore",
+      "category": "enumeration",
+      "need": "any",
+      "q": "what kinds of documents can lore store?",
+      "rank": 1,
+      "gold_ranks": [
+        null,
+        1
+      ],
+      "latency_ms": 24.3,
+      "top": [
+        "migrations/0003_sources_documents_chunks.sql:12-25",
+        "docs/usage.md:118-142",
+        "Makefile:1-60",
+        "docs/usage.md:217-240",
+        "docs/development.md:18-55"
+      ]
+    },
+    {
+      "id": "lore-02",
+      "repo": "lore",
+      "category": "enumeration",
+      "need": "all",
+      "q": "which directories and files does a repo push never index?",
+      "rank": null,
+      "gold_ranks": [
+        2,
+        null
+      ],
+      "latency_ms": 27.6,
+      "top": [
+        "docs/usage.md:40-76",
+        "src/repo/mod.rs:42-52",
+        "tests/repo.rs:305-356",
+        "tests/cli_repo.rs:139-175",
+        "src/repo/mod.rs:63-67"
+      ]
+    },
+    {
+      "id": "lore-03",
+      "repo": "lore",
+      "category": "enumeration",
+      "need": "any",
+      "q": "what states can a repo push be in?",
+      "rank": 10,
+      "gold_ranks": [
+        10
+      ],
+      "latency_ms": 21.1,
+      "top": [
+        "src/cli/repo.rs:20-30",
+        "src/repo/progress.rs:236-377",
+        "tests/common/mod.rs:253-266",
+        "tests/repo.rs:894-930",
+        "src/http/admin.rs:485-519"
+      ]
+    },
+    {
+      "id": "lore-04",
+      "repo": "lore",
+      "category": "enumeration",
+      "need": "any",
+      "q": "which tools can the deep mode agent call?",
+      "rank": null,
+      "gold_ranks": [
+        null,
+        null
+      ],
+      "latency_ms": 22.8,
+      "top": [
+        "src/answer/deep.rs:130-262",
+        "tests/deep.rs:295-328",
+        "docs/usage.md:144-181",
+        "docs/usage.md:217-240",
+        "tests/deep.rs:243-293"
+      ]
+    },
+    {
+      "id": "lore-05",
+      "repo": "lore",
+      "category": "schema",
+      "need": "all",
+      "q": "what columns does the chunks table have?",
+      "rank": 10,
+      "gold_ranks": [
+        3,
+        10
+      ],
+      "latency_ms": 20.8,
+      "top": [
+        "src/chunk/sql.rs:338-340",
+        "src/chunk/sql.rs:798-807",
+        "migrations/0003_sources_documents_chunks.sql:26-41",
+        "src/chunk/sql.rs:809-816",
+        "src/chunk/sql.rs:902-918"
+      ]
+    },
+    {
+      "id": "lore-06",
+      "repo": "lore",
+      "category": "schema",
+      "need": "any",
+      "q": "how are API keys stored in the database?",
+      "rank": 2,
+      "gold_ranks": [
+        2,
+        null
+      ],
+      "latency_ms": 22.5,
+      "top": [
+        "docs/usage.md:5-21",
+        "migrations/0002_tenants.sql:6-15",
+        "src/http/admin.rs:134-174",
+        "tests/auth.rs:317-347",
+        "src/chunk/sql.rs:338-340"
+      ]
+    },
+    {
+      "id": "lore-07",
+      "repo": "lore",
+      "category": "schema",
+      "need": "any",
+      "q": "what is stored for each span received over OTLP?",
+      "rank": 13,
+      "gold_ranks": [
+        13
+      ],
+      "latency_ms": 23.3,
+      "top": [
+        "src/otlp/mod.rs:587-617",
+        "src/sessions.rs:394-530",
+        "tests/otlp.rs:540-575",
+        "docs/usage.md:105-116",
+        "src/otlp/mod.rs:182-206"
+      ]
+    },
+    {
+      "id": "lore-08",
+      "repo": "lore",
+      "category": "schema",
+      "need": "any",
+      "q": "what fields does a search hit have in the HTTP response?",
+      "rank": 35,
+      "gold_ranks": [
+        null,
+        35
+      ],
+      "latency_ms": 24.6,
+      "top": [
+        "tests/mcp.rs:75-107",
+        "src/mcp.rs:274-285",
+        "src/answer/tools.rs:274-304",
+        "docs/usage.md:78-103",
+        "tests/mcp.rs:229-282"
+      ]
+    },
+    {
+      "id": "lore-09",
+      "repo": "lore",
+      "category": "where",
+      "need": "any",
+      "q": "where is a bearer token checked against the stored API keys?",
+      "rank": 2,
+      "gold_ranks": [
+        2
+      ],
+      "latency_ms": 26.4,
+      "top": [
+        "src/cli/client.rs:11-18",
+        "src/auth.rs:110-137",
+        "docs/usage.md:5-21",
+        "tests/auth.rs:317-347",
+        "README.md:28-55"
+      ]
+    },
+    {
+      "id": "lore-10",
+      "repo": "lore",
+      "category": "where",
+      "need": "any",
+      "q": "where does the CLI retry with a full bundle when the server asks for one?",
+      "rank": 1,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 30.4,
+      "top": [
+        "src/cli/repo.rs:158-190",
+        "src/repo/mod.rs:83-93",
+        "src/cli/repo.rs:192-198",
+        "src/main.rs:68-114",
+        "src/repo/mod.rs:69-70"
+      ]
+    },
+    {
+      "id": "lore-11",
+      "repo": "lore",
+      "category": "where",
+      "need": "any",
+      "q": "where are the HTTP routes registered?",
+      "rank": 1,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 18.4,
+      "top": [
+        "src/http/mod.rs:50-102",
+        "src/http/mod.rs:1-23",
+        "tests/routing.rs:41-81",
+        "src/lib.rs:9-9",
+        "src/cli/client.rs:28-35"
+      ]
+    },
+    {
+      "id": "lore-12",
+      "repo": "lore",
+      "category": "where",
+      "need": "any",
+      "q": "where does lore decide which session a span belongs to?",
+      "rank": 29,
+      "gold_ranks": [
+        29
+      ],
+      "latency_ms": 25.8,
+      "top": [
+        "src/sessions.rs:394-530",
+        "docs/usage.md:105-116",
+        "migrations/0004_spans.sql:1-19",
+        "src/store.rs:601-681",
+        "src/sessions.rs:653-680"
+      ]
+    },
+    {
+      "id": "lore-13",
+      "repo": "lore",
+      "category": "config",
+      "need": "any",
+      "q": "what is the default time budget of a deep mode question?",
+      "rank": 12,
+      "gold_ranks": [
+        12,
+        23
+      ],
+      "latency_ms": 26.6,
+      "top": [
+        "docs/usage.md:144-181",
+        "src/answer/deep.rs:130-262",
+        "src/answer/mod.rs:78-105",
+        "src/mcp.rs:541-550",
+        "src/mcp.rs:371-384"
+      ]
+    },
+    {
+      "id": "lore-14",
+      "repo": "lore",
+      "category": "config",
+      "need": "any",
+      "q": "which embedding model does lore use, and how many dimensions do its vectors have?",
+      "rank": 14,
+      "gold_ranks": [
+        null,
+        14,
+        33
+      ],
+      "latency_ms": 29.3,
+      "top": [
+        "docs/architecture.md:5-41",
+        "docs/usage.md:217-240",
+        "docs/configuration.md:1-34",
+        "docs/architecture.md:57-71",
+        "docs/usage.md:144-181"
+      ]
+    },
+    {
+      "id": "lore-15",
+      "repo": "lore",
+      "category": "config",
+      "need": "any",
+      "q": "how large can an uploaded git bundle be by default?",
+      "rank": 10,
+      "gold_ranks": [
+        10,
+        25
+      ],
+      "latency_ms": 23.8,
+      "top": [
+        "src/repo/mod.rs:69-70",
+        "src/cli/repo.rs:158-190",
+        "src/repo/mod.rs:413-443",
+        "tests/common/mod.rs:182-192",
+        "tests/fixture.rs:77-107"
+      ]
+    },
+    {
+      "id": "lore-16",
+      "repo": "lore",
+      "category": "config",
+      "need": "any",
+      "q": "how long must a session go without new spans before it is indexed?",
+      "rank": 2,
+      "gold_ranks": [
+        null,
+        null,
+        2
+      ],
+      "latency_ms": 30.6,
+      "top": [
+        "src/sessions.rs:617-651",
+        "src/sessions.rs:653-680",
+        "src/store.rs:601-681",
+        "src/sessions.rs:394-530",
+        "migrations/0004_spans.sql:1-19"
+      ]
+    },
+    {
+      "id": "lore-17",
+      "repo": "lore",
+      "category": "how",
+      "need": "any",
+      "q": "how are the full-text and vector results merged into one ranking?",
+      "rank": 1,
+      "gold_ranks": [
+        1
+      ],
+      "latency_ms": 32.5,
+      "top": [
+        "src/search.rs:361-393",
+        "src/search.rs:529-541",
+        "src/store.rs:514-596",
+        "src/search.rs:1-20",
+        "tests/documents.rs:1002-1064"
+      ]
+    },
+    {
+      "id": "lore-18",
+      "repo": "lore",
+      "category": "how",
+      "need": "any",
+      "q": "how does fast mode decide how many passages go into the prompt?",
+      "rank": 28,
+      "gold_ranks": [
+        28,
+        null
+      ],
+      "latency_ms": 25.1,
+      "top": [
+        "docs/usage.md:144-181",
+        "src/mcp.rs:541-550",
+        "src/answer/mod.rs:1-13",
+        "src/mcp.rs:371-384",
+        "src/answer/fast.rs:1-13"
+      ]
+    },
+    {
+      "id": "lore-19",
+      "repo": "lore",
+      "category": "how",
+      "need": "any",
+      "q": "how is a new API key generated?",
+      "rank": 6,
+      "gold_ranks": [
+        6
+      ],
+      "latency_ms": 21.5,
+      "top": [
+        "src/main.rs:34-66",
+        "src/cli/mod.rs:47-69",
+        "src/http/admin.rs:134-174",
+        "migrations/0002_tenants.sql:6-15",
+        "docs/usage.md:5-21"
+      ]
+    },
+    {
+      "id": "lore-20",
+      "repo": "lore",
+      "category": "how",
+      "need": "any",
+      "q": "when does the deep mode agent stop calling tools and answer?",
+      "rank": 1,
+      "gold_ranks": [
+        null,
+        1
+      ],
+      "latency_ms": 26.0,
+      "top": [
+        "src/answer/deep.rs:130-262",
+        "tests/deep.rs:295-328",
+        "tests/deep.rs:30-37",
+        "src/llm/fake.rs:184-207",
+        "docs/usage.md:144-181"
+      ]
+    }
+  ]
+}
