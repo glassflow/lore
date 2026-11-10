@@ -256,12 +256,10 @@ async fn standalone_cache_publication_error_keeps_document_visible(pool: PgPool)
     assert_eq!(cache_rows(&pool).await, 0);
     let (status, body) = send(
         &env.router,
-        "POST",
-        "/v1/search",
+        "GET",
+        "/v1/search?q=cachenotefresh&limit=20",
         &env.key,
-        json!({"q": "cachenotefresh", "limit": 20})
-            .to_string()
-            .into_bytes(),
+        Vec::new(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
