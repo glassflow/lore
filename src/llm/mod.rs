@@ -87,6 +87,7 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

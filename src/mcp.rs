@@ -368,15 +368,16 @@ fn cut(s: &str, max: usize) -> String {
     }
 }
 
-/// The `ask` result: the answer and its sources, then `(fast mode, <model>, 4.9 s)`, with the
-/// number of tool calls for deep mode and no model for sources mode.
+/// The `ask` result: the answer and its sources, then `(fast mode, <model>, 4321 in / 381 out,
+/// 4.9 s)`, with the number of tool calls for deep mode and no model for sources mode.
 fn ask_text(res: &AskResponse) -> String {
     let secs = res.latency_ms as f64 / 1000.0;
+    let tokens = res.usage.tokens_text();
     let footer = match res.mode {
-        Mode::Fast => format!("(fast mode, {}, {secs:.1} s)", res.model),
+        Mode::Fast => format!("(fast mode, {}, {tokens}, {secs:.1} s)", res.model),
         Mode::Sources => format!("(sources mode, no model, {secs:.1} s)"),
         Mode::Deep => format!(
-            "(deep mode, {} tool calls, {}, {secs:.1} s)",
+            "(deep mode, {} tool calls, {}, {tokens}, {secs:.1} s)",
             res.tool_calls, res.model
         ),
     };
@@ -542,11 +543,15 @@ mod tests {
     fn ask_text_ends_with_the_mode_model_and_time() {
         assert_eq!(
             ask_text(&response(Mode::Fast)),
-            "Three plans.\n\nSources:\n(none)\n\n(fast mode, m1, 4.9 s)"
+            "Three plans.\n\nSources:\n(none)\n\n(fast mode, m1, 0 in / 0 out, 4.9 s)"
         );
-        assert!(
-            ask_text(&response(Mode::Deep)).ends_with("\n\n(deep mode, 3 tool calls, m1, 4.9 s)")
-        );
+        let mut deep = response(Mode::Deep);
+        deep.usage.input_tokens = 4;
+        deep.usage.cache_read_input_tokens = 9000;
+        deep.usage.output_tokens = 381;
+        assert!(ask_text(&deep).ends_with(
+            "\n\n(deep mode, 3 tool calls, m1, 9004 in (9000 cached) / 381 out, 4.9 s)"
+        ));
     }
 
     fn terms(q: &str) -> Vec<String> {

@@ -130,6 +130,7 @@ fn reply(content: Vec<Block>, stop_reason: &str, input: u64, output: u64, model:
             input_tokens: input,
             output_tokens: output,
             cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         },
         model: model.to_string(),
     })
@@ -434,7 +435,12 @@ async fn the_model_turn_is_echoed_unchanged_and_all_results_come_back_in_one_mes
     // Usage is summed over both calls; the model is the last response's.
     assert_eq!(
         body["usage"],
-        json!({ "input_tokens": 30, "output_tokens": 12 })
+        json!({
+            "input_tokens": 30,
+            "output_tokens": 12,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0
+        })
     );
     assert_eq!(body["model"], "m2");
 
