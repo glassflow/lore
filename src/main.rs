@@ -168,6 +168,14 @@ async fn serve(config: Config) -> Result<()> {
         deep_guard: Default::default(),
     };
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let syncer = state.config.sync_interval_secs.map(|secs| {
+        tracing::info!(interval_secs = secs, "repo sync poller on");
+        tokio::spawn(lore::repo::sync::poll_repos(
+            state.clone(),
+            std::time::Duration::from_secs(secs),
+            stop_rx.clone(),
+        ))
+    });
     let worker = tokio::spawn(session_worker(state.clone(), stop_rx));
     let served = axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
@@ -179,6 +187,11 @@ async fn serve(config: Config) -> Result<()> {
     // If serving failed, the sender is dropped by now and the worker stops as well.
     if let Err(e) = worker.await {
         tracing::error!(error = %e, "session worker task failed");
+    }
+    if let Some(syncer) = syncer
+        && let Err(e) = syncer.await
+    {
+        tracing::error!(error = %e, "sync worker task failed");
     }
     served?;
     tracing::info!("shut down");

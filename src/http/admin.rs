@@ -399,6 +399,14 @@ pub struct SourceOverview {
     /// The later of a repo's last push and the source's newest document write. `None` when
     /// nothing was indexed yet.
     last_indexed_at: Option<DateTime<Utc>>,
+    /// A repo's remote, fetched by sync. `None` when it has none.
+    remote_url: Option<String>,
+    /// When the last sync ended, whether it worked or not.
+    last_sync_at: Option<DateTime<Utc>>,
+    /// The remote's head at the last sync that worked.
+    last_sync_commit: Option<String>,
+    /// Why the last sync failed; `None` when it worked.
+    last_sync_error: Option<String>,
     /// A repo's mirror and checkout on disk. `None` for other kinds, which keep nothing there.
     #[sqlx(skip)]
     disk_bytes: Option<u64>,
@@ -419,6 +427,7 @@ const TENANTS_SQL: &str = "SELECT id, name, created_at FROM tenants ORDER BY cre
 /// when the source was created.
 const SOURCES_SQL: &str = "
     SELECT s.tenant_id, s.id, s.name, s.kind, s.indexed_commit,
+           s.remote_url, s.last_sync_at, s.last_sync_commit, s.last_sync_error,
            count(d.id) AS documents,
            COALESCE(sum(c.n), 0)::bigint AS chunks,
            GREATEST(CASE WHEN s.indexed_commit IS NOT NULL THEN s.updated_at END,

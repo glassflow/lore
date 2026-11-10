@@ -18,7 +18,7 @@ function load(storage) {
       ' ago, formatBytes, formatDuration, formatDate, isRunning, anyRunning, pollDelay, pushEnded,' +
       ' progressText, progressFraction, stateClass, pushTitle, embedText, pushTiming, scopesFrom,' +
       ' keyActive, tenantSummary, modelText, serverFacts, storageSummary, indexKind, keysUrl,' +
-      ' revokeUrl, tenantUrl, sourceUrl, confirmMatches, deleteQuestion };'
+      ' revokeUrl, tenantUrl, sourceUrl, confirmMatches, deleteQuestion, syncText, syncTitle };'
   )(storage);
 }
 
@@ -90,6 +90,22 @@ test('commits are shortened, and only repos say "not indexed"', () => {
   assert.strictEqual(page.commitText({ kind: 'repo', indexed_commit: sha }), '0123456');
   assert.strictEqual(page.commitText({ kind: 'repo', indexed_commit: null }), 'not indexed');
   assert.strictEqual(page.commitText({ kind: 'documents', indexed_commit: null }), '');
+});
+
+test('the sync column says how the last fetch of the remote went', () => {
+  const now = '2026-01-01T12:00:00Z';
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  const remote = 'https://github.com/acme/app.git';
+  assert.strictEqual(page.syncText({ kind: 'documents' }, now), '');
+  assert.strictEqual(page.syncText({ kind: 'repo', remote_url: null }, now), 'no remote');
+  assert.strictEqual(page.syncText({ kind: 'repo', remote_url: remote }, now), 'not synced yet');
+  const ok = { kind: 'repo', remote_url: remote, last_sync_at: '2026-01-01T11:55:00Z', last_sync_commit: sha };
+  assert.strictEqual(page.syncText(ok, now), 'ok 5 min ago at 0123456');
+  assert.strictEqual(page.syncTitle(ok), remote + '\ncommit ' + sha);
+  const failed = Object.assign({}, ok, { last_sync_error: 'fetch failed: refused' });
+  assert.strictEqual(page.syncText(failed, now), 'failed 5 min ago');
+  assert.strictEqual(page.syncTitle(failed), remote + '\ncommit ' + sha + '\nfetch failed: refused');
+  assert.strictEqual(page.syncTitle({ kind: 'documents' }), '');
 });
 
 test('ago is relative to the server clock', () => {

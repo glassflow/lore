@@ -83,6 +83,28 @@ jobs:
 
 The `lore` binary has to be on the runner (build it with `cargo install --path .` or copy a release binary).
 
+## Sync a repo from its remote
+
+Instead of pushing from CI, the server can fetch a repo itself. Give the repo a `remote_url` when you create it (creating it again changes it, `""` removes it, leaving it out keeps it):
+
+```bash
+curl -X POST localhost:8080/v1/repos -H "Authorization: Bearer $LORE_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"name": "app", "remote_url": "https://github.com/acme/app.git"}'
+curl -X POST localhost:8080/v1/repos/<id>/sync -H "Authorization: Bearer $LORE_KEY"
+```
+
+`POST /v1/repos/{id}/sync` needs an `ingest` key and git 2.36 or newer on the server. It fetches the remote's default branch (its `HEAD`) into the repo's mirror and indexes the files that changed since the last indexed commit, exactly like a push, under the same per-repo lock. If history was rewritten or the mirror lost the last indexed commit, it fetches all objects again (`git fetch --refetch`) and indexes the whole tree. The answer is the push report plus `up_to_date` (the remote's head was already indexed, the counts are zeros) and `full` (the whole tree was indexed, including the first sync). A repo without a remote is a 409; a remote that cannot be fetched (unreachable, missing, refused credentials, or a fetch over 10 minutes) is a 502 `could not fetch the remote`, and git's message goes to the server log and the [admin page](#admin-page). Pushes and syncs can be mixed on one repo.
+
+`remote_url` must be an `https://` URL without a user or password. For a private remote, the operator sets `LORE_GIT_TOKEN_<TENANT>` on the server (the tenant name upper-cased, `-` written `_`: tenant `acme-web` reads `LORE_GIT_TOKEN_ACME_WEB`). It is sent as HTTP basic auth (`x-access-token:<token>`), which GitHub, GitLab and Gitea accept for a personal access token, to every remote of that tenant and no other. Since a tenant's keys choose the URL, give each tenant a token that reads only its own repos.
+
+Two ways to sync without anyone calling the route:
+
+- **Poller.** With `LORE_SYNC_INTERVAL_SECS` set, the server checks every repo that has a remote at start and then every interval. Repos sync independently, so an unreachable remote cannot hold up the others. Each repo has at most one running poll; a repo already pushing or syncing skips that tick instead of queuing duplicate work. A default-branch push is picked up on the next available tick, plus fetch and indexing time.
+- **GitHub webhook.** Set `LORE_GITHUB_WEBHOOK_SECRET`, then in the GitHub repository's settings add a webhook with payload URL `<LORE_URL>/v1/webhooks/github`, content type `application/json`, the same secret, and the `push` event. A push to the default branch syncs every repo, of any tenant, whose `remote_url` is that repository (`clone_url` or `html_url`, compared without case, a trailing `/` or `.git`); the answer is 202 `{"queued": n}` and the sync runs in the background, so the change is searchable seconds later. The route needs no API key: a delivery whose `X-Hub-Signature-256` is not the HMAC-SHA256 of the body under the secret is a 401, and a valid one can only start fetches from remotes tenants configured. Pushes to other branches, deleted branches and other events are accepted and ignored, `ping` answers 200. Without the secret the route is a 404.
+
+`lore repo push` keeps working for local repos and CI.
+
 ## Search
 
 `GET /v1/search` searches the chunks of the key's tenant. It needs a `read` key, and another tenant's documents are never visible: a source name from another tenant just matches nothing.
@@ -205,7 +227,7 @@ The page shows:
 - **New tenant**: creates a tenant from its name. Create a key for it in its card.
 - **Server**: version, embedder, model provider, the fast and deep models with their effort, the process's memory now and at its peak (Linux only), and the number of tenants, sources, documents and chunks.
 - **Pushes**: the repo pushes that are running, and the last 20 that ended, with their state (`waiting` for another push to the same source, `fetching` the bundle, `indexing`, `done` or `failed`), files done out of the total, chunks written, how many of those were embedded and how many reused a vector (from the embedding cache, from the document's earlier chunks, or from a repeated chunk in the same file), the time spent embedding, and why a failed push failed. While a push runs the list refreshes every 3 seconds, otherwise every 30. When a push ends, the counts are read again.
-- **Tenants**: for each tenant its sources (name, kind, indexed commit, documents, chunks, size on disk for repos, and when it was last indexed) and its keys (prefix, scopes, created, revoked). **Create key** makes a key with the ticked scopes and shows it once, with a copy button. **Revoke** asks for a confirmation first. **Delete tenant** and each source's **Delete** say what goes with it and ask you to type the name to confirm; a push in progress makes them fail with a message.
+- **Tenants**: for each tenant its sources (name, kind, indexed commit, documents, chunks, size on disk for repos, when it was last indexed, and for repos with a remote how the last [sync](#sync-a-repo-from-its-remote) went, with the remote, the commit and the error in its tooltip) and its keys (prefix, scopes, created, revoked). **Create key** makes a key with the ticked scopes and shows it once, with a copy button. **Revoke** asks for a confirmation first. **Delete tenant** and each source's **Delete** say what goes with it and ask you to type the name to confirm; a push in progress makes them fail with a message.
 - **Storage**: the database size, the repo mirrors and checkouts on disk, each table's data and index bytes, and each index with its kind (the vector index is `hnsw`, the full-text index `gin`).
 
 Push progress is kept in memory, so a restart forgets it, and only repo pushes are tracked. The CLI stops waiting for a push after 15 minutes, but the server finishes it; the page shows when it does.
@@ -217,7 +239,7 @@ curl -H "Authorization: Bearer $LORE_ADMIN_TOKEN" localhost:8080/v1/admin/overvi
 curl -H "Authorization: Bearer $LORE_ADMIN_TOKEN" localhost:8080/v1/admin/pushes     # running and recent pushes
 ```
 
-`GET /v1/admin/overview` answers `{"now", "server", "storage", "tenants"}`. `server` has `version`, `llm`, `embedder`, `modes`, `models` (`fast` and `deep`, each with `model` and `effort`), `memory` (`rss_bytes` and `peak_rss_bytes`, null outside Linux), and the totals `tenants`, `sources`, `documents` and `chunks`. `storage` has `database_bytes`, `repos_bytes`, `tables` (`name`, `rows_estimate`, `data_bytes`, `index_bytes`, `total_bytes`, largest first) and `indexes` (`name`, `table`, `method`, `bytes`). Each tenant has `id`, `name`, `created_at`, `sources` (`id`, `name`, `kind`, `indexed_commit`, `documents`, `chunks`, `last_indexed_at`, `disk_bytes`) and `keys` (`id`, `prefix`, `scopes`, `created_at`, `revoked_at`). `last_indexed_at` is the later of a repo's last push and the source's newest document write, and null until something is indexed; `disk_bytes` is null for sources that are not repos. The database reads share one snapshot, so the totals add up; the repo directories are walked on each call, which takes longer the more files the checkouts hold.
+`GET /v1/admin/overview` answers `{"now", "server", "storage", "tenants"}`. `server` has `version`, `llm`, `embedder`, `modes`, `models` (`fast` and `deep`, each with `model` and `effort`), `memory` (`rss_bytes` and `peak_rss_bytes`, null outside Linux), and the totals `tenants`, `sources`, `documents` and `chunks`. `storage` has `database_bytes`, `repos_bytes`, `tables` (`name`, `rows_estimate`, `data_bytes`, `index_bytes`, `total_bytes`, largest first) and `indexes` (`name`, `table`, `method`, `bytes`). Each tenant has `id`, `name`, `created_at`, `sources` (`id`, `name`, `kind`, `indexed_commit`, `remote_url`, `last_sync_at`, `last_sync_commit`, `last_sync_error`, `documents`, `chunks`, `last_indexed_at`, `disk_bytes`) and `keys` (`id`, `prefix`, `scopes`, `created_at`, `revoked_at`). `last_indexed_at` is the later of a repo's last push and the source's newest document write, and null until something is indexed; `disk_bytes` is null for sources that are not repos. `last_sync_at` is when the last sync ended, `last_sync_commit` the remote's head at the last sync that worked, and `last_sync_error` why the last one failed (null when it worked). The database reads share one snapshot, so the totals add up; the repo directories are walked on each call, which takes longer the more files the checkouts hold.
 
 `GET /v1/admin/pushes` answers `{"now", "since", "running", "recent"}`, newest first. `since` is when the server started. A push has `id`, `tenant` (null when the tenant is gone), `tenant_id`, `source`, `source_id`, `commit`, `full`, `state`, `started_at`, `finished_at`, `files_total` (null until the bundle is fetched), `files_done`, `chunks`, `chunks_embedded`, `embed_ms` and `error`. `embed_ms` is wall-clock time in the embedder, including waits while another push uses it. CPU and memory are not measured per push: pushes and searches share one process.
 

@@ -33,6 +33,10 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_DEEP_MAX_ROUNDS` | `12` | Most tool rounds of one deep-mode question. After that the model is told to answer with what it has. Must be a positive integer |
 | `LORE_DEEP_CONCURRENCY` | `2` | How many deep-mode questions one tenant may run at once. A further question waits up to 60 seconds for a free slot, then gets a 429. Must be a positive integer |
 | `LORE_DEEP_DAILY_LIMIT` | `100` | How many deep-mode questions one tenant may ask per UTC day. The next one gets a 429 ("daily deep-mode limit reached"). The count is kept in memory, so a restart resets it. Must be a positive integer |
+| `LORE_SYNC_INTERVAL_SECS` | unset | Seconds between two [syncs](usage.md#sync-a-repo-from-its-remote) of every repo that has a `remote_url`. Unset or `0` turns the poller off. Must be a non-negative integer |
+| `LORE_GITHUB_WEBHOOK_SECRET` | unset | Secret of the GitHub webhook at `POST /v1/webhooks/github`. Unset or empty turns the route off (404) |
+| `LORE_GIT_TOKEN_<TENANT>` | unset | Token for the private remotes of one tenant, for example `LORE_GIT_TOKEN_ACME_WEB` for tenant `acme-web`. Sent as HTTP basic auth to that tenant's `https://` remotes only |
+| `LORE_SYNC_ALLOW_FILE_REMOTES` | `false` | Also accept `file://` remote URLs. For tests and local experiments only: with it on, any `ingest` key can make the server index a git repo on its own disk |
 | `LORE_VERSION` | the crate version | Version string reported by the server |
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
 | `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |
