@@ -6,11 +6,13 @@
 
 lore indexes your repos, docs and agent sessions once,<br>so every question starts from the right code instead of a blank grep.
 
-[![ci](https://github.com/sudopower/lore/actions/workflows/ci.yml/badge.svg)](https://github.com/sudopower/lore/actions/workflows/ci.yml)
+[![ci](https://github.com/glassflow/lore/actions/workflows/ci.yml/badge.svg)](https://github.com/glassflow/lore/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![rust 1.95](https://img.shields.io/badge/rust-1.95-orange.svg)
 
 </div>
+
+This is GlassFlow's fork of [sudopower/lore](https://github.com/sudopower/lore). Experiments happen in sudopower/lore and come in here as PRs.
 
 ## At a glance
 
