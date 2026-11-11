@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::{Postgres, Transaction};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -28,8 +29,8 @@ use crate::chunk::{CHUNKER_VERSION, Language, chunk_file, language_for};
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::store::{
-    IndexStats, NewDocument, Source, delete_document, document_hash, get_source,
-    index_text_with_stats, list_external_ids, set_indexed_commit,
+    IndexStats, NewDocument, PendingEmbeddings, Source, delete_document, document_hash, get_source,
+    index_repo_text, list_external_ids, set_indexed_commit,
 };
 
 pub mod progress;
@@ -315,6 +316,8 @@ pub fn is_full_sha(s: &str) -> bool {
 ///
 /// Once the request is checked, the push is registered in `state.pushes`, which tracks its
 /// progress for the admin page and records how it ended.
+/// All database changes commit together; errors and cancellation roll them back. The checkout
+/// is live, not part of that transaction: grep/read_file do not share search's snapshot guarantee.
 pub async fn ingest_bundle(
     state: &AppState,
     source: &Source,
@@ -409,8 +412,32 @@ async fn index_commit(
 
     refresh_checkout(paths, commit).await?;
 
+    // MVCC keeps the old repo visible until every document and the commit pointer are ready.
+    // Keep all lookups on this connection: even a one-connection pool can finish a push.
+    let mut tx = state.pool.begin().await?;
+    // Parent first: a tenant cascade must not lock the tenant while we hold its source and
+    // subsequently need a tenant FK lock for newly inserted chunks.
+    let tenant: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE id = $1 FOR KEY SHARE")
+            .bind(source.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if tenant.is_none() {
+        return Err(anyhow!("tenant {} vanished", source.tenant_id).into());
+    }
+    let owned: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM sources WHERE id = $1 AND tenant_id = $2 FOR UPDATE")
+            .bind(source.id)
+            .bind(source.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if owned.is_none() {
+        return Err(anyhow!("source {} vanished", source.id).into());
+    }
     let mut job = Job {
         state,
+        tx,
+        pending: PendingEmbeddings::default(),
         source,
         paths,
         commit,
@@ -440,7 +467,9 @@ async fn index_commit(
         job.delete_vanished().await?;
     }
 
-    set_indexed_commit(&state.pool, source.id, commit).await?;
+    set_indexed_commit(&mut *job.tx, source.id, commit).await?;
+    job.tx.commit().await?;
+    job.pending.publish(&state.pool).await;
     Ok(job.report)
 }
 
@@ -751,6 +780,8 @@ struct DocMetadata<'a> {
 /// One ingest run: the counters and the paths seen so far.
 struct Job<'a> {
     state: &'a AppState,
+    tx: Transaction<'static, Postgres>,
+    pending: PendingEmbeddings,
     source: &'a Source,
     paths: &'a RepoPaths,
     commit: &'a str,
@@ -791,7 +822,7 @@ impl Job<'_> {
         };
 
         let content_hash = file_hash(&content);
-        let known = document_hash(&self.state.pool, self.source.id, path).await?;
+        let known = document_hash(&mut *self.tx, self.source.id, path).await?;
         if known.as_deref() == Some(content_hash.as_str()) {
             self.report.files_unchanged += 1;
             self.kept.insert(path.to_string());
@@ -822,15 +853,8 @@ impl Job<'_> {
             body: None,
         };
         let chunks = chunk_file(path, &content);
-        let stats = index_text_with_stats(
-            self.state,
-            self.source.tenant_id,
-            self.source,
-            doc,
-            chunks,
-            path,
-        )
-        .await?;
+        let stats =
+            index_repo_text(self.state, &mut self.tx, &mut self.pending, doc, chunks).await?;
         self.report.files_indexed += 1;
         self.report.chunks += stats.chunks;
         self.totals.chunks += stats.chunks;
@@ -849,16 +873,14 @@ impl Job<'_> {
         Ok(())
     }
 
-    async fn delete_doc(&self, path: &str) -> Result<bool, IngestError> {
-        let mut tx = self.state.pool.begin().await?;
-        let deleted = delete_document(&mut tx, self.source.id, path).await?;
-        tx.commit().await?;
+    async fn delete_doc(&mut self, path: &str) -> Result<bool, IngestError> {
+        let deleted = delete_document(&mut self.tx, self.source.id, path).await?;
         Ok(deleted)
     }
 
     /// Full mode: deletes the documents of paths that are not in the new tree.
     async fn delete_vanished(&mut self) -> Result<(), IngestError> {
-        for id in list_external_ids(&self.state.pool, self.source.id).await? {
+        for id in list_external_ids(&mut *self.tx, self.source.id).await? {
             if !self.kept.contains(&id) && self.delete_doc(&id).await? {
                 self.report.files_deleted += 1;
             }
