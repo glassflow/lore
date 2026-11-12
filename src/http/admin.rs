@@ -223,7 +223,7 @@ fn hold_sources(
 ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, AppError> {
     let busy = || {
         AppError::Conflict(format!(
-            "a push to this {what} is running; try again when it ends"
+            "a push to this {what} is running, or stopped less than 90 seconds ago; try again shortly"
         ))
     };
     if running {

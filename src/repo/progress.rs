@@ -317,8 +317,14 @@ async fn write_run(
     }
 }
 
+/// Inserts the row. A lock wait (a tenant delete holds the tenant row) ends after 2 seconds, so
+/// the insert cannot hold a pool connection for long.
 async fn insert_run(pool: &PgPool, new: &NewRun) -> sqlx::Result<i64> {
-    sqlx::query_scalar(
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *tx)
+        .await?;
+    let id = sqlx::query_scalar(
         "INSERT INTO index_runs (source_id, tenant_id, commit, \"full\", stage)
          VALUES ($1, $2, $3, $4, 'queued') RETURNING id",
     )
@@ -326,8 +332,10 @@ async fn insert_run(pool: &PgPool, new: &NewRun) -> sqlx::Result<i64> {
     .bind(new.tenant_id)
     .bind(&new.commit)
     .bind(new.full)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(id)
 }
 
 fn db_int(n: usize) -> i32 {

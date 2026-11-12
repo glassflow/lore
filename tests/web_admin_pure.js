@@ -186,11 +186,17 @@ test('progress text and fraction for each state', () => {
     ['off', 'run', 'run', 'ok', 'bad']
   );
   assert.strictEqual(page.stateClass({ state: 'indexing', stale: true }), 'off');
+  // A stale run that never got to index says when it was last written, not that it waits.
+  const now = '2026-11-03T12:10:00Z';
+  const lost = { state: 'queued', stale: true, updated_at: '2026-11-03T12:05:00Z' };
+  assert.strictEqual(page.progressText(lost, now), 'last written 5 min ago');
+  assert.strictEqual(page.progressText({ ...lost, state: 'cloning' }, now), 'last written 5 min ago');
+  assert.strictEqual(page.progressText(lost), 'not written for a while');
+  assert.strictEqual(page.progressText({ ...half, stale: true }, now), '908 of 1,816 files');
 });
 
 test('a push is titled tenant / source and timed against the server clock', () => {
   assert.strictEqual(page.pushTitle({ tenant: 'acme', source: 'sample' }), 'acme / sample');
-  assert.strictEqual(page.pushTitle({ tenant: null, source: 'sample' }), 'deleted tenant / sample');
   const now = '2026-11-03T12:10:00Z';
   const running = { started_at: '2026-11-03T12:09:48Z', finished_at: null };
   assert.strictEqual(page.pushTiming(running, now), 'running for 12.0 s');

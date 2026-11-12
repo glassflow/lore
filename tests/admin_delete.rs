@@ -251,6 +251,54 @@ async fn deleting_during_a_push_is_a_409(pool: PgPool) {
     assert!(!env.repo_dir(source).exists());
 }
 
+/// A run of `source` that is not ended, last written `age_secs` ago, by a process that holds
+/// no lock here (another instance, or one that was killed).
+async fn insert_run(pool: &PgPool, tenant: Uuid, source: Uuid, age_secs: i32) {
+    sqlx::query(
+        "INSERT INTO index_runs (source_id, tenant_id, commit, stage, updated_at)
+         VALUES ($1, $2, $3, 'indexing', now() - make_interval(secs => $4))",
+    )
+    .bind(source)
+    .bind(tenant)
+    .bind("a".repeat(40))
+    .bind(f64::from(age_secs))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_live_run_of_another_process_is_a_409_with_the_lock_free(pool: PgPool) {
+    let env = env(pool);
+    let (tenant, key) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;
+    let (_, created) = create_repo(&env.router, &key, "sample").await;
+    let source: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    insert_run(&env.pool, tenant, source, 5).await;
+
+    let (status, body) = env.delete(&format!("/v1/admin/sources/{source}")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = env.delete(&format!("/v1/admin/tenants/{tenant}")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(rows_of(&env.pool, tenant).await.last().unwrap().1, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_stale_run_does_not_block_deleting_a_source_or_a_tenant(pool: PgPool) {
+    let env = env(pool);
+    let (tenant, key) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;
+    let (_, first) = create_repo(&env.router, &key, "one").await;
+    let (_, second) = create_repo(&env.router, &key, "two").await;
+    let first: Uuid = first["id"].as_str().unwrap().parse().unwrap();
+    let second: Uuid = second["id"].as_str().unwrap().parse().unwrap();
+    insert_run(&env.pool, tenant, first, 120).await;
+    insert_run(&env.pool, tenant, second, 120).await;
+
+    let (status, body) = env.delete(&format!("/v1/admin/sources/{first}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = env.delete(&format!("/v1/admin/tenants/{tenant}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn a_held_source_lock_without_a_registered_push_is_also_a_409(pool: PgPool) {
     let env = env(pool);

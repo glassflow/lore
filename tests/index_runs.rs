@@ -582,6 +582,56 @@ async fn an_index_in_progress_is_visible_to_another_instance_and_survives(pool: 
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn a_push_queued_behind_an_index_is_recorded_at_once(pool: PgPool) {
+    // The first push stops in its fourth file, inside its index transaction, which holds the
+    // source's row lock.
+    let (release, gate) = mpsc::channel();
+    let mut a = app(pool.clone());
+    a.state.embedder = std::sync::Arc::new(Gated {
+        calls: AtomicUsize::new(0),
+        block_at: 4,
+        release: Mutex::new(gate),
+    });
+    a.router = test_router(a.state.clone());
+    let (_, key, source) = tenant_with_repo(&a, "acme").await;
+    let repo = fixture_repo();
+    let sha = head(&repo);
+    let push = |bytes: Vec<u8>| {
+        let (router, key, sha) = (a.router.clone(), key.clone(), sha.clone());
+        tokio::spawn(async move { put_bundle(&router, &key, source, bytes, &sha, true).await })
+    };
+    let first = push(bundle(&repo, &["HEAD"]));
+    wait_for_row(&pool, source, |r| r.stage == "indexing" && r.files_done > 0).await;
+
+    // The second push waits for the first's lock. Its row must not wait for it too: the insert
+    // would hold a pool connection, and the queued stage would never show.
+    let second = push(bundle(&repo, &["HEAD"]));
+    let queued = wait_for_row(&pool, source, |r| r.stage == "queued").await;
+    let all = rows(&pool, source).await;
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all[0].stage, "indexing", "{all:?}");
+    assert_eq!(all[1].id, queued.id);
+    let (status, run) = progress(&a.router, &key, source).await;
+    assert_eq!(status, 200, "{run}");
+    assert_eq!(
+        run["stage"], "queued",
+        "the queued run is the latest: {run}"
+    );
+
+    release.send(()).unwrap();
+    for pushing in [first, second] {
+        let (status, report) = pushing.await.unwrap();
+        assert_eq!(status, 200, "{report}");
+    }
+    let stages: Vec<String> = rows(&pool, source)
+        .await
+        .into_iter()
+        .map(|r| r.stage)
+        .collect();
+    assert_eq!(stages, ["done", "done"]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn a_run_nobody_writes_any_more_is_stale_and_is_not_rewritten(pool: PgPool) {
     // The writer of a process that will be killed: it never beats again in this test.
     let a = app(pool.clone());

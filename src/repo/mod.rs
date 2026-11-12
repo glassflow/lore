@@ -427,12 +427,15 @@ async fn index_commit(
     if tenant.is_none() {
         return Err(anyhow!("tenant {} vanished", source.tenant_id).into());
     }
-    let owned: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM sources WHERE id = $1 AND tenant_id = $2 FOR UPDATE")
-            .bind(source.id)
-            .bind(source.tenant_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    // NO KEY UPDATE still excludes other pushes and a delete, but not the foreign-key check of a
+    // queued push recording its `index_runs` row.
+    let owned: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM sources WHERE id = $1 AND tenant_id = $2 FOR NO KEY UPDATE",
+    )
+    .bind(source.id)
+    .bind(source.tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     if owned.is_none() {
         return Err(anyhow!("source {} vanished", source.id).into());
     }
