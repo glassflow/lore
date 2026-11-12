@@ -424,10 +424,10 @@ function pushEnded(before, after) {
 // What a push is doing, or how many files it went through.
 function progressText(p) {
   switch (p.state) {
-    case 'waiting':
+    case 'queued':
       return 'waiting for another push to this source';
-    case 'fetching':
-      return 'fetching the bundle';
+    case 'cloning':
+      return 'fetching the commit';
     case 'indexing':
       return typeof p.files_total === 'number'
         ? formatCount(p.files_done) + ' of ' + plural(p.files_total, 'file', 'files')
@@ -452,7 +452,8 @@ function progressFraction(p) {
 function stateClass(p) {
   if (p.state === 'done') return 'ok';
   if (p.state === 'failed') return 'bad';
-  return p.state === 'waiting' ? 'off' : 'run';
+  if (p.stale) return 'off';
+  return p.state === 'queued' ? 'off' : 'run';
 }
 
 function pushTitle(p) {
@@ -812,14 +813,13 @@ function deleteQuestion(kind, item) {
     var list = pushes || {};
     var running = Array.isArray(list.running) ? list.running : [];
     var recent = Array.isArray(list.recent) ? list.recent : [];
-    var since = ago(list.since, list.now);
     pushesNote.textContent = running.length
       ? plural(running.length, 'push', 'pushes') + ' running, refreshing every ' + (FAST_POLL_MS / 1000) + ' s'
-      : 'Server started ' + since;
+      : 'Latest ' + plural(recent.length, 'run', 'runs');
     var all = running.concat(recent);
     if (!all.length) {
       pushesEl.className = '';
-      pushesEl.appendChild(el('p', 'empty', 'No repo pushes since the server started ' + since + '.'));
+      pushesEl.appendChild(el('p', 'empty', 'No repo index runs yet.'));
       return;
     }
     pushesEl.className = 'pushes';
@@ -840,7 +840,7 @@ function deleteQuestion(kind, item) {
         return [
           pushTitle(p),
           commit,
-          el('span', 'badge ' + stateClass(p), p.state),
+          el('span', 'badge ' + stateClass(p), p.stale ? 'stalled' : p.state),
           progressCell(p),
           formatCount(p.chunks),
           embedText(p),

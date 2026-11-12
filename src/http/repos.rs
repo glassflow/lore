@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::auth::{Caller, Scope};
 use crate::error::AppError;
 use crate::http::{AppJson, AppQuery, AppState};
+use crate::repo::progress::{IndexRun, latest_run};
 use crate::repo::sync::{SyncReport, check_remote_url, remote_urls, set_remote_url};
 use crate::repo::{IndexReport, ingest_bundle, is_full_sha};
 use crate::store::{Source, ensure_source, get_source, list_sources};
@@ -212,6 +213,24 @@ pub async fn sync_repo(
         .await
         .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("sync task failed")))??;
     Ok(Json(report))
+}
+
+/// The latest index run of the repo, whichever process ran it, with `stale` set when the run
+/// has not ended and has not been written for 90 seconds.
+pub async fn repo_progress(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<IndexRun>, AppError> {
+    caller.require(Scope::Read)?;
+    let source = get_source(&state.pool, caller.tenant_id, id)
+        .await?
+        .filter(|s| s.kind == "repo")
+        .ok_or(AppError::NotFound)?;
+    let run = latest_run(&state.pool, source.id)
+        .await?
+        .ok_or(AppError::NotFoundCode("no_index_run"))?;
+    Ok(Json(run))
 }
 
 #[cfg(test)]

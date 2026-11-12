@@ -322,7 +322,7 @@ async fn a_push_that_ended_is_listed_with_its_counts(pool: PgPool) {
     let pushes = admin_get(&env.router, "/v1/admin/pushes").await;
     assert_eq!(pushes["running"], json!([]));
     assert_eq!(pushes["recent"], json!([]));
-    assert!(pushes["since"].is_string() && pushes["now"].is_string());
+    assert!(pushes["now"].is_string());
 
     let (tenant_id, key) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;
     let (source_id, repo) = push_fixture(&env.router, &key).await;
@@ -469,7 +469,8 @@ async fn a_push_waiting_for_its_source_is_listed_as_running(pool: PgPool) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(running["state"], "waiting", "{running}");
+    assert_eq!(running["state"], "queued", "{running}");
+    assert_eq!(running["stale"], false);
     assert_eq!(running["tenant"], "acme");
     assert_eq!(running["source"], "sample");
     assert_eq!(running["commit"], sha.as_str());
@@ -486,7 +487,7 @@ async fn a_push_waiting_for_its_source_is_listed_as_running(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_push_of_a_deleted_tenant_has_no_tenant_name(pool: PgPool) {
+async fn the_runs_of_a_deleted_tenant_go_with_it(pool: PgPool) {
     let env = env(pool.clone());
     let (tenant_id, key) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;
     push_fixture(&env.router, &key).await;
@@ -496,8 +497,12 @@ async fn a_push_of_a_deleted_tenant_has_no_tenant_name(pool: PgPool) {
         .await
         .unwrap();
     let pushes = admin_get(&env.router, "/v1/admin/pushes").await;
-    assert_eq!(pushes["recent"][0]["tenant"], Value::Null);
-    assert_eq!(pushes["recent"][0]["source"], "sample");
+    assert_eq!(pushes["recent"], json!([]));
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM index_runs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
     let overview = admin_get(&env.router, "/v1/admin/overview").await;
     assert_eq!(overview["tenants"], json!([]));
     assert_eq!(overview["server"]["documents"], 0);

@@ -202,6 +202,12 @@ async fn deleting_a_source_removes_its_documents_and_repo_dir_only(pool: PgPool)
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+async fn live_run(pool: &PgPool, source: Uuid) -> bool {
+    lore::repo::progress::source_has_live_run(pool, source)
+        .await
+        .unwrap()
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn deleting_during_a_push_is_a_409(pool: PgPool) {
     let env = env(pool);
@@ -213,7 +219,7 @@ async fn deleting_during_a_push_is_a_409(pool: PgPool) {
     let sha = head(&repo);
     let bytes = bundle(&repo, &["HEAD"]);
 
-    // Hold the source's lock so the push waits, registered as running.
+    // Hold the source's lock so the push waits, recorded as a live run.
     let lock = env.state.source_locks.get(source);
     let guard = lock.lock().await;
     let pushing = {
@@ -221,12 +227,12 @@ async fn deleting_during_a_push_is_a_409(pool: PgPool) {
         tokio::spawn(async move { put_bundle(&router, &key, source, bytes, &sha, true).await })
     };
     for _ in 0..200 {
-        if !env.state.pushes.snapshot().running.is_empty() {
+        if live_run(&env.pool, source).await {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(env.state.pushes.snapshot().running.len(), 1);
+    assert!(live_run(&env.pool, source).await);
 
     let (status, body) = env.delete(&format!("/v1/admin/sources/{source}")).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");

@@ -23,6 +23,7 @@ use base64::Engine;
 use serde::Serialize;
 use uuid::Uuid;
 
+use super::progress::RunWriter;
 use super::{
     GitError, IndexReport, IngestError, RepoPaths, ensure_mirror, git_env, index_commit,
     is_full_sha, push_error, refresh_checkout,
@@ -253,7 +254,7 @@ async fn record_sync(
 
 /// Fetches the remote of `source` (a repo source the caller read for its tenant) and indexes
 /// its head when it moved. The outcome is recorded on the source for the admin page; a run that
-/// indexes is also registered in `state.pushes`.
+/// indexes is also recorded in `index_runs`.
 pub async fn sync_repo(state: &AppState, source: &Source) -> Result<SyncReport, SyncError> {
     if source.kind != "repo" {
         return Err(IngestError::BadRequest("source is not a repo".to_string()).into());
@@ -392,8 +393,10 @@ async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, Sy
         fetch_remote(&paths, &url, token.as_deref(), allow_file, true).await?;
         full = true;
     }
-    let push = state.pushes.start(&source, &head, full);
-    push.fetching();
+    let push = RunWriter::new(state.pool.clone())
+        .start(source.id, source.tenant_id, &head, full)
+        .await;
+    push.cloning();
     let mut result = index_commit(state, &source, &paths, &head, full, &push).await;
     if matches!(result, Err(IngestError::NeedFull)) {
         // The last indexed commit is gone from the mirror (the mirror was lost, or history was
@@ -403,7 +406,7 @@ async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, Sy
     }
     match result {
         Ok(report) => {
-            push.done(&report);
+            push.done(&report).await;
             Ok(SyncReport {
                 report,
                 up_to_date: false,
@@ -411,7 +414,7 @@ async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, Sy
             })
         }
         Err(e) => {
-            push.failed(&push_error(&e));
+            push.failed(&push_error(&e)).await;
             Err(e.into())
         }
     }

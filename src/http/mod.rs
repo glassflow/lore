@@ -19,7 +19,6 @@ use crate::error::AppError;
 use crate::llm::{Llm, Models};
 use crate::mcp;
 use crate::repo::SourceLocks;
-use crate::repo::progress::PushRegistry;
 use crate::web;
 
 pub mod admin;
@@ -42,8 +41,6 @@ pub struct AppState {
     pub models: Models,
     /// One lock per source, held while a bundle is ingested.
     pub source_locks: Arc<SourceLocks>,
-    /// Running and recent repo pushes, with their progress, for the admin page.
-    pub pushes: Arc<PushRegistry>,
     /// Per-tenant slots and the daily count of deep-mode questions.
     pub deep_guard: Arc<DeepGuard>,
 }
@@ -83,6 +80,7 @@ pub fn router(state: AppState) -> Router {
             put(repos::put_bundle).layer(RequestBodyLimitLayer::new(bundle_limit)),
         )
         .route("/v1/repos/{id}/sync", post(repos::sync_repo))
+        .route("/v1/repos/{id}/progress", get(repos::repo_progress))
         .route(
             "/v1/webhooks/github",
             post(webhooks::github).layer(RequestBodyLimitLayer::new(webhooks::BODY_LIMIT)),

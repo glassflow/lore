@@ -14,7 +14,7 @@ use crate::http::info::modes;
 use crate::http::{AppJson, AppState};
 use crate::llm::Models;
 use crate::repo;
-use crate::repo::progress::PushProgress;
+use crate::repo::progress::{NamedRun, admin_runs, source_has_live_run, tenant_has_live_run};
 
 #[derive(Deserialize)]
 pub struct CreateTenant {
@@ -213,7 +213,7 @@ pub async fn revoke_key(
 }
 
 /// Holds the locks of `source_ids` so no push to them starts while they are deleted. A running
-/// push is a 409: it is registered before it waits for its lock, so checking the registry first
+/// push is a 409: its run is recorded before it waits for its lock, so checking the runs first
 /// and then trying each lock leaves no push unseen.
 fn hold_sources(
     state: &AppState,
@@ -268,7 +268,7 @@ pub async fn delete_tenant(
         .fetch_all(&mut *tx)
         .await?;
     ids.sort_unstable();
-    let running = state.pushes.any_running(|p| p.tenant_id == tenant_id);
+    let running = tenant_has_live_run(&mut *tx, tenant_id).await?;
     let _guards = hold_sources(&state, &ids, running, "tenant")?;
 
     // Keep the ids for filesystem cleanup after committing the cascades.
@@ -296,7 +296,7 @@ pub async fn delete_source(
     State(state): State<AppState>,
     Path(source_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let running = state.pushes.any_running(|p| p.source_id == source_id);
+    let running = source_has_live_run(&state.pool, source_id).await?;
     let _guards = hold_sources(&state, &[source_id], running, "source")?;
     let done = sqlx::query("DELETE FROM sources WHERE id = $1")
         .bind(source_id)
@@ -569,59 +569,80 @@ fn parse_proc_status(text: &str) -> Memory {
     }
 }
 
-/// A push with its tenant's name.
+/// How many ended runs the pushes list shows.
+const RECENT_RUNS: i64 = 20;
+
+/// One index run, as the pushes list shows it. The fields are those of the run, with `state`
+/// for its stage and the tenant and source names.
 #[derive(Serialize)]
 pub struct PushItem {
-    /// `None` when the tenant no longer exists.
-    tenant: Option<String>,
-    #[serde(flatten)]
-    push: PushProgress,
+    id: i64,
+    tenant: String,
+    tenant_id: Uuid,
+    source: String,
+    source_id: Uuid,
+    commit: String,
+    full: bool,
+    state: String,
+    started_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+    /// `None` until the commit is fetched and the changes are listed.
+    files_total: Option<i32>,
+    files_done: i32,
+    chunks: i32,
+    chunks_embedded: i32,
+    embed_ms: i64,
+    error: Option<String>,
+    /// Not ended, and not written for 90 seconds: the process that ran it is gone.
+    stale: bool,
+}
+
+impl From<NamedRun> for PushItem {
+    fn from(n: NamedRun) -> Self {
+        let r = n.run;
+        Self {
+            id: r.id,
+            tenant: n.tenant,
+            tenant_id: r.tenant_id,
+            source: n.source,
+            source_id: r.source_id,
+            commit: r.commit,
+            full: r.full,
+            state: r.stage,
+            started_at: r.started_at,
+            updated_at: r.updated_at,
+            finished_at: r.finished_at,
+            files_total: r.files_total,
+            files_done: r.files_done,
+            chunks: r.chunks,
+            chunks_embedded: r.chunks_embedded,
+            embed_ms: r.embed_ms,
+            error: r.error,
+            stale: r.stale,
+        }
+    }
 }
 
 #[derive(Serialize)]
 pub struct PushList {
     now: DateTime<Utc>,
-    /// When the server started: pushes before that are not known.
-    since: DateTime<Utc>,
-    /// Newest first.
+    /// The runs going now, oldest first, whichever process runs them.
     running: Vec<PushItem>,
-    /// The last pushes that ended, newest first.
+    /// The last runs that ended, or whose process is gone (`stale`), newest first.
     recent: Vec<PushItem>,
 }
 
-/// The running repo pushes with their progress, and the recent ones that ended.
+/// The running index runs with their progress, and the recent ones, read from `index_runs`.
 pub async fn list_pushes(
     _admin: Admin,
     State(state): State<AppState>,
 ) -> Result<Json<PushList>, AppError> {
-    let snap = state.pushes.snapshot();
-    let mut ids: Vec<Uuid> = snap
-        .running
-        .iter()
-        .chain(&snap.recent)
-        .map(|p| p.tenant_id)
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
-    let names: HashMap<Uuid, String> = if ids.is_empty() {
-        HashMap::new()
-    } else {
-        sqlx::query_as::<_, (Uuid, String)>("SELECT id, name FROM tenants WHERE id = ANY($1)")
-            .bind(&ids)
-            .fetch_all(&state.pool)
-            .await?
-            .into_iter()
-            .collect()
-    };
-    let item = |push: PushProgress| PushItem {
-        tenant: names.get(&push.tenant_id).cloned(),
-        push,
-    };
+    let (running, recent) = admin_runs(&state.pool, RECENT_RUNS).await?;
     Ok(Json(PushList {
         now: Utc::now(),
-        since: snap.since,
-        running: snap.running.into_iter().map(item).collect(),
-        recent: snap.recent.into_iter().map(item).collect(),
+        running: running.into_iter().map(PushItem::from).collect(),
+        recent: recent.into_iter().map(PushItem::from).collect(),
     }))
 }
 

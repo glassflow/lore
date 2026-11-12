@@ -36,7 +36,7 @@ use crate::store::{
 pub mod progress;
 pub mod sync;
 
-use progress::PushHandle;
+use progress::{RunHandle, RunWriter};
 
 /// Files bigger than this are not indexed.
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -314,8 +314,8 @@ pub fn is_full_sha(s: &str) -> bool {
 /// documents of paths that are gone or skipped. Otherwise only the diff from the last indexed
 /// commit is processed. A per-source lock is held for the whole call.
 ///
-/// Once the request is checked, the push is registered in `state.pushes`, which tracks its
-/// progress for the admin page and records how it ended.
+/// Once the request is checked, the push is recorded in the `index_runs` table, with its progress
+/// and how it ended.
 /// All database changes commit together; errors and cancellation roll them back. The checkout
 /// is live, not part of that transaction: grep/read_file do not share search's snapshot guarantee.
 pub async fn ingest_bundle(
@@ -340,16 +340,18 @@ pub async fn ingest_bundle(
         .to_str()
         .ok_or_else(|| anyhow!("bundle path is not valid UTF-8"))?;
 
-    let push = state.pushes.start(source, expected_ref, full);
+    let push = RunWriter::new(state.pool.clone())
+        .start(source.id, source.tenant_id, expected_ref, full)
+        .await;
     let result = ingest_locked(state, source, bundle_arg, expected_ref, full, &push).await;
     match &result {
-        Ok(report) => push.done(report),
-        Err(e) => push.failed(&push_error(e)),
+        Ok(report) => push.done(report).await,
+        Err(e) => push.failed(&push_error(e)).await,
     }
     result
 }
 
-/// How a failed push reads on the admin page. An internal error stays in the server log, as it
+/// How a failed push reads in its run row and on the admin page. An internal error stays in the server log, as it
 /// does for the HTTP response.
 fn push_error(e: &IngestError) -> String {
     match e {
@@ -367,11 +369,11 @@ async fn ingest_locked(
     bundle_arg: &str,
     expected_ref: &str,
     full: bool,
-    push: &PushHandle,
+    push: &RunHandle,
 ) -> Result<IndexReport, IngestError> {
     let lock = state.source_locks.get(source.id);
     let _guard = lock.lock().await;
-    push.fetching();
+    push.cloning();
 
     // The caller read the source before waiting for the lock, so the last indexed commit may
     // have moved since.
@@ -395,7 +397,7 @@ async fn index_commit(
     paths: &RepoPaths,
     commit: &str,
     full: bool,
-    push: &PushHandle,
+    push: &RunHandle,
 ) -> Result<IndexReport, IngestError> {
     paths
         .mirror_git(&["update-ref", "refs/heads/lore-indexed", commit])
