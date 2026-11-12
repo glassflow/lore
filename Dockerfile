@@ -14,7 +14,8 @@ COPY src ./src
 COPY migrations ./migrations
 COPY tests/fixtures ./tests/fixtures
 # COPY keeps the old mtimes, so without this cargo would reuse the stub build.
-RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+# LORE_VERSION is set here only, so the dependency cache above does not depend on it.
+RUN touch src/main.rs src/lib.rs && LORE_VERSION=$VERSION cargo build --release --locked
 
 FROM debian:trixie-slim
 RUN apt-get update \
@@ -24,8 +25,12 @@ RUN useradd --uid 10001 --create-home --home-dir /home/lore lore \
     && mkdir -p /var/lib/lore && chown lore:lore /var/lib/lore
 COPY --from=builder /src/target/release/lore /usr/local/bin/lore
 ARG VERSION=dev
-ENV LORE_VERSION=$VERSION LORE_DATA_DIR=/var/lib/lore
-EXPOSE 8080
+# The embedding model is baked in under HF_HOME, not under /var/lib/lore: a volume on the
+# data directory would hide it.
+ENV LORE_VERSION=$VERSION LORE_DATA_DIR=/var/lib/lore HF_HOME=/opt/lore-models
+RUN mkdir -p $HF_HOME && chown lore:lore $HF_HOME
 USER lore
+RUN lore fetch-model
+EXPOSE 8080
 ENTRYPOINT ["lore"]
 CMD ["serve"]

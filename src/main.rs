@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     name = "lore",
-    version,
+    version = lore::VERSION,
     about = "Ask questions of your traces, sessions and code"
 )]
 struct Cli {
@@ -37,6 +37,9 @@ enum Command {
     Serve,
     /// Apply database migrations and exit
     Migrate,
+    /// Download the embedding model into the cache and exit (the image build runs this)
+    #[command(hide = true)]
+    FetchModel,
     /// Manage tenants, sources and API keys (needs the admin token)
     Admin {
         #[command(subcommand)]
@@ -80,6 +83,15 @@ async fn main() -> Result<()> {
             let pool = lore::db::connect(&config.database_url).await?;
             lore::db::migrate(&pool).await?;
             tracing::info!("migrations applied");
+            Ok(())
+        }
+        Command::FetchModel => {
+            let config = Config::from_env()?;
+            let dir = config.data_dir.join("models");
+            let timeout = std::time::Duration::from_secs(config.model_download_timeout_secs);
+            let download = lore::embed::Download::new(timeout);
+            let snapshot = lore::embed::fetch_model(&dir, &download)?;
+            println!("{}", snapshot.display());
             Ok(())
         }
         Command::Admin { command } => {

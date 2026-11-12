@@ -37,7 +37,7 @@ lore reads these environment variables (all in `src/config.rs`).
 | `LORE_GITHUB_WEBHOOK_SECRET` | unset | Secret of the GitHub webhook at `POST /v1/webhooks/github`. Unset or empty turns the route off (404) |
 | `LORE_GIT_TOKEN_<TENANT>` | unset | Token for the private remotes of one tenant, for example `LORE_GIT_TOKEN_ACME_WEB` for tenant `acme-web`. Sent as HTTP basic auth to that tenant's `https://` remotes only |
 | `LORE_SYNC_ALLOW_FILE_REMOTES` | `false` | Also accept `file://` remote URLs. For tests and local experiments only: with it on, any `ingest` key can make the server index a git repo on its own disk |
-| `LORE_VERSION` | the crate version | Version string reported by the server |
+| `LORE_VERSION` | the release tag the binary was built for, else the crate version | Version string reported by the server |
 | `LORE_URL` | `http://localhost:8080` | CLI only: base URL of the server, the default of the global `--url` flag |
 | `LORE_KEY` | unset | CLI only: tenant API key, the default of the global `--key` flag |
 

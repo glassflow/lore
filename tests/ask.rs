@@ -300,7 +300,7 @@ async fn info_needs_no_key(pool: PgPool) {
         String::from_utf8(bytes.to_vec()).unwrap(),
         format!(
             r#"{{"version":"{}","llm":"fake","embedder":"hash","modes":["fast","sources","deep"]}}"#,
-            env!("CARGO_PKG_VERSION")
+            lore::VERSION
         )
     );
 }
