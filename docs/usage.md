@@ -121,9 +121,18 @@ curl -X POST localhost:8080/v1/repos -H "Authorization: Bearer $LORE_KEY" \
 curl -X POST localhost:8080/v1/repos/<id>/sync -H "Authorization: Bearer $LORE_KEY"
 ```
 
-`POST /v1/repos/{id}/sync` needs an `ingest` key and git 2.36 or newer on the server. It fetches the remote's default branch (its `HEAD`) into the repo's mirror and indexes the files that changed since the last indexed commit, exactly like a push, under the same per-repo lock. If history was rewritten or the mirror lost the last indexed commit, it fetches all objects again (`git fetch --refetch`) and indexes the whole tree. The answer is the push report plus `up_to_date` (the remote's head was already indexed, the counts are zeros) and `full` (the whole tree was indexed, including the first sync). A repo without a remote is a 409; a remote that cannot be fetched (unreachable, missing, refused credentials, or a fetch over 10 minutes) is a 502 `could not fetch the remote`, and git's message goes to the server log and the [admin page](#admin-page). Pushes and syncs can be mixed on one repo.
+`POST /v1/repos/{id}/sync` needs an `ingest` key and git 2.36 or newer on the server. It fetches the remote's default branch (its `HEAD`) into the repo's mirror and indexes the files that changed since the last indexed commit, exactly like a push, under the same per-repo lock. If history was rewritten or the mirror lost the last indexed commit, it fetches all objects again (`git fetch --refetch`) and indexes the whole tree. The answer is the push report plus `up_to_date` (the remote's head was already indexed, the counts are zeros) and `full` (the whole tree was indexed, including the first sync). A repo without a remote is a 409; a remote that cannot be fetched (unreachable, missing, or a fetch over 10 minutes) is a 502 `could not fetch the remote`, and git's message goes to the server log and the [admin page](#admin-page). A remote that refuses the credentials, or wants some and gets none, is a 502 that says `the remote refused authentication`. Pushes and syncs can be mixed on one repo.
 
 `remote_url` must be an `https://` URL without a user or password. For a private remote, the operator sets `LORE_GIT_TOKEN_<TENANT>` on the server (the tenant name upper-cased, `-` written `_`: tenant `acme-web` reads `LORE_GIT_TOKEN_ACME_WEB`). It is sent as HTTP basic auth (`x-access-token:<token>`), which GitHub, GitLab and Gitea accept for a personal access token, to every remote of that tenant and no other. Since a tenant's keys choose the URL, give each tenant a token that reads only its own repos.
+
+A token can also be passed per call, which is how a private repo is synced without a token on the server:
+
+```bash
+curl -X POST localhost:8080/v1/repos/<id>/sync -H "Authorization: Bearer $LORE_KEY" \
+  -H 'content-type: application/json' -d "{\"token\": \"$GITHUB_TOKEN\"}"
+```
+
+The body is optional (an empty body syncs as before); anything else must be `{"token": "..."}`, otherwise it is a 400. The token is used for that fetch only and wins over `LORE_GIT_TOKEN_<TENANT>` for that call. It is never stored, and it is scrubbed (also in its basic-auth form) from what git says before that text reaches the server log, the admin page's `last_sync_error` or the database. While the fetch runs, the token is in the environment of the git child process, so anyone who can read that process's `/proc/<pid>/environ` (the same user, or root, on the host) can see it. The poller and the webhook never have a per-call token: they use `LORE_GIT_TOKEN_<TENANT>` or, without it, fetch anonymously.
 
 Two ways to sync without anyone calling the route:
 

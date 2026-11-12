@@ -3,7 +3,7 @@
 use std::error::Error as StdError;
 
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -196,19 +196,53 @@ pub async fn put_bundle(
     Ok(Json(report))
 }
 
-/// Fetches the repo's remote and indexes what changed since the last indexed commit.
+/// The optional body of a sync. `token` is a GitHub token for this fetch only: it is never
+/// stored or logged, so this has no `Debug`.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SyncRequest {
+    token: Option<String>,
+}
+
+/// The longest accepted token (GitHub's are well under 300 characters).
+const MAX_TOKEN_CHARS: usize = 1024;
+
+/// An empty body is valid (no token). Any other body must be `{"token": "..."}`; the parse error
+/// is not echoed, so a token in a malformed body cannot come back.
+fn sync_token(body: &[u8]) -> Result<Option<String>, AppError> {
+    if body.trim_ascii().is_empty() {
+        return Ok(None);
+    }
+    let req: SyncRequest = serde_json::from_slice(body).map_err(|_| {
+        AppError::BadRequest("the body must be empty or JSON like {\"token\": \"...\"}".to_string())
+    })?;
+    match req.token {
+        Some(t) if t.chars().count() > MAX_TOKEN_CHARS || t.chars().any(char::is_control) => {
+            Err(AppError::BadRequest(format!(
+                "token must be at most {MAX_TOKEN_CHARS} characters, without control characters"
+            )))
+        }
+        token => Ok(token),
+    }
+}
+
+/// Fetches the repo's remote and indexes what changed since the last indexed commit. A `token`
+/// in the body is used for this fetch only.
 pub async fn sync_repo(
     caller: Caller,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    body: Bytes,
 ) -> Result<Json<SyncReport>, AppError> {
     caller.require(Scope::Ingest)?;
     let source = get_source(&state.pool, caller.tenant_id, id)
         .await?
         .filter(|s| s.kind == "repo")
         .ok_or(AppError::NotFound)?;
+    let token = sync_token(&body)?;
     // Like a bundle push, the sync finishes even if the client disconnects.
-    let task = tokio::spawn(async move { crate::repo::sync::sync_repo(&state, &source).await });
+    let task =
+        tokio::spawn(async move { crate::repo::sync::sync_repo(&state, &source, token).await });
     let report = task
         .await
         .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("sync task failed")))??;

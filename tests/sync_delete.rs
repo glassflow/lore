@@ -28,7 +28,7 @@ async fn fetching_sync_without_push_registration_blocks_both_deletes(pool: PgPoo
         .unwrap();
     let syncing = {
         let (state, source) = (state.clone(), source.clone());
-        tokio::spawn(async move { sync_repo(&state, &source).await })
+        tokio::spawn(async move { sync_repo(&state, &source, None).await })
     };
     // Hold the TLS connection before responding, so real git fetch is in flight.
     let (mut connection, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
@@ -144,7 +144,7 @@ async fn delete_before_queued_sync_does_not_recreate_repo_directory(pool: PgPool
         .await
         .unwrap();
         // Poll the real sync future once: it must queue on deletion's source lock.
-        let mut syncing = Box::pin(sync_repo(&state, &source));
+        let mut syncing = Box::pin(sync_repo(&state, &source, None));
         assert!(
             std::future::poll_fn(|cx| {
                 std::task::Poll::Ready(std::future::Future::poll(syncing.as_mut(), cx).is_pending())

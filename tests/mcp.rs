@@ -155,7 +155,7 @@ async fn lists_the_four_tools_and_describes_the_server(pool: PgPool) {
     let info = client.peer_info().expect("server info");
     let server = info.server_info.as_ref().expect("server name and version");
     assert_eq!(server.name, "lore");
-    assert_eq!(server.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(server.version, lore::VERSION);
     assert_eq!(
         info.instructions.as_deref(),
         Some(

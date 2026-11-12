@@ -37,7 +37,7 @@ make kind-deploy VERSION=dev          # namespace and secrets if missing, then a
 | `make kind-logs` | Last 200 log lines of the lore pod |
 | `make kind-delete NS=lore-dev-<name>` | Deletes a dev namespace. It refuses `lore`, any name that is not `lore-dev-*`, and any value with a space or other character outside `[a-z0-9-]` |
 
-The first start downloads the embedding model into the `lore-data` volume, and the startup probe allows 3 minutes for it.
+The image already holds the embedding model (see [Release](#release)), so the first start does not download it; the startup probe still allows 3 minutes.
 
 Verify the deployment (replace `lore` with your namespace, and `18080` with `18081` for a dev namespace):
 
@@ -55,4 +55,32 @@ scripts/mcp_smoke.sh                 # last line: MCP SMOKE OK
 ```
 
 `scripts/smoke.sh <stage>` (`m1`, `m2`, `m4`, `m5`, or `all` for every stage that exists) needs `LORE_URL`, `LORE_ADMIN_TOKEN`, and `lore`, `jq`, `git` and `curl` on the path. It creates fresh tenants on each run. It also works against `make run`. `scripts/mcp_smoke.sh` checks the MCP endpoint (see [Use lore from agents](usage.md#use-lore-from-agents)); it needs `curl` as well.
+
+## Release
+
+A tag `vX.Y.Z` (or `vX.Y.Z-suffix`, such as `v1.2.0-rc.1`) on `glassflow/lore` publishes the image and a Linux binary. Cut one from main, after the pre-push gate passes:
+
+```bash
+git switch main && git pull
+make check
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+The `release` workflow (`.github/workflows/release.yml`) refuses a tag that is not of that form, then builds the image for `linux/amd64` with `--build-arg VERSION=<tag>` and pushes `ghcr.io/glassflow/lore:<tag>`. It copies `/usr/local/bin/lore` out of the pushed image, checks that it reports the tag, and attaches `lore-<tag>-linux-amd64` and its `.sha256` to a GitHub release with generated notes. It uses only the workflow's `GITHUB_TOKEN`. The tag is the version that `lore --version`, `/v1/info` and the MCP server info report (the build reads `LORE_VERSION`; without it the version is the crate version in `Cargo.toml`).
+
+Verify a release:
+
+```bash
+docker run --rm ghcr.io/glassflow/lore:<tag> --version   # lore <tag>
+```
+
+The first publish creates the package `glassflow/lore` as private. A person with admin rights must make it public once: the organization's Packages, `lore`, Package settings, Change visibility. Until then `docker pull` needs a login.
+
+Check the image build on your machine before tagging:
+
+```bash
+docker build --build-arg VERSION=v0.0.0-test -t lore:t . && docker run --rm lore:t --version   # lore v0.0.0-test
+```
+
+The embedding model (bge-small-en-v1.5, about 130 MB) is baked into the image: the build runs `lore fetch-model` as the `lore` user with `HF_HOME=/opt/lore-models`, and the server finds it there, so the first start needs no network. The model is not under `/var/lib/lore` because a volume on the data directory would hide it. `lore fetch-model` is hidden from `--help`; it downloads the model into the cache (`HF_HOME`, or `$LORE_DATA_DIR/models`), loads it once and prints the snapshot directory.
 

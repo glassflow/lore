@@ -251,7 +251,7 @@ impl Config {
             embed_model,
             model_download_timeout_secs,
             max_bundle_bytes,
-            version: get("LORE_VERSION", env!("CARGO_PKG_VERSION")),
+            version: get("LORE_VERSION", crate::VERSION),
             llm,
             anthropic_api_key: non_empty("ANTHROPIC_API_KEY"),
             anthropic_base_url: get("ANTHROPIC_BASE_URL", DEFAULT_ANTHROPIC_BASE_URL),
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(c.embed_model, "bge-small-en-v1.5");
         assert_eq!(c.model_download_timeout_secs, 300);
         assert_eq!(c.max_bundle_bytes, 512 * 1024 * 1024);
-        assert_eq!(c.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(c.version, crate::VERSION);
         assert_eq!(c.llm, LlmKind::Anthropic);
         assert_eq!(c.anthropic_api_key, None);
         assert_eq!(c.anthropic_base_url, "https://api.anthropic.com");

@@ -318,7 +318,10 @@ async fn write_run(
 }
 
 /// Inserts the row. A lock wait (a tenant delete holds the tenant row) ends after 2 seconds, so
-/// the insert cannot hold a pool connection for long.
+/// the insert cannot hold a pool connection for long. When that timeout fires (or the insert
+/// fails for any other reason) the run has no row: the push goes on, and `GET .../progress`
+/// shows the previous run (or 404 `no_index_run`) and the admin page shows nothing for it. The
+/// caller logs the error and does not retry.
 async fn insert_run(pool: &PgPool, new: &NewRun) -> sqlx::Result<i64> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL lock_timeout = '2s'")
