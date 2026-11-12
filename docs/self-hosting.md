@@ -67,6 +67,10 @@ The dump creates the `vector` extension again, so nothing else is needed. `ON_ER
 
 The `loredata` volume (repo mirrors and the model cache) is not in the dump. After a restore onto a fresh volume, run `lore repo push --full` for each repo (a repo with a `remote_url` gets its mirror and checkout back on its next sync by itself). lore also answers `need_full_bundle`, and the CLI then retries with a full bundle on its own.
 
+## Private repos
+
+The deployment sets no `LORE_GIT_TOKEN_<TENANT>`, no `LORE_SYNC_INTERVAL_SECS` and no `LORE_GITHUB_WEBHOOK_SECRET`, so the poller and the webhook are off and have no token to use. A private repo is synced by a call to `POST /v1/repos/{id}/sync` that carries the token in its body (see [usage](usage.md#sync-a-repo-from-its-remote)): lore uses it for that fetch and never stores or logs it. It is visible in the environment of the git child process (`/proc/<pid>/environ`) while the fetch runs, so keep other users off the host.
+
 ## Upgrade and roll back
 
 Upgrade by running `make deploy-prod` again with a new `VERSION`. Roll back by running it with the previous `VERSION`. Migrations only move forward, so undoing one means restoring a backup taken before the upgrade.

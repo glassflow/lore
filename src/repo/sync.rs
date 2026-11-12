@@ -8,10 +8,13 @@
 //! - A remote URL is `https://` without credentials. `file://` is accepted only with
 //!   `LORE_SYNC_ALLOW_FILE_REMOTES`, and git is told the same (`GIT_ALLOW_PROTOCOL`), so neither a
 //!   redirect nor a crafted URL makes it use another transport.
-//! - A private remote's token comes from the environment, from `LORE_GIT_TOKEN_<TENANT>` (the
-//!   tenant name upper-cased, `-` as `_`), so a tenant can only ever send its own token. It is
-//!   passed to git as an `http.extraHeader` through the environment: it never appears in a URL,
-//!   in git's arguments, in the mirror's config or in an error.
+//! - A private remote's token is passed per call, in the body of `POST /v1/repos/{id}/sync`, and
+//!   used for that fetch only. Without one, the token comes from the environment, from
+//!   `LORE_GIT_TOKEN_<TENANT>` (the tenant name upper-cased, `-` as `_`), so a tenant can only
+//!   ever send its own token. Either way it is passed to git as an `http.extraHeader` through
+//!   the environment: it is never stored, and never appears in a URL, in git's arguments, in the
+//!   mirror's config, in a log or in an error (`fetch_remote` scrubs what git says). It stays
+//!   visible in the git child's `/proc/<pid>/environ` while the fetch runs.
 //! - What git says when a fetch fails stays on the server (log and admin page); the client is
 //!   told only that the remote could not be fetched.
 
@@ -59,6 +62,9 @@ pub enum SyncError {
     /// The fetch failed; the text is git's message, for the server only.
     #[error("could not fetch the remote: {0}")]
     Fetch(String),
+    /// The remote refused the credentials, or asked for some and got none; for the server only.
+    #[error("the remote refused authentication: {0}")]
+    Auth(String),
     #[error(transparent)]
     Ingest(#[from] IngestError),
 }
@@ -89,6 +95,13 @@ impl From<SyncError> for AppError {
                 tracing::warn!(error = %m, "remote fetch failed");
                 AppError::BadGateway("could not fetch the remote".to_string())
             }
+            SyncError::Auth(m) => {
+                tracing::warn!(error = %m, "remote refused authentication");
+                AppError::BadGateway(
+                    "the remote refused authentication: send a token that can read the repo as {\"token\": \"...\"} in the sync request body"
+                        .to_string(),
+                )
+            }
             // A full index is done here, never asked of the client.
             SyncError::Ingest(IngestError::NeedFull) => {
                 AppError::Internal(anyhow!("a full index still needed a full bundle"))
@@ -103,6 +116,7 @@ fn admin_error(e: &SyncError) -> String {
     let text = match e {
         SyncError::NoRemote => "no remote_url".to_string(),
         SyncError::Fetch(m) => format!("fetch failed: {m}"),
+        SyncError::Auth(m) => format!("remote refused authentication: {m}"),
         SyncError::Ingest(e) => push_error(e),
     };
     text.chars().take(MAX_ERROR_CHARS).collect()
@@ -167,6 +181,30 @@ pub fn token_var(tenant_name: &str) -> String {
 fn auth_header(token: &str) -> String {
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
     format!("Authorization: Basic {basic}")
+}
+
+/// `text` with the token, its basic-auth form and the whole header value replaced, so what git
+/// says can be logged and stored. The header goes first: it contains the basic-auth form.
+fn scrub(text: &str, token: &str) -> String {
+    let header = auth_header(token);
+    let basic = header.trim_start_matches("Authorization: Basic ");
+    text.replace(&header, "[token]")
+        .replace(basic, "[token]")
+        .replace(token, "[token]")
+}
+
+/// Whether git's stderr says the remote wanted credentials and got none or bad ones.
+fn is_auth_failure(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    [
+        "authentication failed",
+        "terminal prompts disabled",
+        "could not read username",
+        "error: 401",
+        "error: 403",
+    ]
+    .iter()
+    .any(|m| s.contains(m))
 }
 
 /// Sets, or with `None` clears, the remote URL of a repo source. The caller checked the URL and
@@ -253,19 +291,28 @@ async fn record_sync(
 
 /// Fetches the remote of `source` (a repo source the caller read for its tenant) and indexes
 /// its head when it moved. The outcome is recorded on the source for the admin page; a run that
-/// indexes is also registered in `state.pushes`.
-pub async fn sync_repo(state: &AppState, source: &Source) -> Result<SyncReport, SyncError> {
+/// indexes is also registered in `state.pushes`. A `token` wins over the tenant's environment
+/// token for this call; it is not kept.
+pub async fn sync_repo(
+    state: &AppState,
+    source: &Source,
+    token: Option<String>,
+) -> Result<SyncReport, SyncError> {
     if source.kind != "repo" {
         return Err(IngestError::BadRequest("source is not a repo".to_string()).into());
     }
     let lock = state.source_locks.get(source.id);
     let _guard = lock.lock().await;
-    sync_under_lock(state, source).await
+    sync_under_lock(state, source, token).await
 }
 
 /// The caller owns this source's lock, including while recording the outcome.
-async fn sync_under_lock(state: &AppState, source: &Source) -> Result<SyncReport, SyncError> {
-    let result = sync_locked(state, source).await;
+async fn sync_under_lock(
+    state: &AppState,
+    source: &Source,
+    token: Option<String>,
+) -> Result<SyncReport, SyncError> {
+    let result = sync_locked(state, source, token).await;
     if matches!(result, Err(SyncError::NoRemote)) {
         return result;
     }
@@ -317,7 +364,7 @@ pub async fn poll_repos(
             let state = state.clone();
             jobs.spawn(async move {
                 let _guard = guard;
-                match sync_under_lock(&state, &source).await {
+                match sync_under_lock(&state, &source, None).await {
                     Ok(r) if !r.up_to_date => {
                         tracing::info!(source_id = %source.id, commit = %r.report.indexed_commit, "repo synced by poller");
                     }
@@ -334,7 +381,11 @@ pub async fn poll_repos(
     }
 }
 
-async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, SyncError> {
+async fn sync_locked(
+    state: &AppState,
+    source: &Source,
+    token: Option<String>,
+) -> Result<SyncReport, SyncError> {
     // Read again under the lock: a push may have moved the indexed commit while this waited.
     let source = get_source(&state.pool, source.tenant_id, source.id)
         .await?
@@ -350,9 +401,11 @@ async fn sync_locked(state: &AppState, source: &Source) -> Result<SyncReport, Sy
     let allow_file = state.config.sync_allow_file_remotes;
     // Checked again: the URL was stored under the configuration of that time.
     check_remote_url(&url, allow_file).map_err(SyncError::Fetch)?;
-    let token = std::env::var(token_var(&tenant))
-        .ok()
-        .filter(|t| !t.is_empty());
+    let token = token.filter(|t| !t.is_empty()).or_else(|| {
+        std::env::var(token_var(&tenant))
+            .ok()
+            .filter(|t| !t.is_empty())
+    });
 
     let paths = RepoPaths::new(&state.config.data_dir, source.id)?;
     ensure_mirror(&paths).await?;
@@ -452,7 +505,16 @@ async fn fetch_remote(
             } else {
                 e.stderr
             };
-            return Err(SyncError::Fetch(stderr));
+            // The one place git's text leaves with the token possibly in it.
+            let stderr = match token {
+                Some(t) => scrub(&stderr, t),
+                None => stderr,
+            };
+            return Err(if is_auth_failure(&stderr) {
+                SyncError::Auth(stderr)
+            } else {
+                SyncError::Fetch(stderr)
+            });
         }
         Ok(Ok(_)) => {}
     }
@@ -471,7 +533,7 @@ async fn fetch_remote(
 pub async fn sync_all(state: &AppState) -> anyhow::Result<usize> {
     let mut indexed = 0;
     for source in remote_sources(&state.pool).await? {
-        match sync_repo(state, &source).await {
+        match sync_repo(state, &source, None).await {
             Ok(r) if !r.up_to_date => {
                 indexed += 1;
                 tracing::info!(source_id = %source.id, commit = %r.report.indexed_commit, "repo synced");
@@ -489,7 +551,7 @@ pub fn spawn_syncs(state: &AppState, sources: Vec<Source>) {
     for source in sources {
         let state = state.clone();
         tokio::spawn(async move {
-            match sync_repo(&state, &source).await {
+            match sync_repo(&state, &source, None).await {
                 Ok(r) => tracing::info!(
                     source_id = %source.id,
                     commit = %r.report.indexed_commit,
@@ -578,6 +640,29 @@ mod tests {
             auth_header("t0k"),
             "Authorization: Basic eC1hY2Nlc3MtdG9rZW46dDBr"
         );
+    }
+
+    #[test]
+    fn scrub_removes_every_form_of_the_token() {
+        let token = "ghp_fake123";
+        let header = auth_header(token);
+        let basic = header.trim_start_matches("Authorization: Basic ");
+        let text = format!("a {token} b {basic} c {header} d");
+        let out = scrub(&text, token);
+        assert_eq!(out, "a [token] b [token] c [token] d");
+    }
+
+    #[test]
+    fn auth_failures_are_told_from_other_errors() {
+        assert!(is_auth_failure(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        ));
+        assert!(is_auth_failure(
+            "fatal: Authentication failed for 'https://x/'"
+        ));
+        assert!(!is_auth_failure(
+            "fatal: unable to access: Could not resolve host"
+        ));
     }
 
     #[test]
