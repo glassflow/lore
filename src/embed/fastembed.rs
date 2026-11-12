@@ -50,19 +50,38 @@ impl FastEmbedder {
     /// Loads the model from `cache_dir` (`$HF_HOME` instead, when that is set), downloading it
     /// as `download` says when it is missing.
     pub fn with_download(cache_dir: &Path, download: &Download) -> Result<Self> {
-        // fastembed's own loader let HF_HOME replace the cache directory, and the docs say so.
-        let cache_dir = std::env::var_os("HF_HOME")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| cache_dir.to_path_buf(), PathBuf::from);
-        let info = TextEmbedding::get_model_info(&MODEL)?;
-        let mut files = TOKENIZER_FILES.to_vec();
-        files.push(&info.model_file);
-        let snapshot = download::fetch(&info.model_code, &files, &cache_dir, download)?;
+        Self::from_snapshot(&fetch_snapshot(cache_dir, download)?)
+    }
+
+    /// Loads both instances from the model files in `snapshot`, without the network.
+    fn from_snapshot(snapshot: &Path) -> Result<Self> {
         Ok(Self {
-            documents: Mutex::new(load(&snapshot, None)?),
-            queries: Mutex::new(load(&snapshot, Some(QUERY_THREADS))?),
+            documents: Mutex::new(load(snapshot, None)?),
+            queries: Mutex::new(load(snapshot, Some(QUERY_THREADS))?),
         })
     }
+}
+
+/// The snapshot directory with the model files, downloading them as `download` says when they
+/// are missing from `cache_dir` (`$HF_HOME` instead, when that is set).
+fn fetch_snapshot(cache_dir: &Path, download: &Download) -> Result<PathBuf> {
+    // fastembed's own loader let HF_HOME replace the cache directory, and the docs say so.
+    let cache_dir = std::env::var_os("HF_HOME")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| cache_dir.to_path_buf(), PathBuf::from);
+    let info = TextEmbedding::get_model_info(&MODEL)?;
+    let mut files = TOKENIZER_FILES.to_vec();
+    files.push(&info.model_file);
+    download::fetch(&info.model_code, &files, &cache_dir, download)
+}
+
+/// Makes sure the model is in `cache_dir` (`$HF_HOME` instead, when that is set): downloads it
+/// when it is missing, then loads it once to prove the files work. Returns the snapshot
+/// directory. The image build runs this so the model is baked in.
+pub fn fetch_model(cache_dir: &Path, download: &Download) -> Result<PathBuf> {
+    let snapshot = fetch_snapshot(cache_dir, download)?;
+    FastEmbedder::from_snapshot(&snapshot)?;
+    Ok(snapshot)
 }
 
 /// One instance of the model, from the files in `snapshot`, with the settings
@@ -161,12 +180,46 @@ mod tests {
         );
     }
 
+    /// `fetch_model` finds the model in an existing cache without the network, then loads it:
+    /// the cache here holds files that are not an ONNX model, so the load fails and names the
+    /// snapshot it read. A real download and load is covered by `fastembed_smoke`.
+    #[test]
+    fn fetch_model_reads_the_cache_and_loads_from_the_snapshot() {
+        // HF_HOME replaces the cache directory, and may already hold the model.
+        if std::env::var_os("HF_HOME").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let info = TextEmbedding::get_model_info(&MODEL).unwrap();
+        let repo_dir = dir
+            .path()
+            .join(format!("models--{}", info.model_code.replace('/', "--")));
+        let snapshot = repo_dir.join("snapshots/abc123");
+        let mut files = TOKENIZER_FILES.to_vec();
+        files.push(&info.model_file);
+        for file in files {
+            let path = snapshot.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "not a model").unwrap();
+        }
+        std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        std::fs::write(repo_dir.join("refs/main"), "abc123").unwrap();
+        // Nothing listens on port 9: the files in the cache must be enough to get that far.
+        let download = Download::with_endpoint("http://127.0.0.1:9", Duration::from_secs(1));
+        let err = fetch_model(dir.path(), &download).unwrap_err().to_string();
+        let want = format!("loading bge-small-en-v1.5 from {}", snapshot.display());
+        assert!(err.contains(&want), "{err}");
+    }
+
     /// Downloads the model (about 130 MB) into a temp dir. Run with
     /// `cargo test -- --ignored fastembed_smoke`.
     #[test]
     #[ignore = "downloads the bge-small-en-v1.5 model"]
     fn fastembed_smoke() {
         let dir = tempfile::tempdir().unwrap();
+        let download = Download::new(Duration::from_secs(DEFAULT_MODEL_DOWNLOAD_TIMEOUT_SECS));
+        let snapshot = fetch_model(dir.path(), &download).unwrap();
+        assert!(snapshot.join("tokenizer.json").exists());
         let e = FastEmbedder::new(dir.path()).unwrap();
         assert_eq!(e.name(), "fastembed:bge-small-en-v1.5");
         let docs = e

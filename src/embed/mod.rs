@@ -13,7 +13,7 @@ pub mod fastembed;
 pub mod hash;
 
 pub use self::download::Download;
-pub use self::fastembed::FastEmbedder;
+pub use self::fastembed::{FastEmbedder, fetch_model};
 pub use self::hash::HashEmbedder;
 
 /// Dimension of every embedding (bge-small-en-v1.5, and the hash embedder to match).
