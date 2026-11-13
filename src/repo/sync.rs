@@ -19,6 +19,7 @@
 //!   told only that the remote could not be fetched.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -54,6 +55,10 @@ pub struct SyncReport {
     /// The whole tree was indexed: the source's first index, a history rewrite, or the last
     /// indexed commit was gone from the mirror.
     pub full: bool,
+    /// The source was already indexed (by `lore index` or another server), but this process held
+    /// no mirror or no checkout for it: the sync built them and indexed at most what the remote
+    /// gained since. False when the sync was a full index, which is a reindex.
+    pub adopted: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -485,16 +490,31 @@ async fn sync_locked(
     });
 
     let paths = RepoPaths::new(&state.config.data_dir, source.id)?;
+    // Looked at before `ensure_mirror` creates anything: an indexed source that this process has
+    // no mirror or checkout for is adopted (indexed by a Job, or the data volume was lost).
+    let held_mirror = tokio::fs::try_exists(Path::new(&paths.mirror).join("HEAD"))
+        .await
+        .context("checking the mirror")?;
+    let held_checkout = tokio::fs::try_exists(&paths.checkout)
+        .await
+        .context("checking the checkout")?;
+    let unheld = source.indexed_commit.is_some() && !(held_mirror && held_checkout);
     ensure_mirror(&paths).await?;
     let head = fetch_remote(&paths, &url, token.as_deref(), allow_file, false).await?;
 
     if source.indexed_commit.as_deref() == Some(head.as_str()) {
-        // A lost data volume leaves the index intact but no checkout for deep mode.
-        if !tokio::fs::try_exists(&paths.checkout)
-            .await
-            .context("checking the checkout")?
-        {
+        // A lost data volume, or an index made elsewhere, leaves the index intact but no
+        // checkout for deep mode.
+        if !held_mirror || !held_checkout {
             refresh_checkout(&paths, &head).await?;
+        }
+        if unheld {
+            tracing::info!(
+                source_id = %source.id,
+                commit = %head,
+                files_indexed = 0,
+                "sync adopted an indexed repo"
+            );
         }
         return Ok(SyncReport {
             report: IndexReport {
@@ -507,6 +527,7 @@ async fn sync_locked(
             },
             up_to_date: true,
             full: false,
+            adopted: unheld,
         });
     }
 
@@ -536,10 +557,20 @@ async fn sync_locked(
     match result {
         Ok(report) => {
             push.done(&report).await;
+            let adopted = unheld && !full;
+            if adopted {
+                tracing::info!(
+                    source_id = %source.id,
+                    commit = %report.indexed_commit,
+                    files_indexed = report.files_indexed,
+                    "sync adopted an indexed repo"
+                );
+            }
             Ok(SyncReport {
                 report,
                 up_to_date: false,
                 full,
+                adopted,
             })
         }
         Err(e) => {
