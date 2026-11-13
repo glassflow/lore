@@ -618,8 +618,9 @@ async fn the_token_reaches_git_only_as_a_header_and_never_leaves(pool: PgPool) {
             .unwrap();
     assert!(!last.unwrap().contains(TOKEN));
 
-    // Git got it as http.extraHeader through the environment, not in its arguments, and not
-    // the lore variables themselves.
+    // Git got it as http.extraHeader in its environment (so it is readable from the git
+    // process's /proc/<pid>/environ while it runs), but not in its arguments, and neither
+    // LORE_INDEX_TOKEN nor LORE_DATABASE_URL themselves.
     let args = std::fs::read_to_string(fake.path().join("args.dump")).unwrap();
     assert!(!args.contains(TOKEN) && !args.contains(&basic), "{args}");
     let dump = std::fs::read_to_string(fake.path().join("env.dump")).unwrap();
@@ -644,4 +645,183 @@ async fn a_successful_index_with_a_token_prints_and_logs_no_token(pool: PgPool) 
     assert!(!out.stdout.contains(TOKEN) && !out.stderr.contains(TOKEN));
     // The logs are on stderr, never mixed into the one result line.
     assert!(out.stderr.contains("embedder ready"), "{}", out.stderr);
+}
+
+/// How many sessions of this database wait for a row lock taken with `FOR NO KEY UPDATE`.
+async fn waiting_for_the_row(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = current_database() AND wait_event_type = 'Lock'
+           AND query LIKE '%FOR NO KEY UPDATE%' AND query NOT LIKE '%pg_stat_activity%'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn wait_for_waiters(pool: &PgPool, n: i64) {
+    for _ in 0..600 {
+        if waiting_for_the_row(pool).await >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("{n} sessions never queued on the source row");
+}
+
+async fn indexed_paths(pool: &PgPool, source: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT external_id FROM documents WHERE source_id = $1 ORDER BY external_id",
+    )
+    .bind(source)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// A server push computes its diff from the indexed commit it read, then queues on the source
+/// row. A `lore index` (another process, so no in-process lock) that queued first commits a
+/// newer commit in between. The push must not apply its diff on top of that: it has to ask for
+/// a full bundle, and leave the index as the job made it.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_push_that_queued_behind_an_index_does_not_apply_its_stale_diff(pool: PgPool) {
+    let env = Env::new(pool.clone());
+    let (tenant, key, source) = env.tenant("jobs").await;
+    let repo = fixture_repo();
+
+    // A: the server's full push. B adds ghost.md, and the job's remote is a clone at B. C drops
+    // ghost.md again and adds a file.
+    let a = head(&repo);
+    let (status, body) = put_bundle(
+        &env.router,
+        &key,
+        source,
+        bundle(&repo, &["HEAD"]),
+        &a,
+        true,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    std::fs::write(repo.path().join("ghost.md"), "# Ghost\n\nOnly B has me.\n").unwrap();
+    commit_all(&repo, "B adds ghost.md");
+    let b = head(&repo);
+    let job_remote = tempfile::tempdir().unwrap();
+    git(
+        repo.path(),
+        &["clone", "-q", ".", &job_remote.path().to_string_lossy()],
+    );
+    std::fs::remove_file(repo.path().join("ghost.md")).unwrap();
+    std::fs::write(repo.path().join("c.md"), "# See\n\nOnly C has me.\n").unwrap();
+    commit_all(&repo, "C drops ghost.md");
+    let c = head(&repo);
+
+    // Hold the source row, so both writers queue on it, the job first.
+    let mut hold = pool.begin().await.unwrap();
+    let held: Uuid = sqlx::query_scalar("SELECT id FROM sources WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(source)
+        .fetch_one(&mut *hold)
+        .await
+        .unwrap();
+    assert_eq!(held, source);
+    let job = tokio::spawn(run(env.command(
+        tenant,
+        source,
+        &file_url(job_remote.path()),
+    )));
+    wait_for_waiters(&pool, 1).await;
+    let push = {
+        let router = env.router.clone();
+        let key = key.clone();
+        let bytes = bundle(&repo, &[&format!("{a}..HEAD")]);
+        let c = c.clone();
+        tokio::spawn(async move { put_bundle(&router, &key, source, bytes, &c, false).await })
+    };
+    wait_for_waiters(&pool, 2).await;
+    hold.rollback().await.unwrap();
+
+    let job_out = job.await.unwrap();
+    assert_eq!(job_out.json()["commit"], b.as_str());
+    let (status, body) = push.await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "need_full_bundle", "{body}");
+
+    // Nothing of the refused push was applied: the index is B, ghost.md included, c.md absent.
+    assert_eq!(indexed_commit(&pool, source).await, Some(b));
+    let docs = indexed_paths(&pool, source).await;
+    assert!(docs.contains(&"ghost.md".to_string()), "{docs:?}");
+    assert!(!docs.contains(&"c.md".to_string()), "{docs:?}");
+
+    // The client's answer to the 409, a full push of C, lands cleanly and drops ghost.md.
+    let (status, body) = put_bundle(
+        &env.router,
+        &key,
+        source,
+        bundle(&repo, &["HEAD"]),
+        &c,
+        true,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(indexed_commit(&pool, source).await, Some(c));
+    let docs = indexed_paths(&pool, source).await;
+    assert!(!docs.contains(&"ghost.md".to_string()), "{docs:?}");
+    assert!(docs.contains(&"c.md".to_string()), "{docs:?}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_lock_connection_is_kept_alive_while_held_and_freed_on_release(pool: PgPool) {
+    let source = Uuid::new_v4();
+    let ping = std::time::Duration::from_millis(100);
+    let held = SourceAdvisoryLock::try_acquire_pinging(&dsn(&pool), source, ping)
+        .await
+        .unwrap()
+        .expect("the lock is free");
+
+    // The backend that holds the advisory lock, and when it last ran a statement.
+    let state_change = || async {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT a.state_change FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+             WHERE l.locktype = 'advisory' AND l.granted AND l.pid <> pg_backend_pid()
+               AND a.datname = current_database()",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let first = state_change().await;
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let later = state_change().await;
+    assert!(
+        later > first,
+        "the idle connection was used: {first:?} {later:?}"
+    );
+
+    // Still held after several ping intervals.
+    assert!(
+        SourceAdvisoryLock::try_acquire(&dsn(&pool), source)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    held.release().await;
+    let again = SourceAdvisoryLock::try_acquire(&dsn(&pool), source)
+        .await
+        .unwrap()
+        .expect("released, the lock is free");
+    // Dropping without release frees it too (the task closes the connection).
+    drop(again);
+    let mut freed = false;
+    for _ in 0..50 {
+        if let Some(l) = SourceAdvisoryLock::try_acquire(&dsn(&pool), source)
+            .await
+            .unwrap()
+        {
+            l.release().await;
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(freed, "a dropped lock is freed");
 }

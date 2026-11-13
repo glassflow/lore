@@ -5,7 +5,10 @@
 //! Inputs: `LORE_DATABASE_URL` and the embedder settings as the server reads them
 //! (`Config::from_env`), and `LORE_INDEX_TOKEN`, the git token for a private remote. The token
 //! comes from the environment only: it is never a flag, never in a URL or in git's arguments,
-//! and never printed or stored (see `repo::sync`).
+//! and never printed, logged or stored (see `repo::sync`). Git does get it, as a basic-auth
+//! `http.extraHeader` in its environment, so it is readable from that git process's
+//! `/proc/<pid>/environ` while the fetch runs; `LORE_INDEX_TOKEN` and `LORE_DATABASE_URL`
+//! themselves are removed from git's environment.
 
 use std::sync::Arc;
 

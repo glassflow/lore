@@ -8,13 +8,33 @@
 //! releases it too. The server's own push and sync path does not take it. It is already kept apart
 //! from a running index in the database: `index_commit` locks the source row (`FOR NO KEY
 //! UPDATE`) before it writes anything and holds it until it commits, so a push that meets a
-//! running index waits for it instead of writing at the same time. The advisory lock adds what
+//! running index waits for it instead of writing at the same time (and, once it has the row, checks
+//! that the indexed commit is still the one its diff started from, else it asks for a full
+//! index). The advisory lock adds what
 //! that cannot: a second `lore index` fails at once instead of embedding the repo twice.
+//!
+//! The connection sits idle for the whole run, which can be hours (embedding a big repo), and a
+//! NAT or load balancer in between may drop an idle TCP connection without either end noticing;
+//! Postgres would then end the session and release the lock silently. sqlx 0.8 has no TCP
+//! keepalive option, so a background task owns the connection and runs `SELECT 1` on it every
+//! [`PING_INTERVAL`] until the lock is released or dropped.
+//!
+//! This needs a session-level connection to Postgres itself: through a transaction-mode pooler
+//! (PgBouncer in `transaction` pool mode) the session advisory lock would belong to whichever
+//! server connection the pooler handed out for that statement, and it would be lost or leak.
+//! Point `LORE_DATABASE_URL` of `lore index` at Postgres directly, or at a session-mode pooler.
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgConnection;
 use sqlx::{Connection, Row};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+/// How often the idle lock connection is used, so that a NAT or load balancer does not drop it.
+pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The advisory lock key of a source: the first 8 bytes of its (random, version 4) id.
 pub fn advisory_key(source_id: Uuid) -> i64 {
@@ -25,16 +45,27 @@ pub fn advisory_key(source_id: Uuid) -> i64 {
 }
 
 /// The held advisory lock of one source. Call [`SourceAdvisoryLock::release`] when done; the
-/// lock is dropped with the connection either way.
+/// lock is dropped with the connection either way (the task ends and closes it when this is
+/// dropped).
 pub struct SourceAdvisoryLock {
-    conn: PgConnection,
-    key: i64,
+    /// Tells the task owning the connection to unlock and close it; dropping it stops the task.
+    release: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl SourceAdvisoryLock {
     /// Opens a dedicated connection to `database_url` and tries the lock without waiting.
     /// `Ok(None)` means another session holds it.
     pub async fn try_acquire(database_url: &str, source_id: Uuid) -> Result<Option<Self>> {
+        Self::try_acquire_pinging(database_url, source_id, PING_INTERVAL).await
+    }
+
+    /// [`Self::try_acquire`] with the interval of the keepalive pings (a test makes it short).
+    pub async fn try_acquire_pinging(
+        database_url: &str,
+        source_id: Uuid,
+        ping_every: Duration,
+    ) -> Result<Option<Self>> {
         let mut conn = PgConnection::connect(database_url)
             .await
             .context("opening the lock connection to the database")?;
@@ -45,25 +76,60 @@ impl SourceAdvisoryLock {
             .await
             .context("taking the source lock")?
             .get(0);
-        if got {
-            Ok(Some(Self { conn, key }))
-        } else {
+        if !got {
             let _ = conn.close().await;
-            Ok(None)
+            return Ok(None);
         }
+        let (release, released) = oneshot::channel();
+        let task = tokio::spawn(hold(conn, key, ping_every, released));
+        Ok(Some(Self {
+            release: Some(release),
+            task: Some(task),
+        }))
     }
 
     /// Unlocks and closes the connection. A failure is not an error: closing the connection
     /// releases the lock anyway.
     pub async fn release(mut self) {
-        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(self.key)
-            .execute(&mut self.conn)
-            .await
-        {
-            tracing::warn!(error = %e, "could not unlock the source");
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
         }
-        let _ = self.conn.close().await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+/// Owns the lock connection: pings it every `ping_every`, and on a release request unlocks and
+/// closes it. When the sender is dropped without a request, the connection is just closed.
+async fn hold(
+    mut conn: PgConnection,
+    key: i64,
+    ping_every: Duration,
+    mut released: oneshot::Receiver<()>,
+) {
+    let mut next = tokio::time::Instant::now() + ping_every;
+    loop {
+        tokio::select! {
+            requested = &mut released => {
+                if requested.is_ok()
+                    && let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                        .bind(key)
+                        .execute(&mut conn)
+                        .await
+                {
+                    tracing::warn!(error = %e, "could not unlock the source");
+                }
+                let _ = conn.close().await;
+                return;
+            }
+            _ = tokio::time::sleep_until(next) => {
+                next = tokio::time::Instant::now() + ping_every;
+                if let Err(e) = sqlx::query("SELECT 1").execute(&mut conn).await {
+                    tracing::warn!(error = %e, "the source lock connection failed its keepalive");
+                }
+            }
+        }
     }
 }
 

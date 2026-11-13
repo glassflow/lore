@@ -158,16 +158,20 @@ lore index --tenant <tenant id> --repo <source id> --remote https://github.com/a
 
 | Variable | Meaning |
 |---|---|
-| `LORE_DATABASE_URL` | The Postgres DSN (required). Migrations are applied first, as `lore serve` does |
-| `LORE_INDEX_TOKEN` | A git token for a private remote, sent as basic auth (`x-access-token:<token>`). Only ever read from the environment: there is no flag for it, it is not put in the URL or git's arguments, and it is scrubbed from every message the command prints, logs or records |
+| `LORE_DATABASE_URL` | The Postgres DSN (required). Migrations are applied first, as `lore serve` does (see below) |
+| `LORE_INDEX_TOKEN` | A git token for a private remote, sent as basic auth (`x-access-token:<token>`). Only ever read from the environment: there is no flag for it, it is not put in the URL or git's arguments, and it is scrubbed from every message the command prints, logs or records. Git receives it as a basic-auth header in its environment, so while the fetch runs it is readable from that git process's `/proc/<pid>/environ` by the same user (or root); `LORE_INDEX_TOKEN` and `LORE_DATABASE_URL` themselves are removed from git's environment |
 | `LORE_EMBEDDER`, `LORE_EMBEDDING_CACHE`, `LORE_DATA_DIR`, ... | Read as the server reads them, see [the configuration](configuration.md). `lore index` makes no LLM or other model calls except the local embedder |
 | `LORE_EMBED_THREADS` | ONNX threads of the embedder. Unset, it follows the container CPU limit (cgroup v2 `cpu.max`, else cgroup v1 CFS quota and period), rounded up and at least 1, and without a limit the available cores |
+
+`lore index` runs the database migrations when it starts, as `lore serve` does. A Job image newer than the running server therefore migrates the schema under that server; run matching versions of the two.
+
+A Job index writes its mirror and checkout under its own `LORE_DATA_DIR`, so it does not feed the server's deep mode (the checkout) yet. Pointing the Job at the server's volume is not safe: the mirror and checkout updates are only guarded in-process (TR-1196 covers this).
 
 The repo must belong to the tenant: a source of another tenant, a source that does not exist and a tenant that does not exist are all the same error and nothing is written. Only that tenant's rows are touched.
 
 The run shows in `index_runs` like any index run, so `GET /v1/repos/{id}/progress` and the admin page show its stage and counts while it works and `done` or `failed` after. A process that is killed leaves a run that goes stale, as for the server.
 
-One `lore index` per repo at a time: it holds a Postgres advisory lock on the repo for the whole run, on a connection of its own. A second one for the same repo does not wait; it exits at once with code 3 (`another index of source <id> is running`). The lock is released when the process ends, however it ends. Other repos are not affected, and the server's own pushes and syncs of that repo still serialise with it on the row lock the index takes while it writes.
+One `lore index` per repo at a time: it holds a Postgres advisory lock on the repo for the whole run, on a connection of its own. A second one for the same repo does not wait; it exits at once with code 3 (`another index of source <id> is running`). The lock is released when the process ends, however it ends. Other repos are not affected, and the server's own pushes and syncs of that repo still serialise with it on the row lock the index takes while it writes. A server incremental push or sync that waited on that row lock behind an index that moved the indexed commit is answered with the full-index path (409 `need_full_bundle` for a push, a full index for a sync) instead of applying a stale diff. The lock connection is pinged every 30 seconds so an idle-connection timeout of a NAT or load balancer does not drop it; point `LORE_DATABASE_URL` at Postgres or a session-mode pooler, not a transaction-mode one (PgBouncer `pool_mode=transaction`), which cannot hold a session lock.
 
 | Exit code | Meaning |
 |---|---|
