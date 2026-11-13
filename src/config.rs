@@ -61,6 +61,9 @@ pub struct Config {
     pub sync_allow_file_remotes: bool,
     /// `LORE_EMBEDDING_CACHE`: who may reuse a vector another document already paid for.
     pub embedding_cache: EmbeddingCache,
+    /// `LORE_EMBED_THREADS`: ONNX Runtime threads of the indexing embedder. `None` (unset or
+    /// empty) follows the container's CPU limit; see `embed::threads`.
+    pub embed_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +168,14 @@ impl Config {
             other => bail!(
                 "LORE_EMBEDDING_CACHE must be \"shared\", \"tenant\" or \"off\", got {other:?}"
             ),
+        };
+        let embed_threads = match f("LORE_EMBED_THREADS").map(|v| v.trim().to_string()) {
+            None => None,
+            Some(v) if v.is_empty() => None,
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => bail!("LORE_EMBED_THREADS must be a positive integer, got {v:?}"),
+            },
         };
         let embed_model = get("LORE_EMBED_MODEL", EMBED_MODEL);
         if embed_model != EMBED_MODEL {
@@ -272,6 +283,7 @@ impl Config {
             github_webhook_secret: f("LORE_GITHUB_WEBHOOK_SECRET").filter(|s| !s.is_empty()),
             sync_allow_file_remotes,
             embedding_cache,
+            embed_threads,
         })
     }
 }
@@ -336,6 +348,25 @@ mod tests {
         assert_eq!(c.github_webhook_secret, None);
         assert!(!c.sync_allow_file_remotes);
         assert_eq!(c.embedding_cache, EmbeddingCache::Shared);
+        assert_eq!(c.embed_threads, None);
+    }
+
+    #[test]
+    fn embed_threads_is_a_positive_integer_or_unset() {
+        assert_eq!(
+            lookup(&[("LORE_EMBED_THREADS", " 3 ")])
+                .unwrap()
+                .embed_threads,
+            Some(3)
+        );
+        assert_eq!(
+            lookup(&[("LORE_EMBED_THREADS", "")]).unwrap().embed_threads,
+            None
+        );
+        for bad in ["0", "-1", "two", "1.5"] {
+            let err = lookup(&[("LORE_EMBED_THREADS", bad)]).unwrap_err();
+            assert!(err.to_string().contains("LORE_EMBED_THREADS"), "{bad}");
+        }
     }
 
     #[test]

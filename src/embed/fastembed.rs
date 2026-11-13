@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
 
 use super::Embedder;
 use super::download::{self, Download};
+use super::threads::embed_threads;
 use crate::config::DEFAULT_MODEL_DOWNLOAD_TIMEOUT_SECS;
 
 const MODEL: EmbeddingModel = EmbeddingModel::BGESmallENV15;
@@ -44,19 +45,20 @@ impl FastEmbedder {
     /// it is missing, within the default deadline.
     pub fn new(cache_dir: &Path) -> Result<Self> {
         let deadline = Duration::from_secs(DEFAULT_MODEL_DOWNLOAD_TIMEOUT_SECS);
-        Self::with_download(cache_dir, &Download::new(deadline))
+        Self::with_download(cache_dir, &Download::new(deadline), embed_threads(None))
     }
 
     /// Loads the model from `cache_dir` (`$HF_HOME` instead, when that is set), downloading it
     /// as `download` says when it is missing.
-    pub fn with_download(cache_dir: &Path, download: &Download) -> Result<Self> {
-        Self::from_snapshot(&fetch_snapshot(cache_dir, download)?)
+    /// The document instance uses `threads` ONNX Runtime threads (see [`embed_threads`]).
+    pub fn with_download(cache_dir: &Path, download: &Download, threads: usize) -> Result<Self> {
+        Self::from_snapshot(&fetch_snapshot(cache_dir, download)?, threads)
     }
 
     /// Loads both instances from the model files in `snapshot`, without the network.
-    fn from_snapshot(snapshot: &Path) -> Result<Self> {
+    fn from_snapshot(snapshot: &Path, threads: usize) -> Result<Self> {
         Ok(Self {
-            documents: Mutex::new(load(snapshot, None)?),
+            documents: Mutex::new(load(snapshot, Some(threads))?),
             queries: Mutex::new(load(snapshot, Some(QUERY_THREADS))?),
         })
     }
@@ -80,13 +82,14 @@ fn fetch_snapshot(cache_dir: &Path, download: &Download) -> Result<PathBuf> {
 /// directory. The image build runs this so the model is baked in.
 pub fn fetch_model(cache_dir: &Path, download: &Download) -> Result<PathBuf> {
     let snapshot = fetch_snapshot(cache_dir, download)?;
-    FastEmbedder::from_snapshot(&snapshot)?;
+    FastEmbedder::from_snapshot(&snapshot, embed_threads(None))?;
     Ok(snapshot)
 }
 
 /// One instance of the model, from the files in `snapshot`, with the settings
 /// `TextEmbedding::try_new` uses for it. fastembed never touches the network this way.
-/// `threads` caps its ONNX Runtime threads (`None`: the runtime's default, one per core).
+/// `threads` caps its ONNX Runtime threads (`None`: the runtime's default, one per core). The
+/// document instance gets the container-aware count from [`embed_threads`].
 fn load(snapshot: &Path, threads: Option<usize>) -> Result<TextEmbedding> {
     let read = |file: &str| {
         let path = snapshot.join(file);
@@ -167,7 +170,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let download = Download::with_endpoint(&base, Duration::from_millis(500));
         let started = std::time::Instant::now();
-        let err = FastEmbedder::with_download(dir.path(), &download)
+        let err = FastEmbedder::with_download(dir.path(), &download, 1)
             .err()
             .expect("the load fails")
             .to_string();
