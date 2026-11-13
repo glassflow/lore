@@ -406,8 +406,9 @@ async fn ingest_locked(
 
 /// Indexes `commit`, which the mirror already holds, and records it as the source's indexed
 /// commit. `full` (or a source never indexed before) indexes the whole tree; otherwise only the
-/// diff from the last indexed commit, which is `NeedFull` when the mirror lacks that commit.
-/// The caller holds the source's lock and passes the source as read under it.
+/// diff from the last indexed commit, which is `NeedFull` when the mirror lacks that commit or
+/// when another process moved the indexed commit while this waited for the row lock. The caller
+/// holds the source's lock and passes the source as read under it.
 async fn index_commit(
     state: &IndexCtx,
     source: &Source,
@@ -446,15 +447,24 @@ async fn index_commit(
     }
     // NO KEY UPDATE still excludes other pushes and a delete, but not the foreign-key check of a
     // queued push recording its `index_runs` row.
-    let owned: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM sources WHERE id = $1 AND tenant_id = $2 FOR NO KEY UPDATE",
+    let locked: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, indexed_commit FROM sources WHERE id = $1 AND tenant_id = $2
+         FOR NO KEY UPDATE",
     )
     .bind(source.id)
     .bind(source.tenant_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if owned.is_none() {
+    let Some((_, locked_commit)) = locked else {
         return Err(anyhow!("source {} vanished", source.id).into());
+    };
+    // The diff above was computed from `source.indexed_commit`, read under the in-process lock
+    // only. Another process (`lore index`) may have committed another commit since, and the row
+    // lock is the first point where that is excluded. Applying the diff on top of it would keep
+    // files only that commit had, so ask for a full index instead; nothing is written yet.
+    if !full_mode && locked_commit != source.indexed_commit {
+        tx.rollback().await?;
+        return Err(IngestError::NeedFull);
     }
     let mut job = Job {
         state,
