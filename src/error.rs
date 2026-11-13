@@ -13,6 +13,9 @@ pub enum AppError {
     Forbidden(String),
     #[error("not found")]
     NotFound,
+    /// A 404 whose body is a code, for a thing that exists but has nothing to show yet.
+    #[error("not found: {0}")]
+    NotFoundCode(&'static str),
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("payload too large")]
@@ -41,7 +44,7 @@ impl AppError {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
-            AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::NotFound | AppError::NotFoundCode(_) => StatusCode::NOT_FOUND,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -64,6 +67,7 @@ impl AppError {
             | AppError::BadGateway(m) => m.clone(),
             AppError::Unauthorized => "unauthorized".to_string(),
             AppError::NotFound => "not found".to_string(),
+            AppError::NotFoundCode(code) => (*code).to_string(),
             AppError::PayloadTooLarge => "payload too large".to_string(),
             AppError::Internal(_) => "internal error".to_string(),
         }
@@ -105,6 +109,7 @@ mod tests {
             (AppError::Unauthorized, 401),
             (AppError::Forbidden("x".into()), 403),
             (AppError::NotFound, 404),
+            (AppError::NotFoundCode("no_index_run"), 404),
             (AppError::Conflict("x".into()), 409),
             (AppError::PayloadTooLarge, 413),
             (AppError::Unsupported("x".into()), 415),

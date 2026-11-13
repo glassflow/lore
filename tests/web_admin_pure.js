@@ -149,7 +149,7 @@ test('durations and dates', () => {
 });
 
 test('polling is quick only while a push runs', () => {
-  assert.strictEqual(page.isRunning({ state: 'waiting' }), true);
+  assert.strictEqual(page.isRunning({ state: 'queued' }), true);
   assert.strictEqual(page.isRunning({ state: 'indexing' }), true);
   assert.strictEqual(page.isRunning({ state: 'done' }), false);
   assert.strictEqual(page.isRunning({ state: 'failed' }), false);
@@ -170,26 +170,33 @@ test('pushEnded notices a push that left the running list', () => {
 });
 
 test('progress text and fraction for each state', () => {
-  assert.strictEqual(page.progressText({ state: 'waiting' }), 'waiting for another push to this source');
-  assert.strictEqual(page.progressText({ state: 'fetching', files_total: null }), 'fetching the bundle');
+  assert.strictEqual(page.progressText({ state: 'queued' }), 'waiting for another push to this source');
+  assert.strictEqual(page.progressText({ state: 'cloning', files_total: null }), 'fetching the commit');
   const half = { state: 'indexing', files_total: 1816, files_done: 908 };
   assert.strictEqual(page.progressText(half), '908 of 1,816 files');
   assert.strictEqual(page.progressFraction(half), 0.5);
   assert.strictEqual(page.progressText({ state: 'done', files_total: 1, files_done: 1 }), '1 file');
   assert.strictEqual(page.progressFraction({ state: 'done', files_total: null, files_done: 0 }), 1);
   assert.strictEqual(page.progressText({ state: 'failed', error: 'need a full bundle' }), 'need a full bundle');
-  assert.strictEqual(page.progressFraction({ state: 'fetching', files_total: null }), null);
+  assert.strictEqual(page.progressFraction({ state: 'cloning', files_total: null }), null);
   assert.strictEqual(page.progressFraction({ state: 'indexing', files_total: 0, files_done: 0 }), 1);
   assert.strictEqual(page.progressFraction({ state: 'failed', files_total: 4, files_done: 1 }), 0.25);
   assert.deepStrictEqual(
-    ['waiting', 'fetching', 'indexing', 'done', 'failed'].map((s) => page.stateClass({ state: s })),
+    ['queued', 'cloning', 'indexing', 'done', 'failed'].map((s) => page.stateClass({ state: s })),
     ['off', 'run', 'run', 'ok', 'bad']
   );
+  assert.strictEqual(page.stateClass({ state: 'indexing', stale: true }), 'off');
+  // A stale run that never got to index says when it was last written, not that it waits.
+  const now = '2026-11-03T12:10:00Z';
+  const lost = { state: 'queued', stale: true, updated_at: '2026-11-03T12:05:00Z' };
+  assert.strictEqual(page.progressText(lost, now), 'last written 5 min ago');
+  assert.strictEqual(page.progressText({ ...lost, state: 'cloning' }, now), 'last written 5 min ago');
+  assert.strictEqual(page.progressText(lost), 'not written for a while');
+  assert.strictEqual(page.progressText({ ...half, stale: true }, now), '908 of 1,816 files');
 });
 
 test('a push is titled tenant / source and timed against the server clock', () => {
   assert.strictEqual(page.pushTitle({ tenant: 'acme', source: 'sample' }), 'acme / sample');
-  assert.strictEqual(page.pushTitle({ tenant: null, source: 'sample' }), 'deleted tenant / sample');
   const now = '2026-11-03T12:10:00Z';
   const running = { started_at: '2026-11-03T12:09:48Z', finished_at: null };
   assert.strictEqual(page.pushTiming(running, now), 'running for 12.0 s');

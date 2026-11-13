@@ -44,8 +44,10 @@ async fn fetching_sync_without_push_registration_blocks_both_deletes(pool: PgPoo
             > 0
     );
     assert!(
-        state.pushes.snapshot().running.is_empty(),
-        "fetch has not registered indexing"
+        !lore::repo::progress::source_has_live_run(&pool, source.id)
+            .await
+            .unwrap(),
+        "fetch has not recorded a run"
     );
     for path in [
         format!("/v1/admin/sources/{}", source.id),
