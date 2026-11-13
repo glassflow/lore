@@ -11,6 +11,7 @@ use crate::config::{Config, EmbedderKind};
 pub mod download;
 pub mod fastembed;
 pub mod hash;
+pub mod threads;
 
 pub use self::download::Download;
 pub use self::fastembed::{FastEmbedder, fetch_model};
@@ -37,7 +38,10 @@ pub fn from_config(cfg: &Config) -> Result<Arc<dyn Embedder>> {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("creating model directory {}", dir.display()))?;
             let download = Download::new(Duration::from_secs(cfg.model_download_timeout_secs));
-            Ok(Arc::new(FastEmbedder::with_download(&dir, &download)?))
+            let threads = threads::embed_threads(cfg.embed_threads);
+            Ok(Arc::new(FastEmbedder::with_download(
+                &dir, &download, threads,
+            )?))
         }
     }
 }

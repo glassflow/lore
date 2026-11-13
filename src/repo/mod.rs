@@ -20,19 +20,21 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::chunk::{CHUNKER_VERSION, Language, chunk_file, language_for};
+use crate::config::Config;
+use crate::embed::Embedder;
 use crate::error::AppError;
-use crate::http::AppState;
 use crate::store::{
     IndexStats, NewDocument, PendingEmbeddings, Source, delete_document, document_hash, get_source,
     index_repo_text, list_external_ids, set_indexed_commit,
 };
 
+pub mod lock;
 pub mod progress;
 pub mod sync;
 
@@ -127,6 +129,18 @@ pub struct GitError {
     pub stderr: String,
 }
 
+/// What indexing needs, and nothing more: the database, the configuration, the embedder and the
+/// per-source locks. The server builds one from its `AppState` (`AppState::index_ctx`); `lore
+/// index` builds one without an HTTP server and without a model provider, so the indexing path
+/// can never call an LLM.
+#[derive(Clone)]
+pub struct IndexCtx {
+    pub pool: PgPool,
+    pub config: Arc<Config>,
+    pub embedder: Arc<dyn Embedder>,
+    pub source_locks: Arc<SourceLocks>,
+}
+
 /// One lock per source, so two pushes to the same repo never run at once. lore runs as a single
 /// replica, so an in-process lock is enough. An entry is added the first time a source (one that
 /// exists in the database) is ingested and then reused, so the map holds at most one entry per
@@ -178,6 +192,9 @@ async fn git_env(args: &[&str], envs: &[(&str, &str)]) -> Result<Vec<u8>, GitErr
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_LITERAL_PATHSPECS", "1")
         .env("LC_ALL", "C")
+        // Not for git: the database password and the `lore index` token.
+        .env_remove("LORE_DATABASE_URL")
+        .env_remove("LORE_INDEX_TOKEN")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -319,7 +336,7 @@ pub fn is_full_sha(s: &str) -> bool {
 /// All database changes commit together; errors and cancellation roll them back. The checkout
 /// is live, not part of that transaction: grep/read_file do not share search's snapshot guarantee.
 pub async fn ingest_bundle(
-    state: &AppState,
+    state: &IndexCtx,
     source: &Source,
     bundle: &Path,
     expected_ref: &str,
@@ -364,7 +381,7 @@ fn push_error(e: &IngestError) -> String {
 /// The body of [`ingest_bundle`]: takes the source's lock, then fetches and indexes, reporting
 /// each step to `push`.
 async fn ingest_locked(
-    state: &AppState,
+    state: &IndexCtx,
     source: &Source,
     bundle_arg: &str,
     expected_ref: &str,
@@ -389,10 +406,11 @@ async fn ingest_locked(
 
 /// Indexes `commit`, which the mirror already holds, and records it as the source's indexed
 /// commit. `full` (or a source never indexed before) indexes the whole tree; otherwise only the
-/// diff from the last indexed commit, which is `NeedFull` when the mirror lacks that commit.
-/// The caller holds the source's lock and passes the source as read under it.
+/// diff from the last indexed commit, which is `NeedFull` when the mirror lacks that commit or
+/// when another process moved the indexed commit while this waited for the row lock. The caller
+/// holds the source's lock and passes the source as read under it.
 async fn index_commit(
-    state: &AppState,
+    state: &IndexCtx,
     source: &Source,
     paths: &RepoPaths,
     commit: &str,
@@ -429,15 +447,24 @@ async fn index_commit(
     }
     // NO KEY UPDATE still excludes other pushes and a delete, but not the foreign-key check of a
     // queued push recording its `index_runs` row.
-    let owned: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM sources WHERE id = $1 AND tenant_id = $2 FOR NO KEY UPDATE",
+    let locked: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, indexed_commit FROM sources WHERE id = $1 AND tenant_id = $2
+         FOR NO KEY UPDATE",
     )
     .bind(source.id)
     .bind(source.tenant_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if owned.is_none() {
+    let Some((_, locked_commit)) = locked else {
         return Err(anyhow!("source {} vanished", source.id).into());
+    };
+    // The diff above was computed from `source.indexed_commit`, read under the in-process lock
+    // only. Another process (`lore index`) may have committed another commit since, and the row
+    // lock is the first point where that is excluded. Applying the diff on top of it would keep
+    // files only that commit had, so ask for a full index instead; nothing is written yet.
+    if !full_mode && locked_commit != source.indexed_commit {
+        tx.rollback().await?;
+        return Err(IngestError::NeedFull);
     }
     let mut job = Job {
         state,
@@ -784,7 +811,7 @@ struct DocMetadata<'a> {
 
 /// One ingest run: the counters and the paths seen so far.
 struct Job<'a> {
-    state: &'a AppState,
+    state: &'a IndexCtx,
     tx: Transaction<'static, Postgres>,
     pending: PendingEmbeddings,
     source: &'a Source,

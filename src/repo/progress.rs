@@ -80,6 +80,7 @@ impl Stage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Snapshot {
     stage: Stage,
+    commit: String,
     full: bool,
     files_done: usize,
     files_total: Option<usize>,
@@ -90,9 +91,10 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn queued(full: bool) -> Self {
+    fn queued(commit: &str, full: bool) -> Self {
         Self {
             stage: Stage::Queued,
+            commit: commit.to_string(),
             full,
             files_done: 0,
             files_total: None,
@@ -137,7 +139,7 @@ impl RunWriter {
         commit: &str,
         full: bool,
     ) -> RunHandle {
-        let (tx, rx) = watch::channel(Snapshot::queued(full));
+        let (tx, rx) = watch::channel(Snapshot::queued(commit, full));
         let (inserted_tx, inserted_rx) = oneshot::channel();
         let new = NewRun {
             source_id,
@@ -173,6 +175,18 @@ impl RunHandle {
     /// The source's lock is held: the commit is being fetched.
     pub fn cloning(&self) {
         self.tx.send_modify(|s| s.stage = Stage::Cloning);
+    }
+
+    /// The commit is known now. A run that starts before its commit is fetched (`lore index`)
+    /// records the ref it fetches, such as `HEAD`, until this is called.
+    pub fn commit(&self, commit: &str) {
+        self.tx.send_modify(|s| s.commit = commit.to_string());
+    }
+
+    /// Vectors embedded and milliseconds spent embedding so far.
+    pub fn embedding(&self) -> (usize, u64) {
+        let s = self.tx.borrow();
+        (s.chunks_embedded, s.embed_ms)
     }
 
     /// The changes are listed: `files_total` files to index or delete.
@@ -256,7 +270,7 @@ async fn write_run(
             return;
         }
     };
-    let mut written = Snapshot::queued(new.full);
+    let mut written = Snapshot::queued(&new.commit, new.full);
     let mut last_write = Instant::now();
     let mut last_failed = false;
     let mut final_tries = 0;
@@ -351,7 +365,8 @@ async fn store(pool: &PgPool, id: i64, s: &Snapshot) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE index_runs SET stage = $2, \"full\" = $3, files_done = $4, files_total = $5,
            chunks = $6, chunks_embedded = $7, embed_ms = $8, error = $9, updated_at = now(),
-           finished_at = CASE WHEN $10 THEN COALESCE(finished_at, now()) END
+           finished_at = CASE WHEN $10 THEN COALESCE(finished_at, now()) END,
+           commit = $11
          WHERE id = $1",
     )
     .bind(id)
@@ -364,6 +379,7 @@ async fn store(pool: &PgPool, id: i64, s: &Snapshot) -> sqlx::Result<()> {
     .bind(i64::try_from(s.embed_ms).unwrap_or(i64::MAX))
     .bind(s.error.as_deref())
     .bind(s.stage.is_terminal())
+    .bind(&s.commit)
     .execute(pool)
     .await?;
     Ok(())
