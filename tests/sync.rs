@@ -194,11 +194,14 @@ async fn sync_indexes_the_remote_then_only_what_changed(pool: PgPool) {
     assert_eq!(rebuilt["up_to_date"], true);
     assert_eq!(rebuilt["adopted"], true);
     assert!(repo_dir.join("checkout/README.md").is_file());
-    // Only the mirror lost, the checkout kept.
+    // Only the mirror lost, the checkout kept (and damaged): the checkout is rebuilt from the
+    // new mirror.
     std::fs::remove_dir_all(repo_dir.join("mirror.git")).unwrap();
+    std::fs::remove_file(repo_dir.join("checkout/README.md")).unwrap();
     let rebuilt = sync_ok(&env, id).await;
     assert_eq!(rebuilt["up_to_date"], true);
     assert_eq!(rebuilt["adopted"], true);
+    assert!(repo_dir.join("checkout/README.md").is_file());
     assert!(repo_dir.join("mirror.git/HEAD").is_file());
 
     std::fs::write(remote.path().join("NOTES.md"), "# Notes\n\nSync works.\n").unwrap();
