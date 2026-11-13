@@ -1,4 +1,5 @@
-//! The CLI side of lore: commands that talk to a server over HTTP.
+//! The CLI side of lore: commands that talk to a server over HTTP, and `lore index`, which talks
+//! to the database itself.
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -7,6 +8,7 @@ use serde::Serialize;
 pub mod ask;
 pub mod client;
 pub mod doc;
+pub mod index;
 pub mod otlp;
 pub mod repo;
 pub mod search;
@@ -14,6 +16,7 @@ pub mod search;
 pub use ask::{AskArgs, run_ask};
 pub use client::{Auth, Client};
 pub use doc::{DocCommand, run_doc};
+pub use index::{IndexArgs, run_index};
 pub use otlp::{OtlpCommand, run_otlp};
 pub use repo::{RepoCommand, run_repo};
 pub use search::{SearchArgs, run_search};

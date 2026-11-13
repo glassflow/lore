@@ -186,7 +186,8 @@ pub async fn put_bundle(
     // The ingest runs in its own task: if the client disconnects, it still finishes instead of
     // stopping halfway. The temp file goes with the task.
     let task = tokio::spawn(async move {
-        let report = ingest_bundle(&state, &source, &upload, &query.sha, query.full).await;
+        let report =
+            ingest_bundle(&state.index_ctx(), &source, &upload, &query.sha, query.full).await;
         drop(upload);
         report
     });

@@ -139,6 +139,44 @@ Two ways to sync without anyone calling the route:
 - **Poller.** With `LORE_SYNC_INTERVAL_SECS` set, the server checks every repo that has a remote at start and then every interval. Repos sync independently, so an unreachable remote cannot hold up the others. Each repo has at most one running poll; a repo already pushing or syncing skips that tick instead of queuing duplicate work. A default-branch push is picked up on the next available tick, plus fetch and indexing time.
 - **GitHub webhook.** Set `LORE_GITHUB_WEBHOOK_SECRET`, then in the GitHub repository's settings add a webhook with payload URL `<LORE_URL>/v1/webhooks/github`, content type `application/json`, the same secret, and the `push` event. A push to the default branch syncs every repo, of any tenant, whose `remote_url` is that repository (`clone_url` or `html_url`, compared without case, a trailing `/` or `.git`); the answer is 202 `{"queued": n}` and the sync runs in the background, so the change is searchable seconds later. The route needs no API key: a delivery whose `X-Hub-Signature-256` is not the HMAC-SHA256 of the body under the secret is a 401, and a valid one can only start fetches from remotes tenants configured. Pushes to other branches, deleted branches and other events are accepted and ignored, `ping` answers 200. Without the secret the route is a 404.
 
+## Index a repo from a job
+
+`lore index` fetches one repo and indexes it straight into Postgres, then exits. It needs no running server, which makes it fit for a Kubernetes Job or a cron run. It indexes the whole tree of the remote's default branch (`HEAD`) exactly as `lore repo push --full` would for that commit: the same chunks, document hashes, search results, embedding cache behaviour and `indexed_commit`, and the same checkout on its data dir for deep answers. It is not incremental: it reads the whole tree every time and only embeds text it has no vector for.
+
+```bash
+export LORE_DATABASE_URL=postgres://lore:...@db/lore
+export LORE_INDEX_TOKEN=...        # only for a private remote
+lore index --tenant <tenant id> --repo <source id> --remote https://github.com/acme/app.git
+# {"commit":"3f2a...","files_indexed":212,"files_unchanged":0,"files_skipped":4,"files_deleted":0,"chunks":1480,"chunks_embedded":1480,"embed_ms":61234,"full":true}
+```
+
+| Flag | Meaning |
+|---|---|
+| `--tenant` | The tenant id (uuid) that owns the repo |
+| `--repo` | The repo source id (uuid), made earlier with `POST /v1/repos` |
+| `--remote` | The `https://` remote, without a user or password (the same rule as `remote_url`) |
+
+| Variable | Meaning |
+|---|---|
+| `LORE_DATABASE_URL` | The Postgres DSN (required). Migrations are applied first, as `lore serve` does |
+| `LORE_INDEX_TOKEN` | A git token for a private remote, sent as basic auth (`x-access-token:<token>`). Only ever read from the environment: there is no flag for it, it is not put in the URL or git's arguments, and it is scrubbed from every message the command prints, logs or records |
+| `LORE_EMBEDDER`, `LORE_EMBEDDING_CACHE`, `LORE_DATA_DIR`, ... | Read as the server reads them, see [the configuration](configuration.md). `lore index` makes no LLM or other model calls except the local embedder |
+| `LORE_EMBED_THREADS` | ONNX threads of the embedder. Unset, it follows the container CPU limit (cgroup v2 `cpu.max`, else cgroup v1 CFS quota and period), rounded up and at least 1, and without a limit the available cores |
+
+The repo must belong to the tenant: a source of another tenant, a source that does not exist and a tenant that does not exist are all the same error and nothing is written. Only that tenant's rows are touched.
+
+The run shows in `index_runs` like any index run, so `GET /v1/repos/{id}/progress` and the admin page show its stage and counts while it works and `done` or `failed` after. A process that is killed leaves a run that goes stale, as for the server.
+
+One `lore index` per repo at a time: it holds a Postgres advisory lock on the repo for the whole run, on a connection of its own. A second one for the same repo does not wait; it exits at once with code 3 (`another index of source <id> is running`). The lock is released when the process ends, however it ends. Other repos are not affected, and the server's own pushes and syncs of that repo still serialise with it on the row lock the index takes while it writes.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Done. One JSON line on stdout |
+| 1 | Failed (bad remote, unknown repo or tenant, fetch or index error). The error is on stderr and the run row is marked `failed` with the scrubbed error. Nothing on stdout |
+| 3 | Another `lore index` of the same repo holds the lock |
+
+Logs go to stderr, so stdout is always either one JSON line or empty.
+
 `lore repo push` keeps working for local repos and CI.
 
 ## Search

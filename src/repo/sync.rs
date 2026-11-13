@@ -26,9 +26,9 @@ use base64::Engine;
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::progress::RunWriter;
+use super::progress::{RunHandle, RunWriter};
 use super::{
-    GitError, IndexReport, IngestError, RepoPaths, ensure_mirror, git_env, index_commit,
+    GitError, IndexCtx, IndexReport, IngestError, RepoPaths, ensure_mirror, git_env, index_commit,
     is_full_sha, push_error, refresh_checkout,
 };
 use crate::error::AppError;
@@ -186,7 +186,7 @@ fn auth_header(token: &str) -> String {
 
 /// `text` with the token, its basic-auth form and the whole header value replaced, so what git
 /// says can be logged and stored. The header goes first: it contains the basic-auth form.
-fn scrub(text: &str, token: &str) -> String {
+pub fn scrub(text: &str, token: &str) -> String {
     let header = auth_header(token);
     let basic = header.trim_start_matches("Authorization: Basic ");
     text.replace(&header, "[token]")
@@ -302,14 +302,15 @@ pub async fn sync_repo(
     if source.kind != "repo" {
         return Err(IngestError::BadRequest("source is not a repo".to_string()).into());
     }
-    let lock = state.source_locks.get(source.id);
+    let ctx = state.index_ctx();
+    let lock = ctx.source_locks.get(source.id);
     let _guard = lock.lock().await;
-    sync_under_lock(state, source, token).await
+    sync_under_lock(&ctx, source, token).await
 }
 
 /// The caller owns this source's lock, including while recording the outcome.
 async fn sync_under_lock(
-    state: &AppState,
+    state: &IndexCtx,
     source: &Source,
     token: Option<String>,
 ) -> Result<SyncReport, SyncError> {
@@ -326,6 +327,81 @@ async fn sync_under_lock(
         tracing::error!(error = %e, source_id = %source.id, "recording a sync failed");
     }
     result
+}
+
+/// What `lore index` did: the report of the full index, and what its embedding cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteIndex {
+    pub report: IndexReport,
+    /// Vectors the embedder computed; the other chunks came from a cache or an earlier chunk.
+    pub chunks_embedded: usize,
+    /// Wall-clock milliseconds spent embedding.
+    pub embed_ms: u64,
+}
+
+/// `lore index`: fetches `url` (checked like a remote URL) and indexes its head into `source`
+/// as a full push of that commit would: the whole tree, vanished files deleted, `indexed_commit`
+/// set, the checkout built. Unlike a sync it records its `index_runs` row before it fetches, so
+/// a long clone shows as `cloning`, and it indexes even when the head is already indexed.
+/// `token` is the remote's token for this call; it is not kept, and never appears in an error.
+/// The caller read `source` for its tenant and holds the cross-process lock; this takes the
+/// in-process one. It makes no model call: [`IndexCtx`] has no provider. The URL is not stored
+/// on the source.
+pub async fn index_remote(
+    ctx: &IndexCtx,
+    source: &Source,
+    url: &str,
+    token: Option<String>,
+) -> Result<RemoteIndex, SyncError> {
+    if source.kind != "repo" {
+        return Err(IngestError::BadRequest("source is not a repo".to_string()).into());
+    }
+    let lock = ctx.source_locks.get(source.id);
+    let _guard = lock.lock().await;
+    let push = RunWriter::new(ctx.pool.clone())
+        .start(source.id, source.tenant_id, "HEAD", true)
+        .await;
+    push.cloning();
+    let result =
+        index_remote_locked(ctx, source, url, token.filter(|t| !t.is_empty()), &push).await;
+    let error = result.as_ref().err().map(admin_error);
+    match &result {
+        Ok(done) => push.done(&done.report).await,
+        Err(_) => push.failed(error.as_deref().unwrap_or_default()).await,
+    }
+    let commit = result
+        .as_ref()
+        .ok()
+        .map(|r| r.report.indexed_commit.as_str());
+    if let Err(e) = record_sync(&ctx.pool, source.id, commit, error.as_deref()).await {
+        tracing::error!(error = %e, source_id = %source.id, "recording an index failed");
+    }
+    result
+}
+
+async fn index_remote_locked(
+    ctx: &IndexCtx,
+    source: &Source,
+    url: &str,
+    token: Option<String>,
+    push: &RunHandle,
+) -> Result<RemoteIndex, SyncError> {
+    let allow_file = ctx.config.sync_allow_file_remotes;
+    check_remote_url(url, allow_file).map_err(SyncError::Fetch)?;
+    let source = get_source(&ctx.pool, source.tenant_id, source.id)
+        .await?
+        .ok_or_else(|| anyhow!("source {} vanished", source.id))?;
+    let paths = RepoPaths::new(&ctx.config.data_dir, source.id)?;
+    ensure_mirror(&paths).await?;
+    let head = fetch_remote(&paths, url, token.as_deref(), allow_file, false).await?;
+    push.commit(&head);
+    let report = index_commit(ctx, &source, &paths, &head, true, push).await?;
+    let (chunks_embedded, embed_ms) = push.embedding();
+    Ok(RemoteIndex {
+        report,
+        chunks_embedded,
+        embed_ms,
+    })
 }
 
 /// Poll each configured remote independently. At most one poll per source can run, and a busy
@@ -362,7 +438,7 @@ pub async fn poll_repos(
             let Ok(guard) = state.source_locks.get(source.id).try_lock_owned() else {
                 continue;
             };
-            let state = state.clone();
+            let state = state.index_ctx();
             jobs.spawn(async move {
                 let _guard = guard;
                 match sync_under_lock(&state, &source, None).await {
@@ -383,7 +459,7 @@ pub async fn poll_repos(
 }
 
 async fn sync_locked(
-    state: &AppState,
+    state: &IndexCtx,
     source: &Source,
     token: Option<String>,
 ) -> Result<SyncReport, SyncError> {

@@ -45,6 +45,18 @@ pub struct AppState {
     pub deep_guard: Arc<DeepGuard>,
 }
 
+impl AppState {
+    /// The part of the state indexing uses (no model provider, no deep-mode guard).
+    pub fn index_ctx(&self) -> crate::repo::IndexCtx {
+        crate::repo::IndexCtx {
+            pool: self.pool.clone(),
+            config: self.config.clone(),
+            embedder: self.embedder.clone(),
+            source_locks: self.source_locks.clone(),
+        }
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     // The limit is on the bundle route only: other routes keep axum's own defaults.
     let bundle_limit = usize::try_from(state.config.max_bundle_bytes).unwrap_or(usize::MAX);

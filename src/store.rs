@@ -20,6 +20,7 @@ use crate::config::EmbeddingCache;
 use crate::embed::{DIM, embed_documents_async};
 use crate::error::AppError;
 use crate::http::AppState;
+use crate::repo::IndexCtx;
 use crate::sessions::is_pending;
 
 const SOURCE_KINDS: [&str; 3] = ["repo", "traces", "documents"];
@@ -562,7 +563,7 @@ impl PendingEmbeddings {
 }
 
 fn cache_keys(
-    state: &AppState,
+    state: &IndexCtx,
     tenant_id: Uuid,
     title: &str,
     chunks: &[Chunk],
@@ -658,10 +659,11 @@ pub async fn index_text_with_stats(
     if source.tenant_id != tenant_id || doc.tenant_id != tenant_id || doc.source_id != source.id {
         bail!("document does not belong to the source and tenant");
     }
-    let keys = cache_keys(state, tenant_id, title_for_embed, &chunks);
-    let cached = cached_embeddings(&state.pool, keys.as_deref().unwrap_or_default()).await?;
+    let ctx = state.index_ctx();
+    let keys = cache_keys(&ctx, tenant_id, title_for_embed, &chunks);
+    let cached = cached_embeddings(&ctx.pool, keys.as_deref().unwrap_or_default()).await?;
     let stored = stored_embeddings(
-        &state.pool,
+        &ctx.pool,
         tenant_id,
         source.id,
         &doc.external_id,
@@ -669,19 +671,19 @@ pub async fn index_text_with_stats(
     )
     .await?;
     let (indexed, stats, pending) =
-        prepare_chunks(state, chunks, title_for_embed, stored, keys, cached).await?;
-    let mut tx = state.pool.begin().await?;
+        prepare_chunks(&ctx, chunks, title_for_embed, stored, keys, cached).await?;
+    let mut tx = ctx.pool.begin().await?;
     let document_id = upsert_document(&mut tx, &doc).await?;
     replace_chunks(&mut tx, tenant_id, document_id, &indexed).await?;
     tx.commit().await?;
-    pending.publish(&state.pool).await;
+    pending.publish(&ctx.pool).await;
     Ok(stats)
 }
 
 /// Repo pushes keep every changed document in the same transaction. Cache and document reads
 /// use that connection; fresh vectors are staged until the entire push commits.
 pub(crate) async fn index_repo_text(
-    state: &AppState,
+    state: &IndexCtx,
     tx: &mut Transaction<'_, Postgres>,
     pending: &mut PendingEmbeddings,
     doc: NewDocument,
@@ -706,7 +708,7 @@ pub(crate) async fn index_repo_text(
 }
 
 async fn prepare_chunks(
-    state: &AppState,
+    state: &IndexCtx,
     chunks: Vec<Chunk>,
     title_for_embed: &str,
     stored: HashMap<String, Vec<f32>>,

@@ -228,6 +228,37 @@ async fn sync_indexes_the_remote_then_only_what_changed(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn a_sync_records_its_index_run_as_done(pool: PgPool) {
+    let env = env(pool.clone()).await;
+    let remote = fixture_repo();
+    let id = create_ok(&env, "sample", &file_url(remote.path())).await;
+    sync_ok(&env, id).await;
+
+    let (stage, commit, error): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT stage, commit, error FROM index_runs WHERE source_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (stage.as_str(), commit.as_str(), error),
+        ("done", head(&remote).as_str(), None)
+    );
+    let (status, run) = send(
+        &env.router,
+        "GET",
+        &format!("/v1/repos/{id}/progress"),
+        &env.key,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["stage"], "done", "{run}");
+    assert_eq!(run["commit"], head(&remote).as_str());
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn an_unreachable_remote_is_a_502_and_shows_on_the_admin_page(pool: PgPool) {
     let env = env(pool.clone()).await;
     let remote = fixture_repo();

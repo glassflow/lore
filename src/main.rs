@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lore::cli::{AdminCommand, AskArgs, Client, DocCommand, OtlpCommand, RepoCommand, SearchArgs};
+use lore::cli::{
+    AdminCommand, AskArgs, Client, DocCommand, IndexArgs, OtlpCommand, RepoCommand, SearchArgs,
+};
 use lore::config::{Config, LogFormat};
 use lore::http::{AppState, router};
 use std::sync::Arc;
@@ -62,6 +64,9 @@ enum Command {
         #[command(subcommand)]
         command: DocCommand,
     },
+    /// Clone or fetch one repo, index it into Postgres like a full push, and exit (no server;
+    /// reads LORE_DATABASE_URL and LORE_INDEX_TOKEN)
+    Index(IndexArgs),
     /// Search the tenant's indexed code, docs, sessions and notes (needs an API key)
     Search(SearchArgs),
     /// Ask a question and get an answer with citations (needs an API key)
@@ -93,6 +98,12 @@ async fn main() -> Result<()> {
             let snapshot = lore::embed::fetch_model(&dir, &download)?;
             println!("{}", snapshot.display());
             Ok(())
+        }
+        Command::Index(args) => {
+            let config = Config::from_env()?;
+            // stdout carries the one result line, so logs go to stderr.
+            init_tracing_to(&config, true)?;
+            std::process::exit(lore::cli::run_index(config, args).await);
         }
         Command::Admin { command } => {
             let client = Client::new(&cli.url, cli.key, cli.admin_token)?;
@@ -126,12 +137,18 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing(config: &Config) -> Result<()> {
+    init_tracing_to(config, false)
+}
+
+fn init_tracing_to(config: &Config, stderr: bool) -> Result<()> {
     let filter = EnvFilter::try_new(&config.log)
         .with_context(|| format!("invalid LORE_LOG filter {:?}", config.log))?;
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    match config.log_format {
-        LogFormat::Text => builder.init(),
-        LogFormat::Json => builder.json().init(),
+    match (config.log_format, stderr) {
+        (LogFormat::Text, false) => builder.init(),
+        (LogFormat::Json, false) => builder.json().init(),
+        (LogFormat::Text, true) => builder.with_writer(std::io::stderr).init(),
+        (LogFormat::Json, true) => builder.json().with_writer(std::io::stderr).init(),
     }
     Ok(())
 }
