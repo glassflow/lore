@@ -5,6 +5,7 @@ use std::error::Error as StdError;
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 use crate::auth::{Caller, Scope};
 use crate::error::AppError;
+use crate::http::admin::remove_source;
 use crate::http::{AppJson, AppQuery, AppState};
 use crate::repo::progress::{IndexRun, latest_run};
 use crate::repo::sync::{SyncReport, check_remote_url, remote_urls, set_remote_url};
@@ -248,6 +250,23 @@ pub async fn sync_repo(
         .await
         .map_err(|e| AppError::Internal(anyhow::Error::from(e).context("sync task failed")))??;
     Ok(Json(report))
+}
+
+/// Deletes one of the caller's repos with its documents, chunks, mirror and checkout, exactly as
+/// the admin delete of a source does. A 409 while a run of the repo is live.
+pub async fn delete_repo(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    caller.require(Scope::Ingest)?;
+    // Another tenant's source, or a source that is not a repo, looks like a missing one.
+    let source = get_source(&state.pool, caller.tenant_id, id)
+        .await?
+        .filter(|s| s.kind == "repo")
+        .ok_or(AppError::NotFound)?;
+    remove_source(&state, source.id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The latest index run of the repo, whichever process ran it, with `stale` set when the run
