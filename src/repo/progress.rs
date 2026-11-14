@@ -40,7 +40,6 @@ const FINISH_WAIT: Duration = Duration::from_secs(10);
 /// How often the write of a run's end is tried.
 const FINAL_TRIES: u32 = 3;
 
-/// The run has not ended (`r` is the alias of `index_runs`).
 /// How many runs of one source are kept. A run that is going is never removed; of the others,
 /// the newest ones stay, so the admin page's recent list and a source's latest run are always
 /// there, and the table does not grow with every push forever.
@@ -49,6 +48,7 @@ pub const KEEP_RUNS_PER_SOURCE: i64 = 50;
 /// The longest the prune of a source's old runs may take.
 const PRUNE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The run has not ended (`r` is the alias of `index_runs`).
 const NOT_ENDED: &str = "r.stage NOT IN ('done','failed')";
 /// The run was written in the last 90 seconds. Older and not ended means stale: the process
 /// that ran it is gone.

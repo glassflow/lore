@@ -16,7 +16,7 @@ use common::{
 use lore::embed::{Embedder, HashEmbedder};
 use lore::http::AppState;
 use lore::repo::IndexReport;
-use lore::repo::progress::{KEEP_RUNS_PER_SOURCE, RunWriter};
+use lore::repo::progress::{KEEP_RUNS_PER_SOURCE, RunWriter, prune_runs};
 use lore::store::IndexStats;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -837,4 +837,35 @@ async fn only_the_newest_runs_of_a_source_are_kept(pool: PgPool) {
         "another source was pruned"
     );
     drop((going, lost));
+}
+
+/// A stale run (its process is gone) is old like an ended one, but only by its position: one
+/// among the newest runs stays, and one beyond them goes.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_stale_run_among_the_newest_is_kept(pool: PgPool) {
+    let a = app(pool.clone());
+    let (tenant, _key, source) = tenant_with_repo(&a, "acme").await;
+    let writer = RunWriter::new(pool.clone());
+
+    let lost = writer.start(source, tenant, &"1".repeat(40), false).await;
+    lost.cloning();
+    wait_for_row(&pool, source, |r| r.stage == "cloning").await;
+    sqlx::query("UPDATE index_runs SET updated_at = now() - interval '1 hour' WHERE commit = $1")
+        .bind("1".repeat(40))
+        .execute(&pool)
+        .await
+        .unwrap();
+    writer
+        .start(source, tenant, &"2".repeat(40), false)
+        .await
+        .done(&report(1))
+        .await;
+
+    // Two runs, and room for two: nothing goes, the stale one included.
+    assert_eq!(prune_runs(&pool, source, 2).await.unwrap(), 0);
+    assert_eq!(rows(&pool, source).await.len(), 2);
+    // Room for one: the older run, the stale one, is beyond the newest and goes.
+    assert_eq!(prune_runs(&pool, source, 1).await.unwrap(), 1);
+    assert_eq!(rows(&pool, source).await.len(), 1);
+    drop(lost);
 }
