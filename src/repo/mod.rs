@@ -464,6 +464,10 @@ async fn index_commit(
     // files only that commit had, so ask for a full index instead; nothing is written yet.
     if !full_mode && locked_commit != source.indexed_commit {
         tx.rollback().await?;
+        // The mirror's indexed ref and the checkout already moved to `commit`, ahead of the
+        // database. Put them back to what this run started from, so deep mode keeps reading
+        // what search serves until the full index that follows.
+        restore_indexed(paths, source.indexed_commit.as_deref()).await;
         return Err(IngestError::NeedFull);
     }
     let mut job = Job {
@@ -503,6 +507,23 @@ async fn index_commit(
     job.tx.commit().await?;
     job.pending.publish(&state.pool).await;
     Ok(job.report)
+}
+
+/// Puts the mirror's indexed ref and the checkout back at `previous` (the commit an index run
+/// started from), after the run moved them and then did not index. A failure is only logged: the
+/// full index that follows moves both again.
+async fn restore_indexed(paths: &RepoPaths, previous: Option<&str>) {
+    let Some(previous) = previous else { return };
+    let result = async {
+        paths
+            .mirror_git(&["update-ref", "refs/heads/lore-indexed", previous])
+            .await?;
+        refresh_checkout(paths, previous).await
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(error = %e, commit = previous, "could not put the checkout back after a refused index");
+    }
 }
 
 /// The longest header line accepted: a ref line is a sha and a ref name.

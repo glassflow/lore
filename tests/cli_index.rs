@@ -7,6 +7,8 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router;
 use common::{
@@ -751,6 +753,24 @@ async fn a_push_that_queued_behind_an_index_does_not_apply_its_stale_diff(pool: 
     assert!(docs.contains(&"ghost.md".to_string()), "{docs:?}");
     assert!(!docs.contains(&"c.md".to_string()), "{docs:?}");
 
+    // The refused push had already moved the server's indexed ref and checkout to C. They are
+    // put back to A, where this push started, and are not left ahead of the database.
+    let server_repo = env
+        ._server_data
+        .path()
+        .join("repos")
+        .join(source.to_string());
+    let mirror = server_repo.join("mirror.git");
+    assert_eq!(
+        git(&mirror, &["rev-parse", "refs/heads/lore-indexed"]).trim(),
+        a
+    );
+    assert!(
+        !server_repo.join("checkout/c.md").exists(),
+        "the checkout is still at the refused commit"
+    );
+    assert!(server_repo.join("checkout/README.md").exists());
+
     // The client's answer to the 409, a full push of C, lands cleanly and drops ghost.md.
     let (status, body) = put_bundle(
         &env.router,
@@ -824,4 +844,110 @@ async fn the_lock_connection_is_kept_alive_while_held_and_freed_on_release(pool:
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(freed, "a dropped lock is freed");
+}
+
+/// A TCP forwarder to the test database whose traffic can be frozen: the connection stays open
+/// and nothing moves on it, like a half-open connection behind a NAT that lost its state.
+struct Proxy {
+    /// The DSN of the database through the proxy.
+    dsn: String,
+    frozen: Arc<AtomicBool>,
+}
+
+async fn pump(
+    mut from: impl tokio::io::AsyncRead + Unpin,
+    mut to: impl tokio::io::AsyncWrite + Unpin,
+    frozen: Arc<AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        while frozen.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if to.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn proxy(pool: &PgPool) -> Proxy {
+    use tokio::net::{TcpListener, TcpStream};
+    let direct = reqwest::Url::parse(&dsn(pool)).unwrap();
+    let upstream = format!(
+        "{}:{}",
+        direct.host_str().unwrap(),
+        direct.port().unwrap_or(5432)
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let frozen = Arc::new(AtomicBool::new(false));
+    let flag = frozen.clone();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = TcpStream::connect(&upstream).await else {
+                continue;
+            };
+            let (client_read, client_write) = client.into_split();
+            let (server_read, server_write) = server.into_split();
+            tokio::spawn(pump(client_read, server_write, flag.clone()));
+            tokio::spawn(pump(server_read, client_write, flag.clone()));
+        }
+    });
+    let mut via = direct;
+    via.set_host(Some("127.0.0.1")).unwrap();
+    via.set_port(Some(port)).unwrap();
+    Proxy {
+        dsn: via.to_string(),
+        frozen,
+    }
+}
+
+/// On a half-open connection a query never gets an answer. Releasing the lock, which sends an
+/// unlock, must not hang: each step has a timeout.
+#[sqlx::test(migrations = "./migrations")]
+async fn releasing_a_lock_on_a_dead_connection_returns(pool: PgPool) {
+    let proxy = proxy(&pool).await;
+    let source = Uuid::new_v4();
+    let held = SourceAdvisoryLock::try_acquire_timed(
+        &proxy.dsn,
+        source,
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_millis(300),
+    )
+    .await
+    .unwrap()
+    .expect("the lock is free");
+
+    proxy.frozen.store(true, Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), held.release())
+        .await
+        .expect("release returned although the connection never answers");
+}
+
+/// The same for the keepalive: a ping that gets no answer must not keep `release` waiting.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_keepalive_on_a_dead_connection_does_not_block_the_release(pool: PgPool) {
+    let proxy = proxy(&pool).await;
+    let source = Uuid::new_v4();
+    let held = SourceAdvisoryLock::try_acquire_timed(
+        &proxy.dsn,
+        source,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(300),
+    )
+    .await
+    .unwrap()
+    .expect("the lock is free");
+
+    proxy.frozen.store(true, Ordering::SeqCst);
+    // A ping is now on the wire and unanswered.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), held.release())
+        .await
+        .expect("release returned although a ping is unanswered");
 }
