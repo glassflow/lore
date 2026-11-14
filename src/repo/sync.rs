@@ -29,8 +29,8 @@ use uuid::Uuid;
 
 use super::progress::{RunHandle, RunWriter};
 use super::{
-    GitError, IndexCtx, IndexReport, IngestError, RepoPaths, ensure_mirror, git_env, index_commit,
-    is_full_sha, push_error, refresh_checkout,
+    GitError, IndexCtx, IndexReport, IngestError, RepoPaths, checkout_commit, ensure_mirror,
+    git_env, index_commit, is_full_sha, push_error, refresh_checkout,
 };
 use crate::error::AppError;
 use crate::http::AppState;
@@ -504,10 +504,20 @@ async fn sync_locked(
 
     if source.indexed_commit.as_deref() == Some(head.as_str()) {
         // A lost data volume, or an index made elsewhere, leaves the index intact but no
-        // checkout for deep mode.
-        if !held_mirror || !held_checkout {
+        // checkout for deep mode; a Job that indexed a newer commit than the one this checkout
+        // is at leaves it stale. The checkout's own ref says which commit it is at.
+        if !held_mirror
+            || !held_checkout
+            || checkout_commit(&paths).await.as_deref() != Some(head.as_str())
+        {
             refresh_checkout(&paths, &head).await?;
         }
+        // The mirror keeps a ref at the indexed commit, as `index_commit` leaves it, so the next
+        // fetch tells the remote what it already has instead of downloading all history again.
+        paths
+            .mirror_git(&["update-ref", "refs/heads/lore-indexed", &head])
+            .await
+            .map_err(anyhow::Error::from)?;
         if unheld {
             tracing::info!(
                 source_id = %source.id,

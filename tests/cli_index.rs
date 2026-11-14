@@ -946,6 +946,81 @@ async fn a_sync_adopts_what_a_job_indexed_and_indexes_nothing(pool: PgPool) {
     assert_eq!(chunk_rows(&pool, source).await, before);
 }
 
+/// The server holds commit A and a Job then indexes B: the sync finds the index at the remote's
+/// head already, but its checkout is still at A, so it rebuilds the checkout at B (the stale
+/// checkout the review found), and it leaves the mirror a ref at B so the next fetch negotiates.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_sync_rebuilds_a_checkout_that_a_job_left_behind(pool: PgPool) {
+    let env = Env::new(pool.clone());
+    let (tenant, key, source) = env.tenant("jobs").await;
+    let repo = fixture_repo();
+    let remote = file_url(repo.path());
+    env.set_remote(&key, &remote).await;
+    let first = env.sync(&key, source).await;
+    assert_eq!(first["up_to_date"], false, "{first}");
+
+    // The remote moves to B and the Job (not the server) indexes it.
+    std::fs::write(repo.path().join("NOTES.md"), "# Notes\n\nOnly in B.\n").unwrap();
+    commit_all(&repo, "b");
+    let b = head(&repo);
+    let done = env.index(tenant, source, &remote).await.json();
+    assert_eq!(done["commit"], b.as_str());
+    let dir = env.server_repo_dir(source);
+    assert!(!dir.join("checkout/NOTES.md").exists(), "still at A");
+
+    let report = env.sync(&key, source).await;
+    assert_eq!(report["up_to_date"], true, "{report}");
+    assert_eq!(report["files_indexed"], 0, "{report}");
+    assert_eq!(report["indexed_commit"], b.as_str());
+    assert_eq!(
+        tree_files(&dir.join("checkout"), None),
+        tree_files(repo.path(), Some(&repo)),
+        "the checkout is at B"
+    );
+    let mirror = dir.join("mirror.git");
+    let mirror_ref = |name: &str| git(&mirror, &["rev-parse", name]).trim().to_string();
+    assert_eq!(mirror_ref("refs/lore/checkout"), b);
+    assert_eq!(mirror_ref("refs/heads/lore-indexed"), b);
+
+    // Settled: the next sync finds the checkout at the head and touches nothing.
+    std::fs::write(dir.join("checkout/NOTES.md"), "edited by hand").unwrap();
+    let again = env.sync(&key, source).await;
+    assert_eq!(again["up_to_date"], true, "{again}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("checkout/NOTES.md")).unwrap(),
+        "edited by hand"
+    );
+}
+
+/// A checkout whose rebuild did not finish has no checkout ref, so the next sync rebuilds it even
+/// though the directory exists and the remote did not move (a failed `read-tree`, a full disk).
+#[sqlx::test(migrations = "./migrations")]
+async fn a_sync_rebuilds_a_checkout_whose_rebuild_never_finished(pool: PgPool) {
+    let env = Env::new(pool.clone());
+    let (_, key, source) = env.tenant("jobs").await;
+    let repo = fixture_repo();
+    env.set_remote(&key, &file_url(repo.path())).await;
+    env.sync(&key, source).await;
+
+    let dir = env.server_repo_dir(source);
+    let mirror = dir.join("mirror.git");
+    git(&mirror, &["update-ref", "-d", "refs/lore/checkout"]);
+    std::fs::remove_file(dir.join("checkout/README.md")).unwrap();
+    std::fs::write(dir.join("checkout/leftover.txt"), "half written").unwrap();
+
+    let report = env.sync(&key, source).await;
+    assert_eq!(report["up_to_date"], true, "{report}");
+    assert_eq!(
+        tree_files(&dir.join("checkout"), None),
+        tree_files(repo.path(), Some(&repo))
+    );
+    assert!(!dir.join("checkout/leftover.txt").exists());
+    assert_eq!(
+        git(&mirror, &["rev-parse", "refs/lore/checkout"]).trim(),
+        head(&repo)
+    );
+}
+
 /// The remote moved on after the Job: the server (empty data dir) fetches the whole history,
 /// indexes only what changed since the Job's commit, builds the checkout and reports adoption.
 #[sqlx::test(migrations = "./migrations")]
