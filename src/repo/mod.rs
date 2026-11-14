@@ -40,6 +40,9 @@ pub mod sync;
 
 use progress::{RunHandle, RunWriter};
 
+/// The mirror ref that names the commit the checkout is at (see `refresh_checkout`).
+const CHECKOUT_REF: &str = "refs/lore/checkout";
+
 /// Files bigger than this are not indexed.
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 
@@ -610,7 +613,15 @@ fn classify_fetch_error(e: GitError) -> IngestError {
 /// Brings the checkout to `commit`. The checkout exists for deep mode (grep and read_file), never
 /// for indexing. `core.symlinks=false` makes git write a symlink as a plain file holding the link
 /// text.
+///
+/// `CHECKOUT_REF` in the mirror records which commit the checkout is at, and it exists only while
+/// the checkout is complete: it is dropped before the work starts and written after the last
+/// step succeeded. So a missing ref, or one that differs from the commit a sync wants, means the
+/// checkout must be rebuilt, whatever the directory looks like.
 async fn refresh_checkout(paths: &RepoPaths, commit: &str) -> Result<(), IngestError> {
+    paths
+        .mirror_git(&["update-ref", "-d", CHECKOUT_REF])
+        .await?;
     let checkout = Path::new(&paths.checkout);
     if !tokio::fs::try_exists(checkout)
         .await
@@ -630,7 +641,20 @@ async fn refresh_checkout(paths: &RepoPaths, commit: &str) -> Result<(), IngestE
         .checkout_git(&["read-tree", "--reset", "-u", commit])
         .await?;
     paths.checkout_git(&["clean", "-fdq"]).await?;
+    paths
+        .mirror_git(&["update-ref", CHECKOUT_REF, commit])
+        .await?;
     Ok(())
+}
+
+/// The commit the checkout is at, or `None` when there is no complete checkout.
+async fn checkout_commit(paths: &RepoPaths) -> Option<String> {
+    let out = paths
+        .mirror_git(&["rev-parse", "--verify", "--quiet", CHECKOUT_REF])
+        .await
+        .ok()?;
+    let commit = String::from_utf8(out).ok()?.trim().to_string();
+    (!commit.is_empty()).then_some(commit)
 }
 
 /// A path and its git file mode in the new commit.

@@ -168,18 +168,41 @@ async fn sync_indexes_the_remote_then_only_what_changed(pool: PgPool) {
     assert_eq!(first["indexed_commit"], head(&remote));
     assert_eq!(first["up_to_date"], false);
     assert_eq!(first["full"], true);
+    // A first sync of a never indexed source is a normal sync, not an adoption.
+    assert_eq!(first["adopted"], false);
     assert_eq!(first["files_indexed"], 6);
     assert_eq!(doc_paths(&pool, id).await.len(), 6);
 
     let again = sync_ok(&env, id).await;
     assert_eq!(again["up_to_date"], true);
+    assert_eq!(again["adopted"], false);
     assert_eq!(again["files_indexed"], 0);
 
-    // A lost data volume: the index is intact, the next sync brings the checkout back.
+    // A lost data volume: the index is intact, the next sync brings the checkout back, and says
+    // it adopted the repo again.
     let repo_dir = env.data.path().join("repos").join(id.to_string());
     std::fs::remove_dir_all(&repo_dir).unwrap();
-    assert_eq!(sync_ok(&env, id).await["up_to_date"], true);
+    let rebuilt = sync_ok(&env, id).await;
+    assert_eq!(rebuilt["up_to_date"], true);
+    assert_eq!(rebuilt["adopted"], true);
     assert!(repo_dir.join("checkout/README.md").is_file());
+    assert_eq!(sync_ok(&env, id).await["adopted"], false);
+
+    // Only the checkout lost, the mirror kept: the checkout is rebuilt all the same.
+    std::fs::remove_dir_all(repo_dir.join("checkout")).unwrap();
+    let rebuilt = sync_ok(&env, id).await;
+    assert_eq!(rebuilt["up_to_date"], true);
+    assert_eq!(rebuilt["adopted"], true);
+    assert!(repo_dir.join("checkout/README.md").is_file());
+    // Only the mirror lost, the checkout kept (and damaged): the checkout is rebuilt from the
+    // new mirror.
+    std::fs::remove_dir_all(repo_dir.join("mirror.git")).unwrap();
+    std::fs::remove_file(repo_dir.join("checkout/README.md")).unwrap();
+    let rebuilt = sync_ok(&env, id).await;
+    assert_eq!(rebuilt["up_to_date"], true);
+    assert_eq!(rebuilt["adopted"], true);
+    assert!(repo_dir.join("checkout/README.md").is_file());
+    assert!(repo_dir.join("mirror.git/HEAD").is_file());
 
     std::fs::write(remote.path().join("NOTES.md"), "# Notes\n\nSync works.\n").unwrap();
     std::fs::remove_file(remote.path().join("scripts/seed.py")).unwrap();
@@ -187,6 +210,7 @@ async fn sync_indexes_the_remote_then_only_what_changed(pool: PgPool) {
     let second = sync_ok(&env, id).await;
     assert_eq!(second["indexed_commit"], head(&remote));
     assert_eq!(second["full"], false);
+    assert_eq!(second["adopted"], false);
     assert_eq!(second["files_indexed"], 1);
     assert_eq!(second["files_deleted"], 1);
     let docs = doc_paths(&pool, id).await;
@@ -310,6 +334,7 @@ async fn a_rewritten_history_is_indexed_correctly(pool: PgPool) {
     let report = sync_ok(&env, id).await;
     assert_eq!(report["indexed_commit"], head(&remote));
     assert_eq!(report["full"], true);
+    assert_eq!(report["adopted"], false);
     let docs = doc_paths(&pool, id).await;
     assert!(docs.contains(&"other.md".to_string()));
     assert!(!docs.contains(&"extra.md".to_string()), "{docs:?}");
@@ -333,6 +358,8 @@ async fn a_lost_mirror_and_rewritten_history_fall_back_to_a_full_index(pool: PgP
     let report = sync_ok(&env, id).await;
     assert_eq!(report["indexed_commit"], head(&remote));
     assert_eq!(report["full"], true);
+    // The data dir was lost too, but a reindex is not an adoption.
+    assert_eq!(report["adopted"], false);
     assert_eq!(report["files_deleted"], 1);
     let docs = doc_paths(&pool, id).await;
     assert_eq!(docs.len(), 5);
