@@ -511,6 +511,13 @@ async fn sync_locked(
             || checkout_commit(&paths).await.as_deref() != Some(head.as_str())
         {
             refresh_checkout(&paths, &head).await?;
+            if !unheld {
+                tracing::info!(
+                    source_id = %source.id,
+                    commit = %head,
+                    "sync rebuilt a stale checkout"
+                );
+            }
         }
         // The mirror keeps a ref at the indexed commit, as `index_commit` leaves it, so the next
         // fetch tells the remote what it already has instead of downloading all history again.
