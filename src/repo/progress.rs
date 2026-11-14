@@ -40,6 +40,14 @@ const FINISH_WAIT: Duration = Duration::from_secs(10);
 /// How often the write of a run's end is tried.
 const FINAL_TRIES: u32 = 3;
 
+/// How many runs of one source are kept. A run that is going is never removed; of the others,
+/// the newest ones stay, so the admin page's recent list and a source's latest run are always
+/// there, and the table does not grow with every push forever.
+pub const KEEP_RUNS_PER_SOURCE: i64 = 50;
+
+/// The longest the prune of a source's old runs may take.
+const PRUNE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The run has not ended (`r` is the alias of `index_runs`).
 const NOT_ENDED: &str = "r.stage NOT IN ('done','failed')";
 /// The run was written in the last 90 seconds. Older and not ended means stale: the process
@@ -270,6 +278,20 @@ async fn write_run(
             return;
         }
     };
+    // Old rows go now, after the new one exists and the push has stopped waiting for it. A
+    // failure only leaves them for the next run.
+    match tokio::time::timeout(
+        PRUNE_TIMEOUT,
+        prune_runs(&writer.pool, new.source_id, KEEP_RUNS_PER_SOURCE),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, source = %new.source_id, "could not prune old index runs");
+        }
+        Err(_) => tracing::warn!(source = %new.source_id, "pruning old index runs took too long"),
+    }
     let mut written = Snapshot::queued(&new.commit, new.full);
     let mut last_write = Instant::now();
     let mut last_failed = false;
@@ -353,6 +375,26 @@ async fn insert_run(pool: &PgPool, new: &NewRun) -> sqlx::Result<i64> {
     .await?;
     tx.commit().await?;
     Ok(id)
+}
+
+/// Deletes the source's runs beyond the newest `keep`, except runs that are going (not ended and
+/// not stale). A stale run, whose process is gone, counts as old like an ended one. Returns how
+/// many rows went.
+pub async fn prune_runs(pool: &PgPool, source_id: Uuid, keep: i64) -> sqlx::Result<u64> {
+    let done = sqlx::query(&format!(
+        "DELETE FROM index_runs r
+         WHERE r.source_id = $1
+           AND NOT ({NOT_ENDED} AND {FRESH})
+           AND r.id < COALESCE(
+             (SELECT min(k.id) FROM (SELECT id FROM index_runs
+                                     WHERE source_id = $1 ORDER BY id DESC LIMIT $2) k),
+             0)"
+    ))
+    .bind(source_id)
+    .bind(keep)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
 }
 
 fn db_int(n: usize) -> i32 {

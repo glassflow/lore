@@ -16,7 +16,7 @@ use common::{
 use lore::embed::{Embedder, HashEmbedder};
 use lore::http::AppState;
 use lore::repo::IndexReport;
-use lore::repo::progress::RunWriter;
+use lore::repo::progress::{KEEP_RUNS_PER_SOURCE, RunWriter, prune_runs};
 use lore::store::IndexStats;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -756,4 +756,116 @@ async fn the_runs_of_a_deleted_source_go_with_it(pool: PgPool) {
     .await;
     assert_eq!(status, 204, "{body}");
     assert!(rows(&pool, source).await.is_empty());
+}
+
+/// Every push adds a row, so the table is cut back: the newest runs of each source stay, and a
+/// run that is going stays however old it is. Another source's runs are not touched.
+#[sqlx::test(migrations = "./migrations")]
+async fn only_the_newest_runs_of_a_source_are_kept(pool: PgPool) {
+    let a = app(pool.clone());
+    let (tenant, key, source) = tenant_with_repo(&a, "acme").await;
+    let (status, other) = create_repo(&a.router, &key, "other").await;
+    assert_eq!(status, 200, "{other}");
+    let other: Uuid = other["id"].as_str().unwrap().parse().unwrap();
+    let writer = RunWriter::new(pool.clone());
+
+    // The oldest run is still going; the second one's process died.
+    let going = writer.start(source, tenant, &"1".repeat(40), false).await;
+    going.cloning();
+    let lost = writer.start(source, tenant, &"2".repeat(40), false).await;
+    lost.cloning();
+    wait_for_row(&pool, source, |r| r.stage == "cloning").await;
+    sqlx::query("UPDATE index_runs SET updated_at = now() - interval '1 hour' WHERE commit = $1")
+        .bind("2".repeat(40))
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        writer
+            .start(other, tenant, &"9".repeat(40), false)
+            .await
+            .done(&report(1))
+            .await;
+    }
+
+    let keep = usize::try_from(KEEP_RUNS_PER_SOURCE).unwrap();
+    for i in 0..keep + 5 {
+        let commit = format!("{i:040}");
+        writer
+            .start(source, tenant, &commit, false)
+            .await
+            .done(&report(1))
+            .await;
+    }
+
+    // The pruning runs behind each start; wait until it has caught up: the newest `keep` runs,
+    // plus the one that is going.
+    let start = Instant::now();
+    let left = loop {
+        let left = rows(&pool, source).await;
+        if left.len() == keep + 1 || start.elapsed() > Duration::from_secs(10) {
+            break left;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(left.len(), keep + 1, "{left:?}");
+    let commits: Vec<String> =
+        sqlx::query_scalar("SELECT commit FROM index_runs WHERE source_id = $1")
+            .bind(source)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        commits.contains(&"1".repeat(40)),
+        "the running run was pruned"
+    );
+    assert!(
+        !commits.contains(&"2".repeat(40)),
+        "a run nobody writes any more is old like an ended one"
+    );
+    assert!(
+        !commits.contains(&format!("{:040}", 0)),
+        "the oldest ended run is still there"
+    );
+    assert!(
+        commits.contains(&format!("{:040}", keep + 4)),
+        "the newest run is gone"
+    );
+    assert_eq!(
+        rows(&pool, other).await.len(),
+        3,
+        "another source was pruned"
+    );
+    drop((going, lost));
+}
+
+/// A stale run (its process is gone) is old like an ended one, but only by its position: one
+/// among the newest runs stays, and one beyond them goes.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_stale_run_among_the_newest_is_kept(pool: PgPool) {
+    let a = app(pool.clone());
+    let (tenant, _key, source) = tenant_with_repo(&a, "acme").await;
+    let writer = RunWriter::new(pool.clone());
+
+    let lost = writer.start(source, tenant, &"1".repeat(40), false).await;
+    lost.cloning();
+    wait_for_row(&pool, source, |r| r.stage == "cloning").await;
+    sqlx::query("UPDATE index_runs SET updated_at = now() - interval '1 hour' WHERE commit = $1")
+        .bind("1".repeat(40))
+        .execute(&pool)
+        .await
+        .unwrap();
+    writer
+        .start(source, tenant, &"2".repeat(40), false)
+        .await
+        .done(&report(1))
+        .await;
+
+    // Two runs, and room for two: nothing goes, the stale one included.
+    assert_eq!(prune_runs(&pool, source, 2).await.unwrap(), 0);
+    assert_eq!(rows(&pool, source).await.len(), 2);
+    // Room for one: the older run, the stale one, is beyond the newest and goes.
+    assert_eq!(prune_runs(&pool, source, 1).await.unwrap(), 1);
+    assert_eq!(rows(&pool, source).await.len(), 1);
+    drop(lost);
 }
