@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use axum::Router;
 use common::{
     bundle, commit_all, create_repo, create_tenant_key, fixture_repo, git, head, put_bundle, send,
-    test_router, test_state,
+    test_router, test_state_with,
 };
 use lore::repo::lock::SourceAdvisoryLock;
 use serde_json::Value;
@@ -53,8 +53,8 @@ struct Env {
     pool: PgPool,
     /// The server side: tenants, pushes and searches go through this router.
     router: Router,
-    /// The server's data dir (kept alive).
-    _server_data: TempDir,
+    /// The server's data dir (kept alive): empty until the server syncs or pushes something.
+    server_data: TempDir,
     /// The Job's data dir: its mirror and checkout.
     job_data: TempDir,
 }
@@ -62,11 +62,15 @@ struct Env {
 impl Env {
     fn new(pool: PgPool) -> Env {
         let server_data = tempfile::tempdir().unwrap();
-        let router = test_router(test_state(pool.clone(), server_data.path()));
+        // File remotes are allowed on the server too, as on the Job, so a test can sync one.
+        let state = test_state_with(pool.clone(), server_data.path(), |c| {
+            c.sync_allow_file_remotes = true;
+        });
+        let router = test_router(state);
         Env {
             pool,
             router,
-            _server_data: server_data,
+            server_data,
             job_data: tempfile::tempdir().unwrap(),
         }
     }
@@ -105,6 +109,37 @@ impl Env {
 
     async fn index(&self, tenant: Uuid, source: Uuid, remote: &str) -> Run {
         run(self.command(tenant, source, remote)).await
+    }
+
+    /// Gives the repo source `sample` a `remote_url`, as `POST /v1/repos` does.
+    async fn set_remote(&self, key: &str, remote: &str) {
+        let body = serde_json::json!({ "name": "sample", "remote_url": remote });
+        let (status, repo) = send(
+            &self.router,
+            "POST",
+            "/v1/repos",
+            key,
+            body.to_string().into_bytes(),
+        )
+        .await;
+        assert_eq!(status, 200, "{repo}");
+        assert_eq!(repo["remote_url"], remote);
+    }
+
+    /// `POST /v1/repos/{id}/sync` on the server, whose data dir the Job never touched.
+    async fn sync(&self, key: &str, source: Uuid) -> Value {
+        let uri = format!("/v1/repos/{source}/sync");
+        let (status, report) = send(&self.router, "POST", &uri, key, Vec::new()).await;
+        assert_eq!(status, 200, "{report}");
+        report
+    }
+
+    /// The server's `repos/<source>` directory.
+    fn server_repo_dir(&self, source: Uuid) -> std::path::PathBuf {
+        self.server_data
+            .path()
+            .join("repos")
+            .join(source.to_string())
     }
 }
 
@@ -754,7 +789,7 @@ async fn a_push_refused_behind_an_index(pool: PgPool, mirror_has_b: bool) {
     wait_for_waiters(&pool, 2).await;
     if mirror_has_b {
         let server_mirror = env
-            ._server_data
+            .server_data
             .path()
             .join("repos")
             .join(source.to_string())
@@ -782,7 +817,7 @@ async fn a_push_refused_behind_an_index(pool: PgPool, mirror_has_b: bool) {
     // put back, and are not left ahead of the database: at B, which the database holds, when the
     // mirror has B, else at A, where this push started.
     let server_repo = env
-        ._server_data
+        .server_data
         .path()
         .join("repos")
         .join(source.to_string());
@@ -982,4 +1017,265 @@ async fn a_keepalive_on_a_dead_connection_does_not_block_the_release(pool: PgPoo
     tokio::time::timeout(std::time::Duration::from_secs(5), held.release())
         .await
         .expect("release returned although a ping is unanswered");
+}
+
+/// Every file of the tree at HEAD of `repo` and of `checkout`, with contents, to compare.
+fn tree_files(root: &Path, git_ls: Option<&TempDir>) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    match git_ls {
+        Some(repo) => {
+            for path in git(repo, &["ls-files"]).lines() {
+                out.push((path.to_string(), std::fs::read(root.join(path)).unwrap()));
+            }
+        }
+        None => {
+            fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        walk(base, &path, out);
+                    } else {
+                        let rel = path.strip_prefix(base).unwrap();
+                        out.push((
+                            rel.to_string_lossy().into_owned(),
+                            std::fs::read(&path).unwrap(),
+                        ));
+                    }
+                }
+            }
+            walk(root, root, &mut out);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The Job indexed the repo; the server (empty data dir) then syncs it: nothing is indexed, the
+/// mirror and the checkout are built, and the sync says it adopted the repo.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_sync_adopts_what_a_job_indexed_and_indexes_nothing(pool: PgPool) {
+    let env = Env::new(pool.clone());
+    let (tenant, key, source) = env.tenant("jobs").await;
+    let repo = fixture_repo();
+    let sha = head(&repo);
+    let remote = file_url(repo.path());
+
+    let done = env.index(tenant, source, &remote).await.json();
+    assert_eq!(done["commit"], sha.as_str());
+    env.set_remote(&key, &remote).await;
+    let before = chunk_rows(&pool, source).await;
+    assert!(before.len() > 3);
+    assert_eq!(runs(&pool, source).await.len(), 1);
+    assert!(
+        !env.server_repo_dir(source).exists(),
+        "the server holds nothing yet"
+    );
+
+    let report = env.sync(&key, source).await;
+    assert_eq!(report["adopted"], true, "{report}");
+    assert_eq!(report["up_to_date"], true, "{report}");
+    assert_eq!(report["full"], false, "{report}");
+    assert_eq!(report["files_indexed"], 0, "{report}");
+    assert_eq!(report["chunks"], 0, "{report}");
+    assert_eq!(report["indexed_commit"], sha.as_str());
+
+    // The server now holds the mirror and a checkout of the indexed commit.
+    let dir = env.server_repo_dir(source);
+    assert!(dir.join("mirror.git/HEAD").is_file());
+    assert!(dir.join("checkout/README.md").is_file());
+    assert_eq!(
+        tree_files(&dir.join("checkout"), None),
+        tree_files(repo.path(), Some(&repo))
+    );
+
+    // The index is exactly what the Job made: every row, every vector, the commit, the runs.
+    assert_eq!(chunk_rows(&pool, source).await, before);
+    assert_eq!(indexed_commit(&pool, source).await, Some(sha.clone()));
+    assert_eq!(
+        runs(&pool, source).await.len(),
+        1,
+        "a sync that adopts adds no run"
+    );
+
+    // Adopting happens once: the next sync finds what it needs on disk.
+    let again = env.sync(&key, source).await;
+    assert_eq!(again["adopted"], false, "{again}");
+    assert_eq!(again["up_to_date"], true, "{again}");
+    assert_eq!(chunk_rows(&pool, source).await, before);
+}
+
+/// The server holds commit A and a Job then indexes B: the sync finds the index at the remote's
+/// head already, but its checkout is still at A, so it rebuilds the checkout at B (the stale
+/// checkout the review found), and it leaves the mirror a ref at B so the next fetch negotiates.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_sync_rebuilds_a_checkout_that_a_job_left_behind(pool: PgPool) {
+    let env = Env::new(pool.clone());
+    let (tenant, key, source) = env.tenant("jobs").await;
+    let repo = fixture_repo();
+    let remote = file_url(repo.path());
+    env.set_remote(&key, &remote).await;
+    let first = env.sync(&key, source).await;
+    assert_eq!(first["up_to_date"], false, "{first}");
+
+    // The remote moves to B and the Job (not the server) indexes it.
+    std::fs::write(repo.path().join("NOTES.md"), "# Notes\n\nOnly in B.\n").unwrap();
+    commit_all(&repo, "b");
+    let b = head(&repo);
+    let done = env.index(tenant, source, &remote).await.json();
+    assert_eq!(done["commit"], b.as_str());
+    let dir = env.server_repo_dir(source);
+    assert!(!dir.join("checkout/NOTES.md").exists(), "still at A");
+
+    let report = env.sync(&key, source).await;
+    assert_eq!(report["up_to_date"], true, "{report}");
+    assert_eq!(report["files_indexed"], 0, "{report}");
+    assert_eq!(report["indexed_commit"], b.as_str());
+    assert_eq!(
+        tree_files(&dir.join("checkout"), None),
+        tree_files(repo.path(), Some(&repo)),
+        "the checkout is at B"
+    );
+    let mirror = dir.join("mirror.git");
+    let mirror_ref = |name: &str| git(&mirror, &["rev-parse", name]).trim().to_string();
+    assert_eq!(mirror_ref("refs/lore/checkout"), b);
+    assert_eq!(mirror_ref("refs/heads/lore-indexed"), b);
+
+    // Settled: the next sync finds the checkout at the head and touches nothing.
+    std::fs::write(dir.join("checkout/NOTES.md"), "edited by hand").unwrap();
+    let again = env.sync(&key, source).await;
+    assert_eq!(again["up_to_date"], true, "{again}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("checkout/NOTES.md")).unwrap(),
+        "edited by hand"
+    );
+}
+
+/// A checkout whose rebuild did not finish has no checkout ref, so the next sync rebuilds it even
+/// though the directory exists and the remote did not move (a failed `read-tree`, a full disk).
+#[sqlx::test(migrations = "./migrations")]
+async fn a_sync_rebuilds_a_checkout_whose_rebuild_never_finished(pool: PgPool) {
+    let env = Env::new(pool.clone());
+    let (_, key, source) = env.tenant("jobs").await;
+    let repo = fixture_repo();
+    env.set_remote(&key, &file_url(repo.path())).await;
+    env.sync(&key, source).await;
+
+    let dir = env.server_repo_dir(source);
+    let mirror = dir.join("mirror.git");
+    git(&mirror, &["update-ref", "-d", "refs/lore/checkout"]);
+    std::fs::remove_file(dir.join("checkout/README.md")).unwrap();
+    std::fs::write(dir.join("checkout/leftover.txt"), "half written").unwrap();
+
+    let report = env.sync(&key, source).await;
+    assert_eq!(report["up_to_date"], true, "{report}");
+    assert_eq!(
+        tree_files(&dir.join("checkout"), None),
+        tree_files(repo.path(), Some(&repo))
+    );
+    assert!(!dir.join("checkout/leftover.txt").exists());
+    assert_eq!(
+        git(&mirror, &["rev-parse", "refs/lore/checkout"]).trim(),
+        head(&repo)
+    );
+}
+
+/// The remote moved on after the Job: the server (empty data dir) fetches the whole history,
+/// indexes only what changed since the Job's commit, builds the checkout and reports adoption.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_sync_of_a_remote_ahead_of_the_job_indexes_only_the_diff(pool: PgPool) {
+    let env = Env::new(pool.clone());
+    let (tenant, key, source) = env.tenant("jobs").await;
+    let repo = fixture_repo();
+    let job_sha = head(&repo);
+    let remote = file_url(repo.path());
+
+    let done = env.index(tenant, source, &remote).await.json();
+    assert_eq!(done["commit"], job_sha.as_str());
+    env.set_remote(&key, &remote).await;
+    let before = chunk_rows(&pool, source).await;
+    let runs_before = runs(&pool, source).await.len();
+
+    // One file modified, one added, one deleted.
+    std::fs::write(
+        repo.path().join("README.md"),
+        "# Sample app\n\nA sample service, now with a changed readme.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("NOTES.md"),
+        "# Notes\n\nAdded after the job.\n",
+    )
+    .unwrap();
+    std::fs::remove_file(repo.path().join("scripts/seed.py")).unwrap();
+    commit_all(&repo, "change after the job");
+    let new_sha = head(&repo);
+    assert_ne!(new_sha, job_sha);
+
+    let report = env.sync(&key, source).await;
+    assert_eq!(report["adopted"], true, "{report}");
+    assert_eq!(report["up_to_date"], false, "{report}");
+    assert_eq!(report["full"], false, "{report}");
+    assert_eq!(report["indexed_commit"], new_sha.as_str());
+    assert_eq!(
+        report["files_indexed"], 2,
+        "only the changed and the added file: {report}"
+    );
+    assert_eq!(report["files_deleted"], 1, "{report}");
+    assert!(report["chunks"].as_u64().unwrap() > 0, "{report}");
+
+    // The index is the new tree.
+    assert_eq!(indexed_commit(&pool, source).await, Some(new_sha.clone()));
+    let tracked: Vec<String> = {
+        let mut t: Vec<String> = git(&repo, &["ls-files"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        t.retain(|p| p != "package-lock.json");
+        t
+    };
+    let docs = indexed_paths(&pool, source).await;
+    assert!(docs.contains(&"NOTES.md".to_string()), "{docs:?}");
+    assert!(!docs.contains(&"scripts/seed.py".to_string()), "{docs:?}");
+    for doc in &docs {
+        assert!(
+            tracked.contains(doc),
+            "{doc} is indexed but not in the tree"
+        );
+    }
+    // Files the diff did not touch kept their rows and vectors: they were not indexed again.
+    let after = chunk_rows(&pool, source).await;
+    let untouched = |rows: &[ChunkRow]| -> Vec<ChunkRow> {
+        rows.iter()
+            .filter(|r| !["README.md", "NOTES.md", "scripts/seed.py"].contains(&r.0.as_str()))
+            .cloned()
+            .collect()
+    };
+    assert!(!untouched(&before).is_empty());
+    assert_eq!(untouched(&after), untouched(&before));
+
+    // The run is incremental and counts the diff only: 2 upserts and 1 deletion.
+    let all_runs = runs(&pool, source).await;
+    assert_eq!(all_runs.len(), runs_before + 1);
+    let (last_commit, full, total): (String, bool, Option<i32>) = sqlx::query_as(
+        "SELECT commit, \"full\", files_total FROM index_runs WHERE source_id = $1
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(source)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((last_commit, full, total), (new_sha, false, Some(3)));
+
+    // The checkout is at the new head.
+    let dir = env.server_repo_dir(source);
+    assert_eq!(
+        tree_files(&dir.join("checkout"), None),
+        tree_files(repo.path(), Some(&repo))
+    );
+    assert!(!dir.join("checkout/scripts/seed.py").exists());
+    assert!(dir.join("checkout/NOTES.md").is_file());
+
+    let again = env.sync(&key, source).await;
+    assert_eq!(again["adopted"], false, "{again}");
+    assert_eq!(again["up_to_date"], true, "{again}");
 }
