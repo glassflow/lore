@@ -972,6 +972,8 @@ async fn a_sync_rebuilds_a_checkout_that_a_job_left_behind(pool: PgPool) {
     assert_eq!(report["up_to_date"], true, "{report}");
     assert_eq!(report["files_indexed"], 0, "{report}");
     assert_eq!(report["indexed_commit"], b.as_str());
+    // The server held the repo already: a rebuild, not an adoption.
+    assert_eq!(report["adopted"], false, "{report}");
     assert_eq!(
         tree_files(&dir.join("checkout"), None),
         tree_files(repo.path(), Some(&repo)),
@@ -1018,6 +1020,67 @@ async fn a_sync_rebuilds_a_checkout_whose_rebuild_never_finished(pool: PgPool) {
     assert_eq!(
         git(&mirror, &["rev-parse", "refs/lore/checkout"]).trim(),
         head(&repo)
+    );
+}
+
+/// A rebuild whose `read-tree` fails after an earlier good checkout must not leave the old checkout
+/// ref behind: the checkout is half moved by then, so the ref (which says which commit the
+/// checkout is at) is dropped first, and the next sync rebuilds instead of trusting it.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_failed_rebuild_drops_the_checkout_ref_so_the_next_sync_retries(pool: PgPool) {
+    let env = Env::new(pool.clone());
+    let (tenant, key, source) = env.tenant("jobs").await;
+    let repo = fixture_repo();
+    let remote = file_url(repo.path());
+    env.set_remote(&key, &remote).await;
+    env.sync(&key, source).await;
+
+    let dir = env.server_repo_dir(source);
+    let mirror = dir.join("mirror.git");
+    let a = head(&repo);
+    let ref_of = |name: &str| {
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&mirror)
+            .args(["rev-parse", "--verify", "--quiet", name])
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8(out.stdout).unwrap().trim().to_string())
+    };
+    assert_eq!(
+        ref_of("refs/lore/checkout").as_deref(),
+        Some(a.as_str()),
+        "a good checkout at A"
+    );
+
+    // The remote moves to B and a Job indexes it, so the next sync rebuilds the checkout at B.
+    std::fs::write(repo.path().join("NOTES.md"), "# Notes\n\nOnly in B.\n").unwrap();
+    commit_all(&repo, "b");
+    let b = head(&repo);
+    let done = env.index(tenant, source, &remote).await.json();
+    assert_eq!(done["commit"], b.as_str());
+
+    // `read-tree` cannot read a corrupt index, so the rebuild fails after it dropped the ref.
+    std::fs::write(mirror.join("index"), "not an index").unwrap();
+    let uri = format!("/v1/repos/{source}/sync");
+    let (status, body) = send(&env.router, "POST", &uri, &key, Vec::new()).await;
+    assert_ne!(status, 200, "the rebuild fails: {body}");
+    assert_eq!(
+        ref_of("refs/lore/checkout"),
+        None,
+        "the checkout ref no longer names A, the half-moved checkout"
+    );
+
+    // The index is repaired (a stale one is removed), and the next sync rebuilds at B.
+    std::fs::remove_file(mirror.join("index")).unwrap();
+    let report = env.sync(&key, source).await;
+    assert_eq!(report["up_to_date"], true, "{report}");
+    assert_eq!(ref_of("refs/lore/checkout").as_deref(), Some(b.as_str()));
+    assert_eq!(
+        tree_files(&dir.join("checkout"), None),
+        tree_files(repo.path(), Some(&repo))
     );
 }
 
