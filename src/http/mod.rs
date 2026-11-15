@@ -91,6 +91,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/repos/{id}/bundle",
             put(repos::put_bundle).layer(RequestBodyLimitLayer::new(bundle_limit)),
         )
+        .route("/v1/repos/{id}", delete(repos::delete_repo))
         .route("/v1/repos/{id}/sync", post(repos::sync_repo))
         .route("/v1/repos/{id}/progress", get(repos::repo_progress))
         .route(

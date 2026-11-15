@@ -296,8 +296,17 @@ pub async fn delete_source(
     State(state): State<AppState>,
     Path(source_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
+    remove_source(&state, source_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What deleting a source does, for the admin route and the tenant's `DELETE /v1/repos/{id}`
+/// alike: 409 while a run of the source is live, then the row goes (its documents and chunks
+/// with it) and so do its mirror and checkout. `NotFound` when no such source exists. The caller
+/// has checked that the source is the caller's to delete.
+pub(crate) async fn remove_source(state: &AppState, source_id: Uuid) -> Result<(), AppError> {
     let running = source_has_live_run(&state.pool, source_id).await?;
-    let _guards = hold_sources(&state, &[source_id], running, "source")?;
+    let _guards = hold_sources(state, &[source_id], running, "source")?;
     let done = sqlx::query("DELETE FROM sources WHERE id = $1")
         .bind(source_id)
         .execute(&state.pool)
@@ -307,7 +316,7 @@ pub async fn delete_source(
     }
     tracing::info!(source = %source_id, "source deleted");
     repo::remove_repo_dirs(&state.config.data_dir, &[source_id]).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// What the server runs and holds, for the admin page.

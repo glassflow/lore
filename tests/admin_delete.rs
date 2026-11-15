@@ -381,6 +381,160 @@ async fn unknown_ids_are_404(pool: PgPool) {
     }
 }
 
+/// Documents and chunks of the source, plus its own row.
+async fn rows_of_source(pool: &PgPool, source: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM sources WHERE id = $1)
+              + (SELECT count(*) FROM documents WHERE source_id = $1)
+              + (SELECT count(*) FROM chunks c JOIN documents d ON d.id = c.document_id
+                 WHERE d.source_id = $1)",
+    )
+    .bind(source)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_tenant_deletes_its_repo_with_what_the_admin_delete_removes(pool: PgPool) {
+    let env = env(pool);
+    let (acme, acme_key, acme_repo) = env.full_tenant("acme").await;
+    let (other, _, other_repo) = env.full_tenant("other").await;
+    let other_before = rows_of(&env.pool, other).await;
+    assert!(rows_of_source(&env.pool, acme_repo).await > 1);
+    assert!(env.repo_dir(acme_repo).exists());
+
+    let path = format!("/v1/repos/{acme_repo}");
+    let (status, body) = send(&env.router, "DELETE", &path, &acme_key, Vec::new()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(rows_of_source(&env.pool, acme_repo).await, 0);
+    assert!(!env.repo_dir(acme_repo).exists());
+
+    // The tenant keeps its other sources and its key; the repo is gone from its list.
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sources WHERE tenant_id = $1 ORDER BY name")
+            .bind(acme)
+            .fetch_all(&env.pool)
+            .await
+            .unwrap();
+    assert!(names.contains(&"notes".to_string()), "{names:?}");
+    let (status, list) = send(&env.router, "GET", "/v1/repos", &acme_key, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(list["repos"].as_array().unwrap().is_empty(), "{list}");
+
+    assert_eq!(rows_of(&env.pool, other).await, other_before);
+    assert!(env.repo_dir(other_repo).exists());
+
+    let (status, _) = send(&env.router, "DELETE", &path, &acme_key, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_tenant_cannot_delete_an_unknown_repo_or_another_tenants(pool: PgPool) {
+    let env = env(pool);
+    let (acme, acme_key, _) = env.full_tenant("acme").await;
+    let (_, _, other_repo) = env.full_tenant("other").await;
+    let other_before = rows_of_source(&env.pool, other_repo).await;
+
+    let unknown = format!("/v1/repos/{}", Uuid::new_v4());
+    let (status, body) = send(&env.router, "DELETE", &unknown, &acme_key, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let theirs = format!("/v1/repos/{other_repo}");
+    let (status, body) = send(&env.router, "DELETE", &theirs, &acme_key, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(rows_of_source(&env.pool, other_repo).await, other_before);
+    assert!(env.repo_dir(other_repo).exists());
+
+    // A source that is not a repo (the tenant's notes) is no repo to delete either.
+    let notes: Uuid =
+        sqlx::query_scalar("SELECT id FROM sources WHERE tenant_id = $1 AND name = 'notes'")
+            .bind(acme)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    let (status, _) = send(
+        &env.router,
+        "DELETE",
+        &format!("/v1/repos/{notes}"),
+        &acme_key,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(rows_of_source(&env.pool, notes).await > 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deleting_a_repo_needs_an_ingest_key_of_its_tenant(pool: PgPool) {
+    let env = env(pool);
+    let (tenant, key) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;
+    let (status, created) = create_repo(&env.router, &key, "sample").await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let source: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let (status, minted) = send(
+        &env.router,
+        "POST",
+        &format!("/v1/admin/tenants/{tenant}/keys"),
+        "t",
+        json!({ "scopes": ["read"] }).to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{minted}");
+    let read_key = minted["key"].as_str().unwrap().to_string();
+
+    let path = format!("/v1/repos/{source}");
+    for (bearer, want) in [
+        (read_key.as_str(), StatusCode::FORBIDDEN),
+        ("wrong", StatusCode::UNAUTHORIZED),
+    ] {
+        let (status, body) = send(&env.router, "DELETE", &path, bearer, Vec::new()).await;
+        assert_eq!(status, want, "{bearer}: {body}");
+    }
+    assert_eq!(rows_of_source(&env.pool, source).await, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_repo_with_a_live_run_is_a_409_for_its_tenant_too(pool: PgPool) {
+    let env = env(pool);
+    let (tenant, key) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;
+    let (_, created) = create_repo(&env.router, &key, "sample").await;
+    let source: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let path = format!("/v1/repos/{source}");
+
+    // A run of another process (no lock held here).
+    insert_run(&env.pool, tenant, source, 5).await;
+    let (status, body) = send(&env.router, "DELETE", &path, &key, Vec::new()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(rows_of_source(&env.pool, source).await, 1);
+
+    // Once the run has gone stale, the delete goes through.
+    sqlx::query("UPDATE index_runs SET updated_at = now() - interval '120 seconds'")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let (status, body) = send(&env.router, "DELETE", &path, &key, Vec::new()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(rows_of_source(&env.pool, source).await, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_repo_whose_lock_is_held_is_a_409_for_its_tenant(pool: PgPool) {
+    let env = env(pool);
+    let (_, key) = create_tenant_key(&env.router, "acme", &["ingest", "read"]).await;
+    let (_, created) = create_repo(&env.router, &key, "sample").await;
+    let source: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let lock = env.state.source_locks.get(source);
+    let guard = lock.lock().await;
+    let path = format!("/v1/repos/{source}");
+    let (status, body) = send(&env.router, "DELETE", &path, &key, Vec::new()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(rows_of_source(&env.pool, source).await, 1);
+    drop(guard);
+    let (status, _) = send(&env.router, "DELETE", &path, &key, Vec::new()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn the_cli_deletes_sources_and_tenants(pool: PgPool) {
     let env = env(pool);
