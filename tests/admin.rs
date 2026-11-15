@@ -507,3 +507,51 @@ async fn the_runs_of_a_deleted_tenant_go_with_it(pool: PgPool) {
     assert_eq!(overview["tenants"], json!([]));
     assert_eq!(overview["server"]["documents"], 0);
 }
+
+/// The admin page shows how old a run is with the `now` of the response, and `updated_at` and
+/// `stale` come from the database's clock. So `now` is the database's too, not this process's:
+/// two hosts whose clocks differ would otherwise show every age wrong. Here the database's
+/// `now()` runs an hour ahead of this process, and both endpoints must report that hour.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_admin_answers_carry_the_databases_clock(pool: PgPool) {
+    sqlx::query(
+        "CREATE FUNCTION public.now() RETURNS timestamptz LANGUAGE sql STABLE
+         AS $$ SELECT pg_catalog.now() + interval '1 hour' $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let database = pool.connect_options().get_database().unwrap().to_string();
+    sqlx::query(&format!(
+        "ALTER DATABASE \"{database}\" SET search_path = public, pg_catalog"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Connections opened from here on see the other clock.
+    let skewed = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let database_secs: f64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::float8")
+        .fetch_one(&skewed)
+        .await
+        .unwrap();
+    let database_ahead = database_secs - chrono::Utc::now().timestamp() as f64;
+    assert!(
+        (database_ahead - 3600.0).abs() < 60.0,
+        "the test database clock is not an hour ahead: {database_ahead} s"
+    );
+
+    let env = env(skewed);
+    for path in ["/v1/admin/pushes", "/v1/admin/overview"] {
+        let body = admin_get(&env.router, path).await;
+        let now = chrono::DateTime::parse_from_rfc3339(body["now"].as_str().unwrap()).unwrap();
+        let ahead_by = now.timestamp() - chrono::Utc::now().timestamp();
+        assert!(
+            (ahead_by - 3600).abs() < 60,
+            "{path} answered the process clock, not the database's: {now} is {ahead_by} s ahead"
+        );
+    }
+}

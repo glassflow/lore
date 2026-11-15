@@ -467,6 +467,17 @@ async fn index_commit(
     // files only that commit had, so ask for a full index instead; nothing is written yet.
     if !full_mode && locked_commit != source.indexed_commit {
         tx.rollback().await?;
+        // The mirror's indexed ref and the checkout already moved to `commit`, ahead of the
+        // database. Put them back to what the database holds now (the other process's commit),
+        // so deep mode keeps reading what search serves until the full index that follows. That
+        // commit may not be in this mirror (the other process has its own data); then the
+        // commit this run started from is the nearest one this mirror has.
+        restore_indexed(
+            paths,
+            locked_commit.as_deref(),
+            source.indexed_commit.as_deref(),
+        )
+        .await;
         return Err(IngestError::NeedFull);
     }
     let mut job = Job {
@@ -506,6 +517,34 @@ async fn index_commit(
     job.tx.commit().await?;
     job.pending.publish(&state.pool).await;
     Ok(job.report)
+}
+
+/// Puts the mirror's indexed ref and the checkout back after an index run moved them and then
+/// did not index. The target is `database` (the commit the database holds) when the mirror has
+/// it, else `started_from` (the commit the run started from). A failure is only logged: the full
+/// index that follows moves both again.
+async fn restore_indexed(paths: &RepoPaths, database: Option<&str>, started_from: Option<&str>) {
+    let mut target = started_from;
+    if let Some(commit) = database {
+        let present = paths
+            .mirror_git(&["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .await
+            .is_ok();
+        if present {
+            target = Some(commit);
+        }
+    }
+    let Some(target) = target else { return };
+    let result = async {
+        paths
+            .mirror_git(&["update-ref", "refs/heads/lore-indexed", target])
+            .await?;
+        refresh_checkout(paths, target).await
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(error = %e, commit = target, "could not put the checkout back after a refused index");
+    }
 }
 
 /// The longest header line accepted: a ref line is a sha and a ref name.

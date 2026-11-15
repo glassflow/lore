@@ -322,7 +322,8 @@ pub(crate) async fn remove_source(state: &AppState, source_id: Uuid) -> Result<(
 /// What the server runs and holds, for the admin page.
 #[derive(Serialize)]
 pub struct Overview {
-    /// The server's clock, so a client can show times relative to it.
+    /// The database's clock (`now()`), the one that sets `updated_at` and decides `stale`, so a
+    /// client can show times relative to it.
     now: DateTime<Utc>,
     server: ServerFacts,
     storage: Storage,
@@ -486,6 +487,9 @@ pub async fn overview(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *tx)
+        .await?;
     let tenants: Vec<TenantItem> = sqlx::query_as(TENANTS_SQL).fetch_all(&mut *tx).await?;
     let mut sources: Vec<SourceOverview> = sqlx::query_as(SOURCES_SQL).fetch_all(&mut *tx).await?;
     let keys: Vec<KeyRow> = sqlx::query_as(
@@ -548,7 +552,7 @@ pub async fn overview(
         }
     }
     Ok(Json(Overview {
-        now: Utc::now(),
+        now,
         server,
         storage,
         tenants: out,
@@ -635,6 +639,7 @@ impl From<NamedRun> for PushItem {
 
 #[derive(Serialize)]
 pub struct PushList {
+    /// The database's clock, like `updated_at` and `stale`.
     now: DateTime<Utc>,
     /// The runs going now, oldest first, whichever process runs them.
     running: Vec<PushItem>,
@@ -648,8 +653,11 @@ pub async fn list_pushes(
     State(state): State<AppState>,
 ) -> Result<Json<PushList>, AppError> {
     let (running, recent) = admin_runs(&state.pool, RECENT_RUNS).await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&state.pool)
+        .await?;
     Ok(Json(PushList {
-        now: Utc::now(),
+        now,
         running: running.into_iter().map(PushItem::from).collect(),
         recent: recent.into_iter().map(PushItem::from).collect(),
     }))
