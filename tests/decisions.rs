@@ -571,6 +571,20 @@ async fn ask_filters_by_kind(pool: PgPool) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn deep_ask_refuses_an_unknown_kind_before_it_asks_the_model(pool: PgPool) {
+    let env = Env::scripted(pool, Vec::new()).await;
+    let (status, body) = env
+        .call(
+            "POST",
+            "/v1/ask",
+            json!({ "question": QUEUE_QUESTION, "mode": "deep", "kind": ["bogus"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("bogus"), "{body}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // GET /v1/documents
 

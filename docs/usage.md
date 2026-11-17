@@ -292,7 +292,7 @@ curl -G "$LORE_URL/v1/documents" -H "Authorization: Bearer $LORE_KEY" --data-url
 # {"documents":[{"id","source","external_id","kind","title","uri","metadata","updated_at"}, ...],"next_cursor":"1785744000000000.0b0e..."}
 ```
 
-The order is by the date of the decision (`metadata.decided_at`) for decisions and by `updated_at` for every other kind, newest first, then by document id descending, so the order is total. `next_cursor` is `null` on the last page; otherwise pass it as `cursor` to get the next page. Pages do not repeat or skip a document unless documents are added or removed between the requests. The `kind` filter is part of the query, so a page holds only the kinds asked for.
+The order is by the date of the decision (`metadata.decided_at`) for decisions and by `updated_at` for every other kind, newest first, then by document id descending, so the order is total. `next_cursor` is `null` on the last page; otherwise pass it as `cursor` to get the next page. Pages do not repeat or skip a document unless documents are added or removed between the requests. The sort uses the instant of `decided_at`, while answers show the date as written, so `2026-08-03T01:00:00+02:00` shows as 3 August but sorts as 2 August 23:00 UTC; a date far in the future stays at the top. The `kind` filter is part of the query, so a page holds only the kinds asked for.
 
 ## Ask
 

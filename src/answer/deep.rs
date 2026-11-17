@@ -159,6 +159,9 @@ pub async fn answer(
             "deep mode needs a tool-capable model provider (LORE_LLM=anthropic)".to_string(),
         ));
     }
+    // A kind that does not exist is a 400 here as in the other modes, before it takes a slot or a
+    // model round: the search tool would otherwise fail on it in every call.
+    crate::search::validate_kinds(req.kind.clone())?;
     // Held until the answer is built or an error returns.
     let _permit = state
         .deep_guard
