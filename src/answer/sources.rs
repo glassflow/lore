@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::fast::{DEFAULT_K, NOTHING_FOUND};
 use super::{AskRequest, AskResponse, Citation, Mode, UsageOut};
+use crate::decision;
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::search::{Hit, SearchQuery, query_terms, search};
@@ -77,6 +78,10 @@ fn bullet(n: usize, h: &Hit, terms: &[String]) -> String {
         (None, _, _) => h.title.clone(),
     };
     let mut out = format!("- [{n}] `{}` ({})", place.replace('`', "'"), h.source);
+    // A decision says who decided and when.
+    if let Some(decision) = h.decision.as_ref().filter(|_| h.kind == decision::KIND) {
+        out.push_str(&format!(" [{}]", decision.label().replace('`', "'")));
+    }
     if !h.symbols.is_empty() {
         let mut symbols = h.symbols[..h.symbols.len().min(BULLET_SYMBOLS)].join(", ");
         if h.symbols.len() > BULLET_SYMBOLS {
@@ -124,6 +129,7 @@ fn citation(n: usize, h: &Hit) -> Citation {
         start_line: h.start_line,
         end_line: h.end_line,
         url: h.uri.clone(),
+        metadata: h.decision.clone(),
     }
 }
 
@@ -144,6 +150,7 @@ mod tests {
             start_line: path.map(|_| 3),
             end_line: path.map(|_| 14),
             symbols: symbols.iter().map(|s| s.to_string()).collect(),
+            decision: None,
             text: text.to_string(),
             score: 0.03,
         }

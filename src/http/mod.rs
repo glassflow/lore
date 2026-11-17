@@ -106,7 +106,8 @@ pub fn router(state: AppState) -> Router {
             "/v1/documents",
             post(documents::post_documents)
                 .layer(RequestBodyLimitLayer::new(documents::BODY_LIMIT))
-                .layer(map_response(documents::json_payload_too_large)),
+                .layer(map_response(documents::json_payload_too_large))
+                .get(documents::list_documents),
         )
         .route("/v1/documents/{id}", get(documents::get_document))
         .route(

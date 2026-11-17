@@ -106,7 +106,7 @@ pub struct SearchArgs {
     query: String,
     /// How many passages to return, 1 to 50 (default 8). Other values are clamped.
     k: Option<i64>,
-    /// Only these document kinds: `code`, `doc`, `session` or `note`.
+    /// Only these document kinds: `code`, `doc`, `session`, `note` or `decision`.
     kind: Option<Vec<String>>,
     /// Only this source: a repo or document source name, as `list_sources` shows it.
     source: Option<String>,
@@ -461,6 +461,7 @@ mod tests {
             start_line: None,
             end_line: None,
             url: None,
+            metadata: None,
         }
     }
 
@@ -626,6 +627,7 @@ mod tests {
             start_line: path.map(|_| 3),
             end_line: path.map(|_| 4),
             symbols: symbols.iter().map(|s| s.to_string()).collect(),
+            decision: None,
             text: "pub enum Plan {\n    Free }".to_string(),
             score: 0.03,
         }

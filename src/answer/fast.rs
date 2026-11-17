@@ -121,6 +121,7 @@ fn parse_citations(answer: &str, sources: &[Hit]) -> Vec<Citation> {
             start_line: hit.start_line,
             end_line: hit.end_line,
             url: hit.uri.clone(),
+            metadata: hit.decision.clone(),
         });
     }
     citations
@@ -143,6 +144,7 @@ mod tests {
             start_line: Some(3),
             end_line: Some(9),
             symbols: Vec::new(),
+            decision: None,
             text: String::new(),
             score: 0.03,
         }
@@ -191,6 +193,7 @@ mod tests {
                 start_line: Some(3),
                 end_line: Some(9),
                 url: Some("https://example.test/plans".to_string()),
+                metadata: None,
             }]
         );
     }
@@ -216,6 +219,7 @@ mod tests {
                 start_line: None,
                 end_line: None,
                 url: None,
+                metadata: None,
             }]
         );
     }

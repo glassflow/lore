@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::prompt::DEEP_SYSTEM;
 use super::tools::{ToolOutput, run_tool, tool_defs};
 use super::{AskRequest, AskResponse, Citation, Mode, UsageOut};
+use crate::decision::{self, Decision};
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::llm::{Block, LlmError, LlmRequest, LlmResponse, Message, Role, ToolChoice};
@@ -45,6 +46,14 @@ static CODE_CITATION: LazyLock<Regex> = LazyLock::new(|| {
 /// `[session:<id>]`.
 static SESSION_CITATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[session:([^\]]+)\]").expect("the session pattern is valid"));
+
+/// `[doc:<uuid>]`: a document that has no path, such as a decision.
+static DOC_CITATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\[doc:([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\]",
+    )
+    .expect("the doc pattern is valid")
+});
 
 /// One tenant's deep-mode state.
 struct TenantGuard {
@@ -127,6 +136,19 @@ fn daily_limit_reached() -> AppError {
     AppError::TooManyRequests("daily deep-mode limit reached".to_string())
 }
 
+/// The input of a tool call after the request's `kind` filter is applied: the search tool looks
+/// only at those kinds, whatever the model asked for. Every other tool, and a request without a
+/// filter, leave the input as it is.
+fn scoped_to_kinds(name: &str, input: &Value, kinds: Option<&[String]>) -> Value {
+    let mut input = input.clone();
+    if let (Some(kinds), "search", Some(map)) = (kinds, name, input.as_object_mut())
+        && !kinds.is_empty()
+    {
+        map.insert("kind".to_string(), json!(kinds));
+    }
+    input
+}
+
 pub async fn answer(
     state: &AppState,
     tenant_id: Uuid,
@@ -137,6 +159,9 @@ pub async fn answer(
             "deep mode needs a tool-capable model provider (LORE_LLM=anthropic)".to_string(),
         ));
     }
+    // A kind that does not exist is a 400 here as in the other modes, before it takes a slot or a
+    // model round: the search tool would otherwise fail on it in every call.
+    crate::search::validate_kinds(req.kind.clone())?;
     // Held until the answer is built or an error returns.
     let _permit = state
         .deep_guard
@@ -216,11 +241,11 @@ pub async fn answer(
         }
 
         // Echo the turn exactly as the model sent it, then answer every tool call in one message.
-        let results =
-            futures::future::join_all(uses.iter().map(|(_, name, input)| {
-                timed(TOOL_TIMEOUT, run_tool(state, tenant_id, name, input))
-            }))
-            .await;
+        let results = futures::future::join_all(uses.iter().map(|(_, name, input)| {
+            let input = scoped_to_kinds(name, input, req.kind.as_deref());
+            async move { timed(TOOL_TIMEOUT, run_tool(state, tenant_id, name, &input)).await }
+        }))
+        .await;
         tool_calls += u32::try_from(uses.len()).unwrap_or(u32::MAX);
         messages.push(Message {
             role: Role::Assistant,
@@ -311,12 +336,18 @@ enum Cited {
         label: String,
         id: String,
     },
+    Doc {
+        label: String,
+        id: Uuid,
+    },
 }
 
 impl Cited {
     fn label(&self) -> &str {
         match self {
-            Cited::Code { label, .. } | Cited::Session { label, .. } => label,
+            Cited::Code { label, .. } | Cited::Session { label, .. } | Cited::Doc { label, .. } => {
+                label
+            }
         }
     }
 }
@@ -333,6 +364,19 @@ fn parse_citations(answer: &str) -> Vec<Cited> {
                 Cited::Session {
                     label: inner(whole.as_str()).to_string(),
                     id: id.as_str().to_string(),
+                },
+            ));
+        }
+    }
+    for caps in DOC_CITATION.captures_iter(answer) {
+        if let (Some(whole), Some(id)) = (caps.get(0), caps.get(1))
+            && let Ok(id) = id.as_str().parse()
+        {
+            found.push((
+                whole.start(),
+                Cited::Doc {
+                    label: inner(whole.as_str()).to_string(),
+                    id,
                 },
             ));
         }
@@ -390,6 +434,16 @@ struct SessionDocRow {
     uri: Option<String>,
 }
 
+/// What a `[doc:<id>]` lookup returns.
+#[derive(sqlx::FromRow)]
+struct DocRow {
+    id: Uuid,
+    kind: String,
+    title: String,
+    uri: Option<String>,
+    metadata: Value,
+}
+
 /// Matches the citations in `answer` to the tenant's documents. A path that starts with the name
 /// of one of the tenant's sources is looked up in that source; if that finds nothing, or no
 /// source name matches, the path is looked up as written in all of the tenant's sources. A
@@ -418,6 +472,36 @@ async fn resolve_citations(
                     start_line: None,
                     end_line: None,
                     url: row.and_then(|r| r.uri),
+                    metadata: None,
+                }
+            }
+            Cited::Doc { label, id } => {
+                let row = find_doc(pool, tenant_id, id).await?;
+                match row {
+                    Some(r) => Citation {
+                        label,
+                        document_id: Some(r.id),
+                        metadata: (r.kind == decision::KIND)
+                            .then(|| Decision::usable(&r.metadata))
+                            .flatten(),
+                        kind: Some(r.kind),
+                        title: Some(r.title),
+                        path: None,
+                        start_line: None,
+                        end_line: None,
+                        url: r.uri,
+                    },
+                    None => Citation {
+                        label,
+                        document_id: None,
+                        kind: None,
+                        title: None,
+                        path: None,
+                        start_line: None,
+                        end_line: None,
+                        url: None,
+                        metadata: None,
+                    },
                 }
             }
             Cited::Code {
@@ -453,6 +537,7 @@ async fn resolve_citations(
                             start_line: start,
                             end_line: end,
                             url,
+                            metadata: None,
                         }
                     }
                     None => Citation {
@@ -464,6 +549,7 @@ async fn resolve_citations(
                         start_line: start,
                         end_line: end,
                         url: None,
+                        metadata: None,
                     },
                 }
             }
@@ -513,6 +599,17 @@ async fn find_code_doc(
     .bind(tenant_id)
     .bind(path)
     .bind(source_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The tenant's document with this id.
+async fn find_doc(pool: &PgPool, tenant_id: Uuid, id: Uuid) -> sqlx::Result<Option<DocRow>> {
+    sqlx::query_as(
+        "SELECT id, kind, title, uri, metadata FROM documents WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant_id)
+    .bind(id)
     .fetch_optional(pool)
     .await
 }
@@ -613,6 +710,49 @@ mod tests {
     #[test]
     fn text_that_is_not_a_citation_is_ignored() {
         assert!(parse_citations("[1] [a b.rs:1-2] [a.rs:x] a.rs:1-2 [] [:1-2]").is_empty());
+    }
+
+    #[test]
+    fn doc_citations_are_ids_and_keep_their_place_in_the_answer() {
+        let id = "0b0e7f3e-95d2-4c3e-9d0c-5f0a1f8f6a11";
+        let got = parse_citations(&format!(
+            "[a.rs:1-2] then [doc:{id}] and [doc:{id}] [doc:xyz]"
+        ));
+        assert_eq!(
+            got,
+            vec![
+                code("a.rs:1-2", "a.rs", Some(1), Some(2)),
+                Cited::Doc {
+                    label: format!("doc:{id}"),
+                    id: id.parse().unwrap()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_request_kind_filter_overrides_the_kind_of_a_search_call() {
+        let kinds = vec!["decision".to_string()];
+        let input = json!({ "query": "queue", "kind": ["code"] });
+        assert_eq!(
+            scoped_to_kinds("search", &input, Some(&kinds)),
+            json!({ "query": "queue", "kind": ["decision"] })
+        );
+        let bare = json!({ "query": "queue" });
+        assert_eq!(
+            scoped_to_kinds("search", &bare, Some(&kinds)),
+            json!({ "query": "queue", "kind": ["decision"] })
+        );
+    }
+
+    #[test]
+    fn without_a_kind_filter_or_for_other_tools_the_input_is_unchanged() {
+        let input = json!({ "query": "queue", "kind": ["code"] });
+        assert_eq!(scoped_to_kinds("search", &input, None), input);
+        assert_eq!(scoped_to_kinds("search", &input, Some(&[])), input);
+        let grep = json!({ "pattern": "x" });
+        let kinds = vec!["decision".to_string()];
+        assert_eq!(scoped_to_kinds("grep", &grep, Some(&kinds)), grep);
     }
 
     #[test]

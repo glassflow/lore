@@ -20,7 +20,7 @@ pub struct AskArgs {
     /// How many sources to retrieve (1 to 50)
     #[arg(long)]
     k: Option<usize>,
-    /// Only these document kinds, comma-separated (code, doc, session, note)
+    /// Only these document kinds, comma-separated (code, doc, session, note, decision)
     #[arg(long, value_delimiter = ',')]
     kind: Option<Vec<String>>,
     /// Only the source with this name
@@ -120,6 +120,7 @@ mod tests {
             start_line: Some(7),
             end_line: Some(14),
             url: Some("https://example.test/plans.rs#L7-L14".to_string()),
+            metadata: None,
         }
     }
 

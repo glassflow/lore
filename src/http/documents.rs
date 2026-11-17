@@ -1,4 +1,5 @@
-//! Notes and documents: `POST /v1/documents`, `GET /v1/documents/{id}` and
+//! Notes, documents and decisions: `POST /v1/documents`, `GET /v1/documents` (a page of the
+//! tenant's documents of some kinds), `GET /v1/documents/{id}` and
 //! `DELETE /v1/documents/{source}/{*external_id}`.
 //!
 //! Everything a request can get wrong is checked in `parse` before the first write, including the
@@ -17,11 +18,14 @@ use uuid::Uuid;
 
 use crate::auth::{Caller, Scope};
 use crate::chunk::{Chunk, chunk_markdown_split};
+use crate::decision;
 use crate::error::AppError;
-use crate::http::AppState;
 use crate::http::repos::is_length_limit;
+use crate::http::search::parse_kinds;
+use crate::http::{AppQuery, AppState};
 use crate::mcp::MAX_DOCUMENT_CHARS;
-use crate::store::{self, NewDocument};
+use crate::search::validate_kinds;
+use crate::store::{self, ListedDocument, NewDocument};
 
 const MAX_DOCUMENTS: usize = 100;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
@@ -166,12 +170,19 @@ fn prepare(index: usize, doc: DocumentIn) -> Result<Prepared, AppError> {
         return Err(bad(format!("{} is over 1 MiB", at("text"))));
     }
     let kind = doc.kind.unwrap_or_else(|| "note".to_string());
-    if kind != "note" && kind != "doc" {
-        return Err(bad(format!("{} must be note or doc", at("kind"))));
+    if kind != "note" && kind != "doc" && kind != decision::KIND {
+        return Err(bad(format!(
+            "{} must be note, doc or {}",
+            at("kind"),
+            decision::KIND
+        )));
     }
     let metadata = doc.metadata.unwrap_or_else(|| json!({}));
-    if !metadata.is_object() {
+    let Some(fields) = metadata.as_object() else {
         return Err(bad(format!("{} must be a JSON object", at("metadata"))));
+    };
+    if kind == decision::KIND {
+        decision::validate(fields).map_err(|m| bad(format!("documents[{index}].{m}")))?;
     }
     if metadata.to_string().len() > MAX_METADATA_BYTES {
         return Err(bad(format!(
@@ -317,6 +328,87 @@ pub async fn get_document(
         uri: row.uri,
         metadata: row.metadata,
         text,
+    }))
+}
+
+/// Documents on a page when `limit` is not given, and the most a page holds.
+const LIST_DEFAULT_LIMIT: i64 = 50;
+const LIST_MAX_LIMIT: i64 = 200;
+
+#[derive(Deserialize)]
+pub struct ListParams {
+    /// Comma-separated document kinds, like `GET /v1/search`; empty means all.
+    kind: Option<String>,
+    /// A source name.
+    source: Option<String>,
+    /// Documents per page; clamped to 1..=200, default 50.
+    limit: Option<i64>,
+    /// The `next_cursor` of the previous page.
+    cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ListOut {
+    documents: Vec<ListedDocument>,
+    /// Pass it as `cursor` for the next page; null on the last page.
+    next_cursor: Option<String>,
+}
+
+/// `<sort key in microseconds>.<document id>`: URL-safe, and opaque to clients.
+fn encode_cursor(d: &ListedDocument) -> String {
+    format!("{}.{}", d.sort_micros, d.id)
+}
+
+fn decode_cursor(cursor: &str) -> Result<(i64, Uuid), AppError> {
+    let parsed = cursor
+        .split_once('.')
+        .and_then(|(micros, id)| Some((micros.parse().ok()?, id.parse().ok()?)));
+    parsed.ok_or_else(|| bad("cursor is not one that this API returned"))
+}
+
+/// `GET /v1/documents`: a page of the caller's tenant's documents, newest first (see
+/// [`store::list_documents`]), without their text. Needs a `read` key.
+pub async fn list_documents(
+    caller: Caller,
+    State(state): State<AppState>,
+    AppQuery(params): AppQuery<ListParams>,
+) -> Result<Json<ListOut>, AppError> {
+    caller.require(Scope::Read)?;
+    let kinds = validate_kinds(parse_kinds(params.kind.as_deref()))?;
+    let source = params.source.filter(|s| !s.trim().is_empty());
+    if source.as_deref().is_some_and(|s| s.contains('\0')) {
+        return Err(bad("source must not contain NUL"));
+    }
+    let limit = params
+        .limit
+        .unwrap_or(LIST_DEFAULT_LIMIT)
+        .clamp(1, LIST_MAX_LIMIT);
+    let after = params
+        .cursor
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .map(decode_cursor)
+        .transpose()?;
+    // One row more than the page tells whether there is a next page.
+    let mut documents = store::list_documents(
+        &state.pool,
+        caller.tenant_id,
+        kinds.as_deref(),
+        source.as_deref(),
+        after,
+        limit + 1,
+    )
+    .await?;
+    let more = documents.len() as i64 > limit;
+    documents.truncate(usize::try_from(limit).unwrap_or(1));
+    let next_cursor = if more {
+        documents.last().map(encode_cursor)
+    } else {
+        None
+    };
+    Ok(Json(ListOut {
+        documents,
+        next_cursor,
     }))
 }
 
