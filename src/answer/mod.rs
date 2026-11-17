@@ -8,6 +8,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::decision::Decision;
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::llm::Usage;
@@ -56,6 +57,9 @@ pub struct Citation {
     pub start_line: Option<i32>,
     pub end_line: Option<i32>,
     pub url: Option<String>,
+    /// Who decided and when, for a `decision` document; absent for every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Decision>,
 }
 
 /// Tokens used by the model calls behind an answer. `input_tokens` counts only the uncached part

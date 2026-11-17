@@ -15,6 +15,7 @@ use pgvector::Vector;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use crate::decision::Decision;
 use crate::embed::{Embedder, embed_query_async};
 use crate::error::AppError;
 use crate::repo::is_full_sha;
@@ -25,12 +26,12 @@ pub const DEFAULT_K: usize = 10;
 pub const MAX_K: usize = 50;
 /// The longest accepted query, in characters.
 pub const MAX_QUERY_CHARS: usize = 2000;
-/// Document kinds (`documents.kind`), as the migration lists them.
 /// A hit carries at most this many bytes of `metadata.path`. The documents API refuses a longer
 /// path, and a document stored before that limit has its path cut here.
 pub const MAX_PATH_BYTES: usize = 2048;
 
-pub const DOCUMENT_KINDS: [&str; 4] = ["code", "doc", "session", "note"];
+/// Document kinds (`documents.kind`), as the migrations list them.
+pub const DOCUMENT_KINDS: [&str; 5] = ["code", "doc", "session", "note", "decision"];
 
 /// A snippet is the first lines of a chunk.
 const SNIPPET_LINES: usize = 40;
@@ -72,7 +73,7 @@ pub struct SearchQuery {
     pub q: String,
     /// Clamped to 1..=50.
     pub k: usize,
-    /// Document kinds to keep (`code`, `doc`, `session`, `note`); `None` keeps all.
+    /// Document kinds to keep (`code`, `doc`, `session`, `note`, `decision`); `None` keeps all.
     pub kinds: Option<Vec<String>>,
     /// A source name; `None` searches every source of the tenant.
     pub source: Option<String>,
@@ -96,6 +97,8 @@ pub struct Hit {
     pub start_line: Option<i32>,
     pub end_line: Option<i32>,
     pub symbols: Vec<String>,
+    /// Who decided and when, for `decision` hits; `None` for every other kind.
+    pub decision: Option<Decision>,
     pub text: String,
     /// The Reciprocal Rank Fusion score: higher is better.
     pub score: f64,
@@ -117,6 +120,7 @@ struct HitRow {
     start_line: Option<i32>,
     end_line: Option<i32>,
     symbols: Vec<String>,
+    decision_metadata: Option<serde_json::Value>,
     text: String,
 }
 
@@ -149,6 +153,7 @@ impl HitRow {
             start_line: self.start_line,
             end_line: self.end_line,
             symbols: self.symbols,
+            decision: self.decision_metadata.as_ref().and_then(Decision::usable),
             text: self.text,
             score,
         }
@@ -240,7 +245,8 @@ pub async fn search(
                 left(d.metadata->>'path', 2048) AS path,
                 CASE WHEN d.kind = 'session' THEN d.external_id END AS external_id,
                 d.metadata->>'commit' AS commit,
-                s.web_url_template AS template, c.start_line, c.end_line, c.symbols, c.text
+                s.web_url_template AS template, c.start_line, c.end_line, c.symbols,
+                CASE WHEN d.kind = 'decision' THEN d.metadata END AS decision_metadata, c.text
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
          JOIN sources s ON s.id = d.source_id
@@ -340,7 +346,7 @@ pub fn clamp_k(k: usize) -> usize {
 }
 
 /// Checks the kinds against the document kinds. `None`, or an empty list, means all kinds.
-fn validate_kinds(kinds: Option<Vec<String>>) -> Result<Option<Vec<String>>, AppError> {
+pub fn validate_kinds(kinds: Option<Vec<String>>) -> Result<Option<Vec<String>>, AppError> {
     let Some(kinds) = kinds.filter(|k| !k.is_empty()) else {
         return Ok(None);
     };
@@ -487,7 +493,7 @@ mod tests {
             panic!("want BadRequest");
         };
         assert!(msg.contains("\"docs\""), "{msg}");
-        assert!(msg.contains("code, doc, session, note"), "{msg}");
+        assert!(msg.contains("code, doc, session, note, decision"), "{msg}");
     }
 
     #[test]

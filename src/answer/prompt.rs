@@ -1,10 +1,12 @@
 //! The prompt of fast mode: a fixed system prompt, and the retrieved passages as numbered
 //! sources followed by the question.
 
+use crate::decision;
 use crate::search::Hit;
 
 pub const FAST_SYSTEM: &str = "You answer questions about a team's code, documents and agent sessions. \
 Use only the numbered sources. Cite every claim with its source number in square brackets, like [2]. \
+A source marked decision says who decided and when: when you answer from one, say who decided and on what date. \
 If the sources do not contain the answer, say so and say what is missing. \
 Answer in at most 8 short sentences or a short list. Count carefully when asked how many.";
 
@@ -13,7 +15,8 @@ Answer in at most 8 short sentences or a short list. Count carefully when asked 
 pub const DEEP_SYSTEM: &str = "You answer questions about a team's code, documents and agent sessions. \
 Use the tools to find evidence before answering: search for relevant passages, grep for exact names, read_file to check details, get_session to read an agent session. \
 For 'how many' or 'list all' questions, grep for every occurrence instead of trusting search alone. \
-Cite every claim as [path:start-end] for code, using the path without the source prefix, or [session:<id>] for sessions. \
+Cite every claim as [path:start-end] for code, using the path without the source prefix, [session:<id>] for sessions, or [doc:<id>] for a hit shown as doc:<id>. \
+A decision hit names who decided and when: say so when you answer from it. \
 Be concise.";
 
 /// The most lines of a passage that go into the prompt.
@@ -23,12 +26,15 @@ const PREFIX: &str = "Sources:\n\n";
 
 /// One numbered source: a header line, then the text in a fence cut to its first 120 lines.
 fn render_source(n: usize, hit: &Hit) -> String {
+    // A decision names who decided and when where the other kinds name the kind.
+    let kind = match &hit.decision {
+        Some(decision) if hit.kind == decision::KIND => decision.label(),
+        _ => hit.kind.clone(),
+    };
     let header = match (&hit.path, hit.start_line, hit.end_line) {
-        (Some(path), Some(start), Some(end)) => {
-            format!("[{n}] {path}:{start}-{end} ({})", hit.kind)
-        }
-        (Some(path), _, _) => format!("[{n}] {path} ({})", hit.kind),
-        (None, _, _) => format!("[{n}] {} ({})", hit.title, hit.kind),
+        (Some(path), Some(start), Some(end)) => format!("[{n}] {path}:{start}-{end} ({kind})"),
+        (Some(path), _, _) => format!("[{n}] {path} ({kind})"),
+        (None, _, _) => format!("[{n}] {} ({kind})", hit.title),
     };
     let text = hit
         .text
@@ -64,6 +70,7 @@ pub fn fast_user_message(question: &str, hits: &[Hit], max_chars: usize) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision::Decision;
     use uuid::Uuid;
 
     fn hit(path: Option<&str>, text: &str) -> Hit {
@@ -79,6 +86,7 @@ mod tests {
             start_line: path.map(|_| 7),
             end_line: path.map(|_| 14),
             symbols: Vec::new(),
+            decision: None,
             text: text.to_string(),
             score: 0.03,
         }
@@ -115,6 +123,65 @@ mod tests {
             msg.contains("[1] How many plans do we have? (session)\n```\n"),
             "{msg}"
         );
+    }
+
+    fn decision_hit(metadata: serde_json::Value) -> Hit {
+        let mut h = hit(None, "We use Postgres for the queue.");
+        h.kind = "decision".to_string();
+        h.title = "Queue storage".to_string();
+        h.start_line = None;
+        h.end_line = None;
+        h.decision = Decision::from_metadata(&metadata);
+        h
+    }
+
+    #[test]
+    fn a_decision_source_says_who_decided_and_when() {
+        let h = decision_hit(serde_json::json!({
+            "decided_by": ["Ashish Bagri"],
+            "decided_at": "2026-08-03"
+        }));
+        let (msg, _) = fast_user_message("q", &[h], 60_000);
+        assert!(
+            msg.contains(
+                "[1] Queue storage (decision, decided by Ashish Bagri on 3 August 2026)\n```\n"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_decision_with_missing_or_empty_values_prints_no_placeholder() {
+        for (metadata, header) in [
+            (
+                serde_json::json!({ "decided_by": ["Ana", "Bo"] }),
+                "[1] Queue storage (decision, decided by Ana and Bo)",
+            ),
+            (
+                serde_json::json!({ "decided_at": "2026-08-03", "decided_by": [] }),
+                "[1] Queue storage (decision, decided on 3 August 2026)",
+            ),
+            (
+                serde_json::json!({ "decided_by": [" ", null, 3], "decided_at": "" }),
+                "[1] Queue storage (decision)",
+            ),
+            (serde_json::json!({}), "[1] Queue storage (decision)"),
+            (serde_json::json!(null), "[1] Queue storage (decision)"),
+        ] {
+            let h = decision_hit(metadata.clone());
+            let (msg, n) = fast_user_message("q", &[h], 60_000);
+            assert_eq!(n, 1);
+            assert!(msg.contains(header), "{metadata}: {msg}");
+            assert!(!msg.contains("None") && !msg.contains("null"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_decision_hit_that_lost_its_metadata_falls_back_to_its_kind() {
+        let mut h = decision_hit(serde_json::json!({}));
+        h.decision = None;
+        let (msg, _) = fast_user_message("q", &[h], 60_000);
+        assert!(msg.contains("[1] Queue storage (decision)\n"), "{msg}");
     }
 
     #[test]

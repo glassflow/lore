@@ -3,7 +3,7 @@
 //! tenant id, so another tenant's rows are never visible.
 //!
 //! Vocabulary: a "source kind" is `sources.kind` (`repo`, `traces`, `documents`); a "document kind"
-//! is `documents.kind` (`code`, `doc`, `session`, `note`).
+//! is `documents.kind` (`code`, `doc`, `session`, `note`, `decision`).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ pub struct NewDocument {
     pub tenant_id: Uuid,
     pub source_id: Uuid,
     pub external_id: String,
-    /// Document kind: `code`, `doc`, `session` or `note`.
+    /// Document kind: `code`, `doc`, `session`, `note` or `decision`.
     pub kind: String,
     pub title: String,
     pub uri: Option<String>,
@@ -201,13 +201,75 @@ pub struct DocumentRow {
     pub source_id: Uuid,
     /// The source name.
     pub source: String,
-    /// The document kind (`code`, `doc`, `session`, `note`).
+    /// The document kind (`code`, `doc`, `session`, `note`, `decision`).
     pub kind: String,
     pub title: String,
     pub uri: Option<String>,
     pub metadata: serde_json::Value,
     /// `metadata->>'path'`: only repo files have one.
     pub path: Option<String>,
+}
+
+/// One document of a listing: everything but its text.
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct ListedDocument {
+    pub id: Uuid,
+    /// The source name.
+    pub source: String,
+    pub external_id: String,
+    pub kind: String,
+    pub title: String,
+    pub uri: Option<String>,
+    pub metadata: serde_json::Value,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// The listing's sort key in microseconds since the epoch, see [`list_documents`].
+    #[serde(skip)]
+    pub sort_micros: i64,
+}
+
+/// One page of the tenant's documents of the given kinds (all kinds when `kinds` is `None`),
+/// newest first: by the day a decision was decided (`metadata.decided_at`; any other kind, and a
+/// decision whose date cannot be read, by `updated_at`), then by id, both descending, so the
+/// order is total and a page boundary never skips or repeats a row. `after` is the
+/// `(sort_micros, id)` of the last row of the previous page. At most `limit` rows.
+pub async fn list_documents(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    kinds: Option<&[String]>,
+    source: Option<&str>,
+    after: Option<(i64, Uuid)>,
+    limit: i64,
+) -> sqlx::Result<Vec<ListedDocument>> {
+    sqlx::query_as(
+        "SELECT * FROM (
+           SELECT d.id, s.name AS source, d.external_id, d.kind, d.title, d.uri, d.metadata,
+                  d.updated_at,
+                  (extract(epoch FROM (CASE
+                     WHEN d.kind = 'decision' AND length(d.metadata->>'decided_at') = 10
+                          AND pg_input_is_valid(d.metadata->>'decided_at' || 'T00:00:00Z', 'timestamptz')
+                       THEN (d.metadata->>'decided_at' || 'T00:00:00Z')::timestamptz
+                     WHEN d.kind = 'decision' AND pg_input_is_valid(d.metadata->>'decided_at', 'timestamptz')
+                       THEN (d.metadata->>'decided_at')::timestamptz
+                     ELSE d.updated_at
+                   END)) * 1000000)::bigint AS sort_micros
+           FROM documents d
+           JOIN sources s ON s.id = d.source_id
+           WHERE d.tenant_id = $1
+             AND ($2::text[] IS NULL OR d.kind = ANY($2))
+             AND ($3::text IS NULL OR s.name = $3)
+         ) t
+         WHERE ($4::bigint IS NULL OR (t.sort_micros, t.id) < ($4, $5))
+         ORDER BY t.sort_micros DESC, t.id DESC
+         LIMIT $6",
+    )
+    .bind(tenant_id)
+    .bind(kinds)
+    .bind(source)
+    .bind(after.map(|(micros, _)| micros))
+    .bind(after.map(|(_, id)| id))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// The document and its text, or `None` when the id is unknown or belongs to another tenant. The

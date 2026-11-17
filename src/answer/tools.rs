@@ -22,6 +22,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::decision;
 use crate::error::AppError;
 use crate::http::AppState;
 use crate::llm::ToolDef;
@@ -119,7 +120,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
                     },
                     "kind": {
                         "type": "array",
-                        "items": { "type": "string", "enum": ["code", "doc", "session", "note"] },
+                        "items": { "type": "string", "enum": ["code", "doc", "session", "note", "decision"] },
                         "description": "Only these document kinds."
                     }
                 },
@@ -305,11 +306,20 @@ async fn run_search(state: &AppState, tenant_id: Uuid, input: &Value) -> ToolOut
 
 /// A header line and the first [`HIT_LINES`] lines of the hit's text.
 ///
+/// - a decision: `doc:<document_id> (<title>)`;
 /// - a hit with a path (repo code and docs): `<source>/<path>:<start>-<end> (<kind>) <symbols>`;
 /// - a session: `session:<external_id> (<title>)`;
 /// - any other hit: `doc:<document_id> (<title>)`.
+///
+/// A `doc:` hit is cited as `[doc:<document_id>]`.
+///
+/// A decision hit says who decided and when after its header, so the model can answer from it:
+/// `doc:<id> (<title>) [decision, decided by Ana on 3 August 2026]`.
 fn render_hit(hit: &Hit) -> String {
     let mut out = match (&hit.path, &hit.external_id) {
+        // A decision is cited by its id whatever else its metadata holds, so it is looked up
+        // with its decision metadata.
+        _ if hit.kind == decision::KIND => format!("doc:{} ({})", hit.document_id, hit.title),
         (Some(path), _) => {
             let mut header = format!("{}/{}", hit.source, path);
             if let (Some(start), Some(end)) = (hit.start_line, hit.end_line) {
@@ -326,6 +336,9 @@ fn render_hit(hit: &Hit) -> String {
         }
         (None, _) => format!("doc:{} ({})", hit.document_id, hit.title),
     };
+    if let Some(decision) = &hit.decision {
+        let _ = write!(out, " [{}]", decision.label());
+    }
     for line in hit.text.lines().take(HIT_LINES) {
         out.push('\n');
         out.push_str(line);
@@ -701,6 +714,7 @@ mod tests {
             start_line: Some(3),
             end_line: Some(9),
             symbols: vec!["Plan".to_string(), "limits".to_string()],
+            decision: None,
             text: (1..=40)
                 .map(|i| format!("line {i}"))
                 .collect::<Vec<_>>()

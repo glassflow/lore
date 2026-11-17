@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::{Caller, Scope};
+use crate::decision::Decision;
 use crate::error::AppError;
 use crate::http::{AppQuery, AppState};
 use crate::search::{DEFAULT_K, Hit, SearchQuery, clamp_k, search, snippet};
@@ -34,6 +35,9 @@ pub struct HitItem {
     start_line: Option<i32>,
     end_line: Option<i32>,
     symbols: Vec<String>,
+    /// Who decided and when, for `decision` hits only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Decision>,
     snippet: String,
     score: f64,
 }
@@ -57,6 +61,7 @@ impl From<Hit> for HitItem {
             start_line: h.start_line,
             end_line: h.end_line,
             symbols: h.symbols,
+            metadata: h.decision,
             snippet: snippet(&h.text),
             score: h.score,
         }
@@ -65,7 +70,7 @@ impl From<Hit> for HitItem {
 
 /// `code,doc` to `["code", "doc"]`. Blank entries are dropped, and no entries at all means no
 /// filter. Whether each kind exists is checked by the search.
-fn parse_kinds(kind: Option<&str>) -> Option<Vec<String>> {
+pub(crate) fn parse_kinds(kind: Option<&str>) -> Option<Vec<String>> {
     let kinds: Vec<String> = kind?
         .split(',')
         .map(str::trim)

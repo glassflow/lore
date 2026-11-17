@@ -203,10 +203,10 @@ lore search "plan limits" --source sample --json
 |---|---|
 | `q` | The query. Required: a missing or blank `q` is a 400. At most 2000 characters, otherwise a 400. It cannot contain a NUL byte |
 | `k` | How many hits, default 10. Any integer is accepted and clamped to 1 to 50. Something that is not an integer is a 400 |
-| `kind` | Comma-separated document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 that lists the kinds. Empty means all |
+| `kind` | Comma-separated document kinds: `code`, `doc`, `session`, `note`, `decision`. Another name is a 400 that lists the kinds. Empty means all. The kinds are filtered in the query itself, before the best `k` are chosen, so `kind=decision&k=1` is the best decision, not the best hit if it happens to be a decision |
 | `source` | Only the source with this name, whatever its kind (`repo`, `traces`, `documents`). Empty means all. A name that matches nothing gives no hits |
 
-The answer is `{"hits": [...]}`, best first. A hit has `chunk_id`, `document_id`, `source`, `kind`, `title`, `uri`, `path`, `start_line`, `end_line` (1-based, inclusive), `symbols`, `snippet` (the first 40 lines of the chunk) and `score`. `path` is set for repo files only. `uri` is the source's `web_url_template` filled in for repo files (see below), or else the document's own URI, or null.
+The answer is `{"hits": [...]}`, best first. A hit has `chunk_id`, `document_id`, `source`, `kind`, `title`, `uri`, `path`, `start_line`, `end_line` (1-based, inclusive), `symbols`, `snippet` (the first 40 lines of the chunk) and `score`. A `decision` hit also has `metadata`, the decision metadata described under Documents. `path` is set for repo files only. `uri` is the source's `web_url_template` filled in for repo files (see below), or else the document's own URI, or null.
 
 The `web_url_template` of a repo source can use `{path}`, `{commit}`, `{start}` and `{end}`, for example `https://github.com/acme/app/blob/{commit}/{path}#L{start}-L{end}`. `{path}` is percent-encoded segment by segment (the `/` between segments stays), so a space, `#`, `?` or `%` in a file name cannot change the link. Other `{...}` text is left as it is.
 
@@ -240,7 +240,7 @@ curl -X POST "$LORE_URL/v1/documents" \
 # {"upserted":1,"unchanged":0,"chunks":1}
 ```
 
-`source` names a group of documents (1 to 100 characters of `A-Z a-z 0-9 . _ -`, but not `.` or `..`; it is created on first use). `documents` has 1 to 100 entries. Each has an `external_id` (1 to 512 bytes, unique within the source, with no `.` or `..` between slashes, so `a.b` and `a/.b` are fine but `..` and `a/../b` are not), a `title` of at most 1 KiB, a `text` of at most 1 MiB, and optionally `kind` (`note`, the default, or `doc`), `uri` (shown with search hits, at most 2,048 bytes) and `metadata` (a JSON object of at most 64 KiB once serialized). A text that makes more than 1000 chunks is refused too. Anything invalid is a 400 and nothing of that request is written. The body may be up to 128 MiB; more is a 413.
+`source` names a group of documents (1 to 100 characters of `A-Z a-z 0-9 . _ -`, but not `.` or `..`; it is created on first use). `documents` has 1 to 100 entries. Each has an `external_id` (1 to 512 bytes, unique within the source, with no `.` or `..` between slashes, so `a.b` and `a/.b` are fine but `..` and `a/../b` are not), a `title` of at most 1 KiB, a `text` of at most 1 MiB, and optionally `kind` (`note`, the default, `doc` or `decision`), `uri` (shown with search hits, at most 2,048 bytes) and `metadata` (a JSON object of at most 64 KiB once serialized). A text that makes more than 1000 chunks is refused too. Anything invalid is a 400 and nothing of that request is written. The body may be up to 128 MiB; more is a 413.
 
 Putting an `external_id` again replaces the document. When its kind, title, text, uri and metadata are all the same as stored, it is skipped and counted in `unchanged`, so repeating a sync is cheap. If one id appears twice in a request, the documents are handled in order and the last one wins. The text is split into sections at markdown headings, and long sections into overlapping windows of lines. All of the text is searchable: a window is kept within 8,000 characters, and a single line longer than that is split into several chunks (at a space when there is one close to the end) instead of being cut.
 
@@ -252,6 +252,47 @@ lore doc rm --source notes --id n1
 ```
 
 `GET /v1/documents/{id}` (a `read` key) returns `{"id", "kind", "title", "uri", "metadata", "text"}` for any document of the tenant, using the `document_id` of a search hit. For a document put through the API the text is exactly what was sent (line endings, blank lines and the final newline included), cut at 100,000 characters; for repo files and sessions it is rebuilt from the indexed chunks. `DELETE /v1/documents/{source}/{external_id}` (an `ingest` key) answers 204, or 404 when the tenant has no such document; an `external_id` may contain `/`, and other special characters must be percent-encoded. `lore doc put` accepts either `--file` or `--text`, and prints the server's JSON.
+
+### Decisions
+
+A document with `"kind": "decision"` records a decision: who decided it, when and where it came from. The facts go in the document's `metadata` (there is no separate column), so they are stored, returned and replaced with the document. A decision whose `metadata` is not valid is a 400 that names the field (`documents[0].metadata.decided_by is required for a decision`), and nothing of that request is written. Other kinds keep any metadata they had.
+
+| `metadata` field | Meaning |
+|---|---|
+| `decided_by` | Required. A list of 1 to 50 names, each a non-empty string of at most 256 bytes |
+| `decided_at` | Required. When it was decided: a date `YYYY-MM-DD` or an RFC 3339 timestamp |
+| `changed_by` | A list of names (may be empty) of who changed the decision later |
+| `changed_at` | When it was changed, in the same formats as `decided_at` |
+| `pr` | The pull request (or link) that records it, at most 2,048 bytes |
+| `where` | Where it was recorded: `repo_folder`, `factory_project` or `by_hand`. Another value is a 400 |
+| `repo`, `project`, `added_by` | Non-empty strings of at most 256 bytes: the repo and the project it belongs to, and who or what added it |
+
+Every field but `decided_by` and `decided_at` is optional, and `null` counts as missing. Other keys are kept as they are.
+
+```bash
+curl -X POST "$LORE_URL/v1/documents" -H "Authorization: Bearer $LORE_KEY" -H "Content-Type: application/json" \
+  -d '{"source": "decisions", "documents": [{
+        "external_id": "queue-storage", "kind": "decision", "title": "Queue storage",
+        "text": "We chose Postgres over Kafka for the event queue: one less system to run.",
+        "metadata": {"decided_by": ["Ashish Bagri"], "decided_at": "2026-08-03", "where": "repo_folder",
+                     "repo": "glassflow/lore", "pr": "https://github.com/glassflow/lore/pull/42"}}]}'
+```
+
+Where decisions show up:
+
+- `GET /v1/documents/{id}` returns the metadata under `metadata`, like any document.
+- `GET /v1/search` and the MCP `search` tool take `kind=decision`. A decision hit in `/v1/search` carries its `metadata` (only the fields above).
+- `POST /v1/ask`: in fast mode the passage of a decision is headed with who decided and when instead of its kind, for example `[1] Queue storage (decision, decided by Ashish Bagri on 3 August 2026)`, and the model is told to say so in its answer. Several names read `Ana and Bo` or `Ana, Bo and Cy`; a missing decider or date is left out of the header, never printed as a placeholder; a date that is not a date is shown as stored. A decision citation has `metadata` with the same fields as above; no other kind has it. Sources mode adds the same text in square brackets to the bullet.
+- In deep mode the `search` tool marks a decision hit as `doc:<document id> (<title>) [decision, decided by ...]`, and the model cites it as `[doc:<document id>]`. That citation has the document's `document_id`, `kind`, `title`, `url` and, for a decision, `metadata`.
+
+`GET /v1/documents` lists the tenant's documents, newest first, without their text (a `read` key). Parameters: `kind` (comma-separated, as for search; empty means all kinds), `source` (a source name), `limit` (default 50, clamped to 1 to 200) and `cursor`. A bad `kind`, a `cursor` that this API did not return or a `limit` that is not an integer is a 400.
+
+```bash
+curl -G "$LORE_URL/v1/documents" -H "Authorization: Bearer $LORE_KEY" --data-urlencode 'kind=decision' --data-urlencode 'limit=20'
+# {"documents":[{"id","source","external_id","kind","title","uri","metadata","updated_at"}, ...],"next_cursor":"1785744000000000.0b0e..."}
+```
+
+The order is by the date of the decision (`metadata.decided_at`) for decisions and by `updated_at` for every other kind, newest first, then by document id descending, so the order is total. `next_cursor` is `null` on the last page; otherwise pass it as `cursor` to get the next page. Pages do not repeat or skip a document unless documents are added or removed between the requests. The `kind` filter is part of the query, so a page holds only the kinds asked for.
 
 ## Ask
 
@@ -271,10 +312,10 @@ lore ask "how many plans are there?" --mode sources                # the sources
 | `question` | Required. A missing or blank question is a 400. At most 2000 characters, otherwise a 400 |
 | `mode` | `fast` (the default), `sources` or `deep`. `sources` calls no model (see below). `deep` runs an agent loop (see below) and is a 400 ("deep mode needs a tool-capable model provider (LORE_LLM=anthropic)") with `LORE_LLM=openai` |
 | `k` | Fast and sources mode: how many sources to retrieve, default 12, clamped to 1 to 50 |
-| `kind` | Fast and sources mode: a list of document kinds: `code`, `doc`, `session`, `note`. Another name is a 400 |
+| `kind` | A list of document kinds: `code`, `doc`, `session`, `note`, `decision`. Another name is a 400. Fast and sources mode filter the search with it, in the query. Deep mode limits its `search` tool to these kinds, whatever the model asks for (its `grep`, `read_file` and `get_session` tools are not limited) |
 | `source` | Fast and sources mode: only the source with this name |
 
-The answer is `{"answer", "mode", "model", "citations", "sources_considered", "tool_calls", "usage", "latency_ms"}`. `citations` lists the sources the answer cites with `[n]`, once each, in the order they first appear. A citation has `label` (the source number, as text), `document_id`, `kind`, `title`, `path`, `start_line`, `end_line` and `url` (the same link `/v1/search` gives as `uri`). `sources_considered` is the number of passages that went into the prompt (at most 60,000 characters of them, each cut to its first 120 lines), `tool_calls` is 0 in fast mode, and `usage` has `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`. `input_tokens` is only the part of the prompt the model's prompt cache did not cover: the whole prompt is the sum of the three input counts.
+The answer is `{"answer", "mode", "model", "citations", "sources_considered", "tool_calls", "usage", "latency_ms"}`. `citations` lists the sources the answer cites with `[n]`, once each, in the order they first appear. A citation has `label` (the source number, as text), `document_id`, `kind`, `title`, `path`, `start_line`, `end_line`, `url` (the same link `/v1/search` gives as `uri`) and, for a decision, `metadata` (see Decisions under Documents). `sources_considered` is the number of passages that went into the prompt (at most 60,000 characters of them, each cut to its first 120 lines), `tool_calls` is 0 in fast mode, and `usage` has `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`. `input_tokens` is only the part of the prompt the model's prompt cache did not cover: the whole prompt is the sum of the three input counts.
 
 When nothing indexed matches, the answer is "I found nothing indexed that matches this question.", `model` is `"none"` and the model is not called. If the model declines to answer, the response is a 422 `{"error": "the model declined to answer"}`.
 
@@ -345,7 +386,7 @@ The tools are written for agents. `search` runs no language model, answers in we
 
 | Tool | Input | Returns |
 | --- | --- | --- |
-| `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`), `source` | One text item, `No hits.` or one block per hit: a header `[1] <source> <path>:<start>-<end> (<kind>: <symbols>) id=<document id>` (the title in place of the path for documents without one), then at most 12 lines of the hit, numbered: the window with the most query words, or the whole hit when it is at most 15 lines. Common indentation is removed and lines are cut at 160 characters |
+| `search` | `query`, `k` (1 to 50, default 8), `kind` (list of `code`, `doc`, `session`, `note`, `decision`), `source` | One text item, `No hits.` or one block per hit: a header `[1] <source> <path>:<start>-<end> (<kind>: <symbols>) id=<document id>` (the title in place of the path for documents without one), then at most 12 lines of the hit, numbered: the window with the most query words, or the whole hit when it is at most 15 lines. Common indentation is removed and lines are cut at 160 characters |
 | `ask` | `question`, `mode` (`fast`, the default; `deep` runs the agent loop), `source` | One text item: the answer, a `Sources:` list with one line per citation, and `(fast mode, <model>, 4321 in / 381 out, 4.9 s)` (deep mode adds the number of tool calls) |
 | `get_document` | `document_id` (the id of a search hit or a citation) | The document's text under a `# <title>` header with its kind and path, cut to 100,000 characters. An unknown id, or another tenant's, is the tool error `document not found` |
 | `list_sources` | none | One text item: a JSON array of `{name, kind, indexed_commit, documents}` |

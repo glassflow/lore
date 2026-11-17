@@ -17,7 +17,7 @@ pub struct SearchArgs {
     /// How many hits to return (1 to 50)
     #[arg(long)]
     k: Option<u32>,
-    /// Only these document kinds, comma-separated (code, doc, session, note)
+    /// Only these document kinds, comma-separated (code, doc, session, note, decision)
     #[arg(long, value_delimiter = ',')]
     kind: Option<Vec<String>>,
     /// Only the source with this name
