@@ -323,7 +323,9 @@ function shortSha(sha) {
 // The commit column of a source: only repos have one.
 function commitText(source) {
   if (source.indexed_commit) return shortSha(source.indexed_commit);
-  return source.kind === 'repo' ? 'not indexed' : '';
+  if (source.kind !== 'repo') return '';
+  // A first index commits as it goes: documents before an indexed commit are a partial index.
+  return source.documents > 0 ? 'indexing (partial)' : 'not indexed';
 }
 
 // The sync column of a source: how the last fetch of its remote went. Only repos have one.

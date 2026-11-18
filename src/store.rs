@@ -174,6 +174,9 @@ pub struct SourceSummary {
     pub kind: String,
     pub indexed_commit: Option<String>,
     pub documents: i64,
+    /// A repo whose first index is still running (or died and waits for its retry): it holds
+    /// documents but no indexed commit yet, so search finds only part of it.
+    pub partial: bool,
 }
 
 /// The tenant's sources with how many documents each holds, ordered like [`list_sources`].
@@ -182,7 +185,8 @@ pub async fn list_source_summaries(
     tenant_id: Uuid,
 ) -> sqlx::Result<Vec<SourceSummary>> {
     sqlx::query_as(
-        "SELECT s.name, s.kind, s.indexed_commit, count(d.id) AS documents
+        "SELECT s.name, s.kind, s.indexed_commit, count(d.id) AS documents,
+                (s.kind = 'repo' AND s.indexed_commit IS NULL AND count(d.id) > 0) AS partial
          FROM sources s
          LEFT JOIN documents d ON d.source_id = s.id AND d.tenant_id = s.tenant_id
          WHERE s.tenant_id = $1
@@ -740,6 +744,15 @@ pub struct IndexStats {
     /// Wall-clock time spent embedding, including any wait for the embedder while other pushes
     /// use it.
     pub embed_time: Duration,
+}
+
+impl IndexStats {
+    /// Adds `other`'s counts and time to these.
+    pub fn add(&mut self, other: &IndexStats) {
+        self.chunks += other.chunks;
+        self.embedded += other.embedded;
+        self.embed_time += other.embed_time;
+    }
 }
 
 /// [`index_text`], also saying how many chunks were embedded and how long that took.

@@ -301,17 +301,85 @@ async fn changed_new_deleted_and_unchanged_files_publish_together(pool: PgPool) 
     assert_eq!(report["files_deleted"], 1);
 }
 
+/// A router whose embedder is `gate` and whose first index commits every `batch` files.
+fn batched_router(env: &Env, gate: Arc<Gate>, batch: usize) -> Router {
+    let mut state = env.state.clone();
+    let mut config = (*state.config).clone();
+    config.first_index_batch = batch;
+    state.config = Arc::new(config);
+    state.embedder = gate;
+    test_router(state)
+}
+
 #[sqlx::test(migrations = "./migrations")]
-async fn first_push_has_no_partial_search_results(pool: PgPool) {
+async fn a_first_push_is_searchable_batch_by_batch(pool: PgPool) {
     let env = Env::new(pool, false).await;
     let gate = Gate::new(Some("repoatomic old beta"), false, false);
-    let push = env.start_push(env.gated_router(gate.clone()), true);
+    let push = env.start_push(batched_router(&env, gate.clone(), 1), true);
     gate.wait().await;
-    assert!(env.search().await["hits"].as_array().unwrap().is_empty());
+    // a.md is the first batch, committed before b.md is embedded; the source is still partial.
+    assert_eq!(
+        contents(&env.search().await).keys().collect::<Vec<_>>(),
+        ["a.md"]
+    );
     assert_eq!(env.commit().await, None);
     gate.release();
     assert_eq!(push.await.unwrap().0, StatusCode::OK);
     assert_eq!(contents(&env.search().await).len(), 4);
+    assert_eq!(env.commit().await, Some(head(&env.repo)));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_failed_first_push_keeps_its_batches_and_the_retry_resumes(pool: PgPool) {
+    let env = Env::new(pool, false).await;
+    let gate = Gate::new(Some("repoatomic old beta"), false, true);
+    let push = env.start_push(batched_router(&env, gate.clone(), 1), true);
+    gate.wait().await;
+    gate.release();
+    assert_eq!(push.await.unwrap().0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        contents(&env.search().await).keys().collect::<Vec<_>>(),
+        ["a.md"]
+    );
+    assert_eq!(env.commit().await, None);
+
+    let (status, report) = env.push(true).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    // The files the failed run committed (a.md, and fixture files before b.md) are skipped.
+    assert!(report["files_unchanged"].as_u64().unwrap() >= 1, "{report}");
+    assert_eq!(contents(&env.search().await).len(), 4);
+    assert_eq!(env.commit().await, Some(head(&env.repo)));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_later_full_push_still_publishes_at_once(pool: PgPool) {
+    let env = Env::new(pool, true).await;
+    let old = contents(&env.search().await);
+    env.change();
+    let gate = Gate::new(Some("repoatomic new beta"), false, false);
+    let push = env.start_push(batched_router(&env, gate.clone(), 1), true);
+    gate.wait().await;
+    assert_eq!(contents(&env.search().await), old);
+    gate.release();
+    assert_eq!(push.await.unwrap().0, StatusCode::OK);
+    assert_eq!(contents(&env.search().await), new_contents());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_push_while_another_process_indexes_is_busy(pool: PgPool) {
+    let env = Env::new(pool, false).await;
+    let lock = lore::repo::lock::SourceAdvisoryLock::try_acquire(
+        &env.state.config.database_url,
+        env.source,
+    )
+    .await
+    .unwrap()
+    .expect("the lock is free");
+    let (status, body) = env.push(true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(env.commit().await, None);
+    lock.release().await;
+    assert_eq!(env.push(true).await.0, StatusCode::OK);
 }
 
 #[sqlx::test(migrations = "./migrations")]

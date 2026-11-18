@@ -1,17 +1,15 @@
-//! A cross-process lock per source, for `lore index`. The in-process [`super::SourceLocks`]
-//! only keeps two pushes of one server apart; a Kubernetes Job is another process, so it takes a
-//! Postgres session advisory lock keyed by the source id instead.
+//! A cross-process lock per source, held by every index run: `lore index`, and a push or sync of
+//! the server. The in-process [`super::SourceLocks`] only keeps two runs of one server apart; a
+//! Kubernetes Job is another process, so it takes a Postgres session advisory lock keyed by the
+//! source id instead.
 //!
 //! The lock lives on its own connection, opened for the purpose and held for the whole run, so
 //! it is never a pooled connection that goes back to the pool (and loses or keeps the lock by
 //! accident). Postgres drops a session lock when its connection ends, so a killed process
-//! releases it too. The server's own push and sync path does not take it. It is already kept apart
-//! from a running index in the database: `index_commit` locks the source row (`FOR NO KEY
-//! UPDATE`) before it writes anything and holds it until it commits, so a push that meets a
-//! running index waits for it instead of writing at the same time (and, once it has the row, checks
-//! that the indexed commit is still the one its diff started from, else it asks for a full
-//! index). The advisory lock adds what
-//! that cannot: a second `lore index` fails at once instead of embedding the repo twice.
+//! releases it too. A run embeds before it takes the source's row lock, so the row lock alone
+//! would let two processes embed the same repo at once; with this lock the second run fails at
+//! once (`Busy`, or `lore index` exits busy) instead. The row lock stays: each write transaction
+//! takes it and checks the indexed commit (see `lock_source`), for a process without this lock.
 //!
 //! The connection sits idle for the whole run, which can be hours (embedding a big repo), and a
 //! NAT or load balancer in between may drop an idle TCP connection without either end noticing;

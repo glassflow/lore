@@ -30,7 +30,7 @@ use uuid::Uuid;
 use super::progress::{RunHandle, RunWriter};
 use super::{
     GitError, IndexCtx, IndexReport, IngestError, RepoPaths, checkout_commit, ensure_mirror,
-    git_env, index_commit, is_full_sha, push_error, refresh_checkout,
+    git_env, index_commit, is_full_sha, lock_across_processes, push_error, refresh_checkout,
 };
 use crate::error::AppError;
 use crate::http::AppState;
@@ -451,6 +451,10 @@ pub async fn poll_repos(
                         tracing::info!(source_id = %source.id, commit = %r.report.indexed_commit, "repo synced by poller");
                     }
                     Ok(_) => {}
+                    // A Job is indexing it: the next poll picks up from what the Job indexed.
+                    Err(SyncError::Ingest(IngestError::Busy)) => {
+                        tracing::debug!(source_id = %source.id, "repo poll skipped: another process is indexing it");
+                    }
                     Err(e) => tracing::warn!(source_id = %source.id, error = %e, "repo poll failed"),
                 }
             });
@@ -560,6 +564,8 @@ async fn sync_locked(
         fetch_remote(&paths, &url, token.as_deref(), allow_file, true).await?;
         full = true;
     }
+    // Before the run is recorded: a repo another process is indexing is not a failed run here.
+    let lock = lock_across_processes(state, source.id).await?;
     let push = RunWriter::new(state.pool.clone())
         .start(source.id, source.tenant_id, &head, full)
         .await;
@@ -571,6 +577,7 @@ async fn sync_locked(
         full = true;
         result = index_commit(state, &source, &paths, &head, true, &push).await;
     }
+    lock.release().await;
     match result {
         Ok(report) => {
             push.done(&report).await;
