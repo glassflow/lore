@@ -25,15 +25,20 @@
 //! connection is gone, so is the session lock, and there is nothing left to keep alive. The index
 //! goes on (the row lock and the lock check at commit stay in force) and an error is logged.
 //!
-//! This needs a session-level connection to Postgres itself: through a transaction-mode pooler
-//! (PgBouncer in `transaction` pool mode) the session advisory lock would belong to whichever
-//! server connection the pooler handed out for that statement, and it would be lost or leak.
+//! This needs a session-level connection to Postgres itself, for `lore index` and the server
+//! alike: through a transaction-mode pooler (PgBouncer in `transaction` pool mode) the session
+//! advisory lock would belong to whichever server connection the pooler handed out for that
+//! statement, and it would be lost or leak. The server opens it with its pool's options, so it
+//! is always the database the pool writes to.
 //! Point `LORE_DATABASE_URL` of `lore index` at Postgres directly, or at a session-mode pooler.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use sqlx::postgres::PgConnection;
+use std::str::FromStr;
+
+use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgConnection};
 use sqlx::{Connection, Row};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -88,16 +93,47 @@ impl SourceAdvisoryLock {
         ping_every: Duration,
         query_timeout: Duration,
     ) -> Result<Option<Self>> {
-        let mut conn = PgConnection::connect(database_url)
-            .await
-            .context("opening the lock connection to the database")?;
+        let options = PgConnectOptions::from_str(database_url)
+            .context("parsing the database URL of the lock connection")?;
+        Self::acquire(&options, source_id, ping_every, query_timeout).await
+    }
+
+    /// [`Self::try_acquire`] on the database `pool` connects to. A server takes the lock this way,
+    /// so the lock is always in the database it indexes into (advisory locks are per database).
+    pub async fn try_acquire_for(pool: &PgPool, source_id: Uuid) -> Result<Option<Self>> {
+        Self::acquire(
+            &pool.connect_options(),
+            source_id,
+            PING_INTERVAL,
+            QUERY_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn acquire(
+        options: &PgConnectOptions,
+        source_id: Uuid,
+        ping_every: Duration,
+        query_timeout: Duration,
+    ) -> Result<Option<Self>> {
         let key = advisory_key(source_id);
-        let got: bool = sqlx::query("SELECT pg_try_advisory_lock($1)")
-            .bind(key)
-            .fetch_one(&mut conn)
-            .await
-            .context("taking the source lock")?
-            .get(0);
+        // Bounded like every other query here: an unreachable database must not hold the caller
+        // (and the in-process source lock it holds) for the kernel's TCP timeout.
+        let taken = tokio::time::timeout(query_timeout, async {
+            let mut conn = PgConnection::connect_with(options)
+                .await
+                .context("opening the lock connection to the database")?;
+            let got: bool = sqlx::query("SELECT pg_try_advisory_lock($1)")
+                .bind(key)
+                .fetch_one(&mut conn)
+                .await
+                .context("taking the source lock")?
+                .get(0);
+            anyhow::Ok((conn, got))
+        })
+        .await
+        .context("taking the source lock timed out")??;
+        let (conn, got) = taken;
         if !got {
             let _ = tokio::time::timeout(query_timeout, conn.close()).await;
             return Ok(None);

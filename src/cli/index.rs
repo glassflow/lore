@@ -128,7 +128,7 @@ async fn index(config: Config, args: IndexArgs, token: Option<String>) -> Result
             )
         })?;
 
-    let Some(lock) = SourceAdvisoryLock::try_acquire(&config.database_url, source.id).await? else {
+    let Some(lock) = SourceAdvisoryLock::try_acquire_for(&pool, source.id).await? else {
         return Ok(Outcome::Busy(source.id));
     };
     let result = run_locked(&config, &pool, &source, &args.remote, token).await;

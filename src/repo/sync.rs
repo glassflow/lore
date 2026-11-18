@@ -320,7 +320,12 @@ async fn sync_under_lock(
     token: Option<String>,
 ) -> Result<SyncReport, SyncError> {
     let result = sync_locked(state, source, token).await;
-    if matches!(result, Err(SyncError::NoRemote)) {
+    // Neither is an outcome of this repo's sync: no remote, or another process is indexing it
+    // (recording that would show an error on the admin page every poll for the whole Job).
+    if matches!(
+        result,
+        Err(SyncError::NoRemote | SyncError::Ingest(IngestError::Busy))
+    ) {
         return result;
     }
     let commit = result
@@ -566,6 +571,16 @@ async fn sync_locked(
     }
     // Before the run is recorded: a repo another process is indexing is not a failed run here.
     let lock = lock_across_processes(state, source.id).await?;
+    // The source was read before the lock, and a fetch can take minutes: another process may
+    // have indexed meanwhile. Then this sync's plan (full or not, the diff base) is stale; the
+    // next sync starts from what that process indexed.
+    let fresh = get_source(&state.pool, source.tenant_id, source.id)
+        .await?
+        .ok_or_else(|| anyhow!("source {} vanished", source.id))?;
+    if fresh.indexed_commit != source.indexed_commit {
+        lock.release().await;
+        return Err(IngestError::Busy.into());
+    }
     let push = RunWriter::new(state.pool.clone())
         .start(source.id, source.tenant_id, &head, full)
         .await;

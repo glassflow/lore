@@ -716,31 +716,17 @@ async fn indexed_paths(pool: &PgPool, source: Uuid) -> Vec<String> {
     .unwrap()
 }
 
-/// A server push computes its diff from the indexed commit it read, then queues on the source
-/// row. A `lore index` (another process, so no in-process lock) that queued first commits a
-/// newer commit in between. The push must not apply its diff on top of that: it has to ask for
-/// a full bundle, and leave the index as the job made it.
+/// A server push that meets a running `lore index` (another process) is refused at once with
+/// `index_in_progress`, before it fetches or embeds anything: both take the source's advisory lock.
+/// The index stays as the job made it, and a push after the job lands cleanly.
 #[sqlx::test(migrations = "./migrations")]
-async fn a_push_that_queued_behind_an_index_does_not_apply_its_stale_diff(pool: PgPool) {
-    a_push_refused_behind_an_index(pool, false).await;
-}
-
-/// The same, when the server's mirror has the job's commit (a sync fetched it): the refused push
-/// puts the ref and the checkout back at what the database holds, not at where the push started.
-#[sqlx::test(migrations = "./migrations")]
-async fn a_refused_push_restores_the_commit_the_database_holds_when_the_mirror_has_it(
-    pool: PgPool,
-) {
-    a_push_refused_behind_an_index(pool, true).await;
-}
-
-async fn a_push_refused_behind_an_index(pool: PgPool, mirror_has_b: bool) {
+async fn a_push_during_an_index_job_is_refused_as_busy(pool: PgPool) {
     let env = Env::new(pool.clone());
     let (tenant, key, source) = env.tenant("jobs").await;
     let repo = fixture_repo();
 
     // A: the server's full push. B adds ghost.md, and the job's remote is a clone at B. C is
-    // another commit on top of A (not of B), so the push of C does not carry B to the server.
+    // another commit on top of A (not of B).
     let a = head(&repo);
     let (status, body) = put_bundle(
         &env.router,
@@ -765,80 +751,49 @@ async fn a_push_refused_behind_an_index(pool: PgPool, mirror_has_b: bool) {
     commit_all(&repo, "C adds c.md");
     let c = head(&repo);
 
-    // Hold the source row, so both writers queue on it, the job first.
+    // Hold the source row, so the job (holding its advisory lock) waits on it mid-run.
     let mut hold = pool.begin().await.unwrap();
-    let held: Uuid = sqlx::query_scalar("SELECT id FROM sources WHERE id = $1 FOR NO KEY UPDATE")
+    sqlx::query("SELECT id FROM sources WHERE id = $1 FOR NO KEY UPDATE")
         .bind(source)
-        .fetch_one(&mut *hold)
+        .execute(&mut *hold)
         .await
         .unwrap();
-    assert_eq!(held, source);
     let job = tokio::spawn(run(env.command(
         tenant,
         source,
         &file_url(job_remote.path()),
     )));
     wait_for_waiters(&pool, 1).await;
-    let push = {
-        let router = env.router.clone();
-        let key = key.clone();
-        let bytes = bundle(&repo, &[&format!("{a}..HEAD")]);
-        let c = c.clone();
-        tokio::spawn(async move { put_bundle(&router, &key, source, bytes, &c, false).await })
-    };
-    wait_for_waiters(&pool, 2).await;
-    if mirror_has_b {
-        let server_mirror = env
-            .server_data
-            .path()
-            .join("repos")
-            .join(source.to_string())
-            .join("mirror.git");
-        git(
-            &server_mirror,
-            &["fetch", "-q", &job_remote.path().to_string_lossy(), "HEAD"],
-        );
-    }
-    hold.rollback().await.unwrap();
 
-    let job_out = job.await.unwrap();
-    assert_eq!(job_out.json()["commit"], b.as_str());
-    let (status, body) = push.await.unwrap();
+    let (status, body) = put_bundle(
+        &env.router,
+        &key,
+        source,
+        bundle(&repo, &[&format!("{a}..HEAD")]),
+        &c,
+        false,
+    )
+    .await;
     assert_eq!(status, 409, "{body}");
-    assert_eq!(body["error"], "need_full_bundle", "{body}");
-
-    // Nothing of the refused push was applied: the index is B, ghost.md included, c.md absent.
-    assert_eq!(indexed_commit(&pool, source).await, Some(b.clone()));
-    let docs = indexed_paths(&pool, source).await;
-    assert!(docs.contains(&"ghost.md".to_string()), "{docs:?}");
-    assert!(!docs.contains(&"c.md".to_string()), "{docs:?}");
-
-    // The refused push had already moved the server's indexed ref and checkout to C. They are
-    // put back, and are not left ahead of the database: at B, which the database holds, when the
-    // mirror has B, else at A, where this push started.
-    let server_repo = env
+    assert_eq!(body["error"], "index_in_progress", "{body}");
+    // Refused before it fetched: the server's indexed ref is still at A.
+    let mirror = env
         .server_data
         .path()
         .join("repos")
-        .join(source.to_string());
-    let mirror = server_repo.join("mirror.git");
-    let restored = if mirror_has_b { &b } else { &a };
+        .join(source.to_string())
+        .join("mirror.git");
     assert_eq!(
         git(&mirror, &["rev-parse", "refs/heads/lore-indexed"]).trim(),
-        restored
-    );
-    assert!(
-        !server_repo.join("checkout/c.md").exists(),
-        "the checkout is still at the refused commit"
-    );
-    assert!(server_repo.join("checkout/README.md").exists());
-    assert_eq!(
-        server_repo.join("checkout/ghost.md").exists(),
-        mirror_has_b,
-        "the checkout is at the wrong commit"
+        a
     );
 
-    // The client's answer to the 409, a full push of C, lands cleanly and drops ghost.md.
+    hold.rollback().await.unwrap();
+    let job_out = job.await.unwrap();
+    assert_eq!(job_out.json()["commit"], b.as_str());
+    assert_eq!(indexed_commit(&pool, source).await, Some(b.clone()));
+
+    // After the job, a full push of C lands cleanly and drops ghost.md.
     let (status, body) = put_bundle(
         &env.router,
         &key,

@@ -271,19 +271,21 @@ async fn standalone_cache_publication_error_keeps_document_visible(pool: PgPool)
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn failed_push_does_not_publish_staged_cache_or_any_document(pool: PgPool) {
+async fn failed_push_keeps_its_vectors_but_publishes_no_document(pool: PgPool) {
     let env = Env::new(pool.clone(), false).await;
     let gate = Gate::new(Some("repoatomic old beta"), false, true);
     let push = env.start_push(env.gated_router(gate.clone()), true);
     gate.wait().await;
-    assert_eq!(cache_rows(&pool).await, 0);
     gate.release();
     assert_eq!(push.await.unwrap().0, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(cache_rows(&pool).await, 0);
+    // The vectors embedded before the failure are cached for the retry: a cache entry is the
+    // embedder's vector for an exact text, valid whether or not the push that made it commits.
+    let kept = cache_rows(&pool).await;
+    assert!(kept > 0);
     assert!(env.search().await["hits"].as_array().unwrap().is_empty());
     assert_eq!(env.commit().await, None);
     assert_eq!(env.push(true).await.0, StatusCode::OK);
-    assert!(cache_rows(&pool).await > 0);
+    assert!(cache_rows(&pool).await > kept);
 }
 
 /// Real HTTP push, fresh process, 1930 files x 12 chunks. Run separately in shared/off modes.
@@ -355,7 +357,7 @@ async fn cancelled_cold_push_discards_staging_and_retries(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn index_publication_failure_discards_new_cache_entries(pool: PgPool) {
+async fn index_publication_failure_keeps_new_cache_entries(pool: PgPool) {
     let env = Env::new(pool.clone(), true).await;
     let old = env.search().await;
     let old_commit = env.commit().await;
@@ -373,12 +375,14 @@ async fn index_publication_failure_discards_new_cache_entries(pool: PgPool) {
     assert_eq!(env.push(false).await.0, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(env.search().await, old);
     assert_eq!(env.commit().await, old_commit);
-    assert_eq!(cache_rows(&pool).await, old_cache);
+    let kept = cache_rows(&pool).await;
+    assert!(kept > old_cache);
     sqlx::query("DROP TRIGGER reject_publication ON sources")
         .execute(&pool)
         .await
         .unwrap();
     assert_eq!(env.push(false).await.0, StatusCode::OK);
     assert_eq!(contents(&env.search().await), new_contents());
-    assert!(cache_rows(&pool).await > old_cache);
+    // The retry embedded nothing new: every vector it needed was kept from the failed run.
+    assert_eq!(cache_rows(&pool).await, kept);
 }

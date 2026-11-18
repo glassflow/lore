@@ -53,6 +53,9 @@ pub struct Config {
     /// `LORE_FIRST_INDEX_BATCH`: files per transaction of a repo's first index, which publishes
     /// as it goes (searchable partially, and a retry resumes after the last batch).
     pub first_index_batch: usize,
+    /// `LORE_MAX_HELD_CHUNKS`: the most prepared chunks a later repo index holds in memory for
+    /// its one transaction; files past it are prepared again inside the transaction.
+    pub max_held_chunks: usize,
     /// `LORE_SYNC_INTERVAL_SECS`: how often every repo with a remote is fetched and indexed.
     /// `None` (unset or 0) turns the poller off.
     pub sync_interval_secs: Option<u64>,
@@ -130,6 +133,7 @@ pub const DEFAULT_DEEP_CONCURRENCY: usize = 2;
 /// Default `LORE_DEEP_DAILY_LIMIT`.
 pub const DEFAULT_DEEP_DAILY_LIMIT: u32 = 100;
 pub const DEFAULT_FIRST_INDEX_BATCH: usize = 200;
+pub const DEFAULT_MAX_HELD_CHUNKS: usize = 50_000;
 
 /// Reads a positive integer variable, or `default` when it is unset.
 fn positive<T: std::str::FromStr + PartialOrd + Default>(
@@ -217,6 +221,7 @@ impl Config {
         let deep_concurrency = positive(&f, "LORE_DEEP_CONCURRENCY", DEFAULT_DEEP_CONCURRENCY)?;
         let deep_daily_limit = positive(&f, "LORE_DEEP_DAILY_LIMIT", DEFAULT_DEEP_DAILY_LIMIT)?;
         let first_index_batch = positive(&f, "LORE_FIRST_INDEX_BATCH", DEFAULT_FIRST_INDEX_BATCH)?;
+        let max_held_chunks = positive(&f, "LORE_MAX_HELD_CHUNKS", DEFAULT_MAX_HELD_CHUNKS)?;
 
         let sync_interval_secs = match f("LORE_SYNC_INTERVAL_SECS") {
             None => None,
@@ -285,6 +290,7 @@ impl Config {
             deep_concurrency,
             deep_daily_limit,
             first_index_batch,
+            max_held_chunks,
             sync_interval_secs,
             github_webhook_secret: f("LORE_GITHUB_WEBHOOK_SECRET").filter(|s| !s.is_empty()),
             sync_allow_file_remotes,
@@ -351,6 +357,7 @@ mod tests {
         assert_eq!(c.deep_concurrency, 2);
         assert_eq!(c.deep_daily_limit, 100);
         assert_eq!(c.first_index_batch, 200);
+        assert_eq!(c.max_held_chunks, 50_000);
         assert_eq!(c.sync_interval_secs, None);
         assert_eq!(c.github_webhook_secret, None);
         assert!(!c.sync_allow_file_remotes);

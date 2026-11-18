@@ -366,15 +366,34 @@ async fn a_later_full_push_still_publishes_at_once(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn a_later_push_past_the_held_limit_writes_every_file(pool: PgPool) {
+    let env = Env::new(pool, true).await;
+    env.change();
+    let mut state = env.state.clone();
+    let mut config = (*state.config).clone();
+    config.max_held_chunks = 1;
+    state.config = Arc::new(config);
+    let (status, report) = put_bundle(
+        &test_router(state),
+        &env.key,
+        env.source,
+        bundle(&env.repo, &["HEAD"]),
+        &head(&env.repo),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(contents(&env.search().await), new_contents());
+    assert_eq!(env.commit().await, Some(head(&env.repo)));
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn a_push_while_another_process_indexes_is_busy(pool: PgPool) {
     let env = Env::new(pool, false).await;
-    let lock = lore::repo::lock::SourceAdvisoryLock::try_acquire(
-        &env.state.config.database_url,
-        env.source,
-    )
-    .await
-    .unwrap()
-    .expect("the lock is free");
+    let lock = lore::repo::lock::SourceAdvisoryLock::try_acquire_for(&env.state.pool, env.source)
+        .await
+        .unwrap()
+        .expect("the lock is free");
     let (status, body) = env.push(true).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(env.commit().await, None);

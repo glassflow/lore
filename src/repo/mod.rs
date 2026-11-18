@@ -149,8 +149,8 @@ pub struct IndexCtx {
     pub source_locks: Arc<SourceLocks>,
 }
 
-/// One lock per source, so two pushes to the same repo never run at once. lore runs as a single
-/// replica, so an in-process lock is enough. An entry is added the first time a source (one that
+/// One lock per source, so two runs of this process on the same repo never run at once. Runs of
+/// other processes (a `lore index` Job) are kept apart by the advisory lock of [`lock`]. An entry is added the first time a source (one that
 /// exists in the database) is ingested and then reused, so the map holds at most one entry per
 /// source.
 #[derive(Default)]
@@ -400,9 +400,23 @@ async fn ingest_locked(
     let lock = state.source_locks.get(source.id);
     let _guard = lock.lock().await;
     push.cloning();
+    let across = lock_across_processes(state, source.id).await?;
+    let result = ingest_across_locked(state, source, bundle_arg, expected_ref, full, push).await;
+    across.release().await;
+    result
+}
 
-    // The caller read the source before waiting for the lock, so the last indexed commit may
-    // have moved since.
+/// [`ingest_locked`] under both locks.
+async fn ingest_across_locked(
+    state: &IndexCtx,
+    source: &Source,
+    bundle_arg: &str,
+    expected_ref: &str,
+    full: bool,
+    push: &RunHandle,
+) -> Result<IndexReport, IngestError> {
+    // Read under both locks: the caller read the source before waiting, and another process may
+    // have indexed since. From here only this run moves the indexed commit.
     let source = get_source(&state.pool, source.tenant_id, source.id)
         .await?
         .ok_or_else(|| anyhow!("source {} vanished", source.id))?;
@@ -410,10 +424,7 @@ async fn ingest_locked(
     let paths = RepoPaths::new(&state.config.data_dir, source.id)?;
     ensure_mirror(&paths).await?;
     fetch_bundle(&paths, bundle_arg, expected_ref).await?;
-    let lock = lock_across_processes(state, source.id).await?;
-    let result = index_commit(state, &source, &paths, expected_ref, full, push).await;
-    lock.release().await;
-    result
+    index_commit(state, &source, &paths, expected_ref, full, push).await
 }
 
 /// Takes the source's cross-process lock (the one `lore index` holds) for a run of this server.
@@ -423,7 +434,7 @@ pub(crate) async fn lock_across_processes(
     state: &IndexCtx,
     source_id: Uuid,
 ) -> Result<lock::SourceAdvisoryLock, IngestError> {
-    lock::SourceAdvisoryLock::try_acquire(&state.config.database_url, source_id)
+    lock::SourceAdvisoryLock::try_acquire_for(&state.pool, source_id)
         .await?
         .ok_or(IngestError::Busy)
 }
@@ -440,6 +451,23 @@ async fn index_commit(
     commit: &str,
     full: bool,
     push: &RunHandle,
+) -> Result<IndexReport, IngestError> {
+    let mut pending = PendingEmbeddings::default();
+    let result = index_commit_staging(state, source, paths, commit, full, push, &mut pending).await;
+    // Also after a failure: the vectors a failed run computed are what its retry needs.
+    pending.publish(&state.pool).await;
+    result
+}
+
+/// [`index_commit`], staging fresh vectors in `pending` for the caller to publish.
+async fn index_commit_staging(
+    state: &IndexCtx,
+    source: &Source,
+    paths: &RepoPaths,
+    commit: &str,
+    full: bool,
+    push: &RunHandle,
+    pending: &mut PendingEmbeddings,
 ) -> Result<IndexReport, IngestError> {
     paths
         .mirror_git(&["update-ref", "refs/heads/lore-indexed", commit])
@@ -459,7 +487,7 @@ async fn index_commit(
     push.indexing(changes.upserts.len() + changes.deleted.len(), full_mode);
     let mut job = Job {
         state,
-        pending: PendingEmbeddings::default(),
+        pending,
         source,
         paths,
         commit,
@@ -473,65 +501,45 @@ async fn index_commit(
         },
         kept: HashSet::new(),
         totals: IndexStats::default(),
-        planned: Vec::new(),
     };
 
-    // A first index has no earlier version for search to fall back on, so it publishes as it
-    // goes: every `LORE_FIRST_INDEX_BATCH` files commit on their own, and the repo is searchable
-    // (partially) within minutes instead of after the whole run. `indexed_commit` is set only by
-    // the last transaction, so until then the source reads as partial. A run that dies keeps its
-    // batches, and the retry finds those files stored with the same hash and skips them.
-    // Any later index keeps one transaction, so search never mixes two commits.
+    // Chunking and embedding happen before a write transaction opens: embedding is nearly all
+    // of a run's time, and the source's row lock should not be held through it. Fresh vectors
+    // are checkpointed to the cache meanwhile, so a run that dies loses no embedding work.
     let first_index = source.indexed_commit.is_none();
-    let batch = if first_index {
-        state.config.first_index_batch
-    } else {
-        changes.upserts.len().max(1)
-    };
-    for entries in changes.upserts.chunks(batch) {
-        // Chunk and embed before the transaction opens: embedding is nearly all of a run's time,
-        // and the source's row lock should not be held through it. Fresh vectors are
-        // checkpointed to the cache meanwhile, so a run that dies here loses no embedding work.
-        let mut planned = Vec::with_capacity(entries.len());
-        {
-            let mut conn = state.pool.acquire().await?;
-            for entry in entries {
-                let plan = plan_entry(
-                    state,
-                    &mut conn,
-                    &mut job.pending,
-                    source,
-                    paths,
-                    commit,
-                    entry,
-                )
-                .await?;
-                if let Planned::Write(p) = &plan {
-                    job.totals.add(&p.stats);
-                }
-                planned.push(plan);
-                push.file_done(&job.totals);
+    let planned = if first_index {
+        // A first index has no earlier version for search to fall back on, so it publishes as
+        // it goes: every `LORE_FIRST_INDEX_BATCH` files commit on their own, and the repo is
+        // searchable (partially) within minutes. `indexed_commit` is set only by the last
+        // transaction, so until then the source reads as partial. A run that dies keeps its
+        // batches, and the retry finds those files stored with the same hash and skips them. A
+        // retry at a newer head serves the older run's leftovers next to its own batches until
+        // its last transaction deletes what the new tree lacks; `partial` covers that too.
+        for entries in changes.upserts.chunks(state.config.first_index_batch) {
+            let planned = job.plan(entries, push, usize::MAX).await?;
+            let mut tx = lock_source(state, source, paths, full_mode).await?;
+            for plan in planned {
+                job.apply(&mut tx, plan).await?;
             }
+            tx.commit().await?;
         }
-        if !first_index {
-            // The one transaction of a later index: written below with the deletions.
-            job.planned = planned;
-            break;
-        }
-        let mut tx = lock_source(state, source, paths, full_mode).await?;
-        for plan in planned {
-            job.apply(&mut tx, plan).await?;
-        }
-        tx.commit().await?;
-    }
+        Vec::new()
+    } else {
+        // A later index publishes in one transaction, so search never mixes two commits. Only
+        // the first `LORE_MAX_HELD_CHUNKS` chunks (about 100 MB at the default) keep their
+        // vectors until it; the rest are embedded now, warming the cache, and prepared again in
+        // the transaction from the cache. A chunker version bump on a big repo re-chunks it all.
+        job.plan(&changes.upserts, push, state.config.max_held_chunks)
+            .await?
+    };
 
     // MVCC keeps the old repo visible until every document and the commit pointer are ready.
     let mut tx = lock_source(state, source, paths, full_mode).await?;
-    for plan in std::mem::take(&mut job.planned) {
+    for plan in planned {
         job.apply(&mut tx, plan).await?;
     }
     for path in &changes.deleted {
-        if job.delete_doc(&mut tx, path).await? {
+        if delete_document(&mut tx, source.id, path).await? {
             job.report.files_deleted += 1;
         }
         push.file_done(&job.totals);
@@ -541,7 +549,6 @@ async fn index_commit(
     }
     set_indexed_commit(&mut *tx, source.id, commit).await?;
     tx.commit().await?;
-    job.pending.publish(&state.pool).await;
     Ok(job.report)
 }
 
@@ -964,6 +971,8 @@ enum Planned {
     Unchanged { entry: Entry, hash: String },
     /// Chunked and embedded, to be written.
     Write(Box<PreparedText>),
+    /// Embedded (into the cache) but not held: prepared again when written.
+    Deferred(Entry),
 }
 
 /// Reads one path at `commit` and decides what to do with it, chunking and embedding it when it
@@ -1044,7 +1053,7 @@ async fn plan_entry(
 /// One ingest run: the counters and the paths seen so far.
 struct Job<'a> {
     state: &'a IndexCtx,
-    pending: PendingEmbeddings,
+    pending: &'a mut PendingEmbeddings,
     source: &'a Source,
     paths: &'a RepoPaths,
     commit: &'a str,
@@ -1053,11 +1062,44 @@ struct Job<'a> {
     kept: HashSet<String>,
     /// Chunks written and embedded so far, and the time spent embedding, for the push's progress.
     totals: IndexStats,
-    /// A later index's prepared files, written with its deletions in its one transaction.
-    planned: Vec<Planned>,
 }
 
 impl Job<'_> {
+    /// Plans `entries` on a pool connection, outside any transaction. Once `max_held` chunks are
+    /// held, a file that was embedded is kept as `Deferred` instead of with its vectors.
+    async fn plan(
+        &mut self,
+        entries: &[Entry],
+        push: &RunHandle,
+        max_held: usize,
+    ) -> Result<Vec<Planned>, IngestError> {
+        let mut conn = self.state.pool.acquire().await?;
+        let mut held = 0;
+        let mut planned = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut plan = plan_entry(
+                self.state,
+                &mut conn,
+                self.pending,
+                self.source,
+                self.paths,
+                self.commit,
+                entry,
+            )
+            .await?;
+            if let Planned::Write(p) = &plan {
+                self.totals.add(&p.stats);
+                held += p.stats.chunks;
+                if held > max_held {
+                    plan = Planned::Deferred(entry.clone());
+                }
+            }
+            planned.push(plan);
+            push.file_done(&self.totals);
+        }
+        Ok(planned)
+    }
+
     /// Writes one planned path in `tx`.
     async fn apply(
         &mut self,
@@ -1065,7 +1107,10 @@ impl Job<'_> {
         plan: Planned,
     ) -> Result<(), IngestError> {
         let prepared = match plan {
-            Planned::Skip(path) => return self.skip(tx, &path).await,
+            Planned::Skip(path) => {
+                self.skip(tx, &path).await?;
+                None
+            }
             Planned::Unchanged { entry, hash } => {
                 // Read again under the row lock: another writer may have changed the document
                 // since the plan. Then it is prepared again here, on the transaction.
@@ -1075,30 +1120,40 @@ impl Job<'_> {
                     self.kept.insert(entry.path);
                     return Ok(());
                 }
-                let (state, source, paths, commit) =
-                    (self.state, self.source, self.paths, self.commit);
-                match plan_entry(state, tx, &mut self.pending, source, paths, commit, &entry)
-                    .await?
-                {
-                    Planned::Write(p) => {
-                        self.totals.add(&p.stats);
-                        p
-                    }
-                    Planned::Skip(path) => return self.skip(tx, &path).await,
-                    Planned::Unchanged { entry, .. } => {
-                        self.report.files_unchanged += 1;
-                        self.kept.insert(entry.path);
-                        return Ok(());
-                    }
-                }
+                self.replan(tx, entry).await?
             }
-            Planned::Write(p) => p,
+            Planned::Deferred(entry) => self.replan(tx, entry).await?,
+            Planned::Write(p) => Some(p),
         };
-        write_repo_text(tx, &prepared).await?;
-        self.report.files_indexed += 1;
-        self.report.chunks += prepared.stats.chunks;
-        self.kept.insert(prepared.path().to_string());
+        if let Some(prepared) = prepared {
+            write_repo_text(tx, &prepared).await?;
+            self.report.files_indexed += 1;
+            self.report.chunks += prepared.stats.chunks;
+            self.kept.insert(prepared.path().to_string());
+        }
         Ok(())
+    }
+
+    /// Prepares `entry` again inside `tx` (vectors come from the cache the plan warmed). `None`
+    /// when it turned out skipped or unchanged, which this records.
+    async fn replan(
+        &mut self,
+        tx: &mut Transaction<'static, Postgres>,
+        entry: Entry,
+    ) -> Result<Option<Box<PreparedText>>, IngestError> {
+        let (state, source, paths, commit) = (self.state, self.source, self.paths, self.commit);
+        match plan_entry(state, tx, self.pending, source, paths, commit, &entry).await? {
+            Planned::Write(p) => Ok(Some(p)),
+            Planned::Skip(path) => {
+                self.skip(tx, &path).await?;
+                Ok(None)
+            }
+            Planned::Unchanged { entry, .. } | Planned::Deferred(entry) => {
+                self.report.files_unchanged += 1;
+                self.kept.insert(entry.path);
+                Ok(None)
+            }
+        }
     }
 
     /// Counts the path as skipped and drops its document, if it has one.
@@ -1108,19 +1163,10 @@ impl Job<'_> {
         path: &str,
     ) -> Result<(), IngestError> {
         self.report.files_skipped += 1;
-        if self.delete_doc(tx, path).await? {
+        if delete_document(tx, self.source.id, path).await? {
             self.report.files_deleted += 1;
         }
         Ok(())
-    }
-
-    async fn delete_doc(
-        &mut self,
-        tx: &mut Transaction<'static, Postgres>,
-        path: &str,
-    ) -> Result<bool, IngestError> {
-        let deleted = delete_document(tx, self.source.id, path).await?;
-        Ok(deleted)
     }
 
     /// Full mode: deletes the documents of paths that are not in the new tree.
@@ -1129,7 +1175,7 @@ impl Job<'_> {
         tx: &mut Transaction<'static, Postgres>,
     ) -> Result<(), IngestError> {
         for id in list_external_ids(&mut **tx, self.source.id).await? {
-            if !self.kept.contains(&id) && self.delete_doc(tx, &id).await? {
+            if !self.kept.contains(&id) && delete_document(tx, self.source.id, &id).await? {
                 self.report.files_deleted += 1;
             }
         }
