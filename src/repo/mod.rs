@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -30,8 +30,9 @@ use crate::config::Config;
 use crate::embed::Embedder;
 use crate::error::AppError;
 use crate::store::{
-    IndexStats, NewDocument, PendingEmbeddings, Source, delete_document, document_hash, get_source,
-    index_repo_text, list_external_ids, set_indexed_commit,
+    IndexStats, NewDocument, PendingEmbeddings, PreparedText, Source, delete_document,
+    document_hash, get_source, list_external_ids, prepare_repo_text, set_indexed_commit,
+    write_repo_text,
 };
 
 pub mod lock;
@@ -435,6 +436,28 @@ async fn index_commit(
 
     refresh_checkout(paths, commit).await?;
 
+    // Chunk and embed every changed file before the transaction opens: embedding is nearly all of
+    // a push's time, and the source's row lock should not be held through it. Fresh vectors are
+    // checkpointed to the cache meanwhile, so a push that dies here loses no embedding work.
+    push.indexing(changes.upserts.len() + changes.deleted.len(), full_mode);
+    let mut pending = PendingEmbeddings::default();
+    let mut totals = IndexStats::default();
+    let mut planned = Vec::with_capacity(changes.upserts.len());
+    {
+        let mut conn = state.pool.acquire().await?;
+        for entry in &changes.upserts {
+            let plan =
+                plan_entry(state, &mut conn, &mut pending, source, paths, commit, entry).await?;
+            if let Planned::Write(p) = &plan {
+                totals.chunks += p.stats.chunks;
+                totals.embedded += p.stats.embedded;
+                totals.embed_time += p.stats.embed_time;
+            }
+            planned.push(plan);
+            push.file_done(&totals);
+        }
+    }
+
     // MVCC keeps the old repo visible until every document and the commit pointer are ready.
     // Keep all lookups on this connection: even a one-connection pool can finish a push.
     let mut tx = state.pool.begin().await?;
@@ -483,7 +506,7 @@ async fn index_commit(
     let mut job = Job {
         state,
         tx,
-        pending: PendingEmbeddings::default(),
+        pending,
         source,
         paths,
         commit,
@@ -496,12 +519,10 @@ async fn index_commit(
             chunks: 0,
         },
         kept: HashSet::new(),
-        totals: IndexStats::default(),
+        totals,
     };
-    push.indexing(changes.upserts.len() + changes.deleted.len(), full_mode);
-    for entry in &changes.upserts {
-        job.index_entry(entry).await?;
-        push.file_done(&job.totals);
+    for plan in planned {
+        job.apply(plan).await?;
     }
     for path in &changes.deleted {
         if job.delete_doc(path).await? {
@@ -697,7 +718,7 @@ async fn checkout_commit(paths: &RepoPaths) -> Option<String> {
 }
 
 /// A path and its git file mode in the new commit.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     path: String,
     mode: String,
@@ -872,6 +893,91 @@ struct DocMetadata<'a> {
     commit: &'a str,
 }
 
+/// What a push does with one added or modified path, decided before its transaction opens.
+enum Planned {
+    /// Not indexed (not a regular file, a skipped path, too big, binary): its document goes.
+    Skip(String),
+    /// The stored document already has this content.
+    Unchanged { entry: Entry, hash: String },
+    /// Chunked and embedded, to be written.
+    Write(Box<PreparedText>),
+}
+
+/// Reads one path at `commit` and decides what to do with it, chunking and embedding it when it
+/// changed. Database reads use `conn`.
+async fn plan_entry(
+    state: &IndexCtx,
+    conn: &mut PgConnection,
+    pending: &mut PendingEmbeddings,
+    source: &Source,
+    paths: &RepoPaths,
+    commit: &str,
+    entry: &Entry,
+) -> Result<Planned, IngestError> {
+    let path = entry.path.as_str();
+    let skip = || Ok(Planned::Skip(path.to_string()));
+    // Only regular files: not symlinks (120000), submodules (160000) or anything odd.
+    let regular = matches!(entry.mode.as_str(), "100644" | "100755");
+    if !regular || path_is_skipped(path) {
+        return skip();
+    }
+    // The `<commit>:<path>` form reads the object from the tree. It cannot be taken for an
+    // option and never follows a symlink.
+    let spec = format!("{commit}:{path}");
+    let size = paths.mirror_git(&["cat-file", "-s", &spec]).await?;
+    let size: u64 = String::from_utf8_lossy(&size)
+        .trim()
+        .parse()
+        .context("cat-file -s printed a bad size")?;
+    if size > MAX_FILE_BYTES {
+        return skip();
+    }
+    let blob = paths.mirror_git(&["cat-file", "blob", &spec]).await?;
+    // Postgres text cannot hold a NUL, and binary content is not worth indexing.
+    if blob.contains(&0) {
+        return skip();
+    }
+    let Ok(content) = String::from_utf8(blob) else {
+        return skip();
+    };
+
+    let content_hash = file_hash(&content);
+    let known = document_hash(&mut *conn, source.id, path).await?;
+    if known.as_deref() == Some(content_hash.as_str()) {
+        return Ok(Planned::Unchanged {
+            entry: entry.clone(),
+            hash: content_hash,
+        });
+    }
+
+    let lang = language_for(path);
+    let metadata = serde_json::to_value(DocMetadata {
+        path,
+        language: language_name(lang),
+        commit,
+    })
+    .context("building document metadata")?;
+    let doc = NewDocument {
+        tenant_id: source.tenant_id,
+        source_id: source.id,
+        external_id: path.to_string(),
+        kind: if lang == Language::Markdown {
+            "doc"
+        } else {
+            "code"
+        }
+        .to_string(),
+        title: path.to_string(),
+        uri: None,
+        metadata,
+        content_hash,
+        body: None,
+    };
+    let chunks = chunk_file(path, &content);
+    let prepared = prepare_repo_text(state, conn, pending, doc, chunks).await?;
+    Ok(Planned::Write(Box::new(prepared)))
+}
+
 /// One ingest run: the counters and the paths seen so far.
 struct Job<'a> {
     state: &'a IndexCtx,
@@ -888,74 +994,52 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
-    /// Indexes one added or modified path, or skips it (deleting its old document).
-    async fn index_entry(&mut self, entry: &Entry) -> Result<(), IngestError> {
-        let path = entry.path.as_str();
-        // Only regular files: not symlinks (120000), submodules (160000) or anything odd.
-        let regular = matches!(entry.mode.as_str(), "100644" | "100755");
-        if !regular || path_is_skipped(path) {
-            return self.skip(path).await;
-        }
-        // The `<commit>:<path>` form reads the object from the tree. It cannot be taken for an
-        // option and never follows a symlink.
-        let spec = format!("{}:{path}", self.commit);
-        let size = self.paths.mirror_git(&["cat-file", "-s", &spec]).await?;
-        let size: u64 = String::from_utf8_lossy(&size)
-            .trim()
-            .parse()
-            .context("cat-file -s printed a bad size")?;
-        if size > MAX_FILE_BYTES {
-            return self.skip(path).await;
-        }
-        let blob = self.paths.mirror_git(&["cat-file", "blob", &spec]).await?;
-        // Postgres text cannot hold a NUL, and binary content is not worth indexing.
-        if blob.contains(&0) {
-            return self.skip(path).await;
-        }
-        let Ok(content) = String::from_utf8(blob) else {
-            return self.skip(path).await;
-        };
-
-        let content_hash = file_hash(&content);
-        let known = document_hash(&mut *self.tx, self.source.id, path).await?;
-        if known.as_deref() == Some(content_hash.as_str()) {
-            self.report.files_unchanged += 1;
-            self.kept.insert(path.to_string());
-            return Ok(());
-        }
-
-        let lang = language_for(path);
-        let metadata = serde_json::to_value(DocMetadata {
-            path,
-            language: language_name(lang),
-            commit: self.commit,
-        })
-        .context("building document metadata")?;
-        let doc = NewDocument {
-            tenant_id: self.source.tenant_id,
-            source_id: self.source.id,
-            external_id: path.to_string(),
-            kind: if lang == Language::Markdown {
-                "doc"
-            } else {
-                "code"
+    /// Writes one planned path in the push's transaction.
+    async fn apply(&mut self, plan: Planned) -> Result<(), IngestError> {
+        let prepared = match plan {
+            Planned::Skip(path) => return self.skip(&path).await,
+            Planned::Unchanged { entry, hash } => {
+                // Read again under the row lock: another writer may have changed the document
+                // since the plan. Then it is prepared again here, on the transaction.
+                let known = document_hash(&mut *self.tx, self.source.id, &entry.path).await?;
+                if known.as_deref() == Some(hash.as_str()) {
+                    self.report.files_unchanged += 1;
+                    self.kept.insert(entry.path);
+                    return Ok(());
+                }
+                let (state, source, paths, commit) =
+                    (self.state, self.source, self.paths, self.commit);
+                match plan_entry(
+                    state,
+                    &mut self.tx,
+                    &mut self.pending,
+                    source,
+                    paths,
+                    commit,
+                    &entry,
+                )
+                .await?
+                {
+                    Planned::Write(p) => {
+                        self.totals.chunks += p.stats.chunks;
+                        self.totals.embedded += p.stats.embedded;
+                        self.totals.embed_time += p.stats.embed_time;
+                        p
+                    }
+                    Planned::Skip(path) => return self.skip(&path).await,
+                    Planned::Unchanged { entry, .. } => {
+                        self.report.files_unchanged += 1;
+                        self.kept.insert(entry.path);
+                        return Ok(());
+                    }
+                }
             }
-            .to_string(),
-            title: path.to_string(),
-            uri: None,
-            metadata,
-            content_hash,
-            body: None,
+            Planned::Write(p) => p,
         };
-        let chunks = chunk_file(path, &content);
-        let stats =
-            index_repo_text(self.state, &mut self.tx, &mut self.pending, doc, chunks).await?;
+        write_repo_text(&mut self.tx, &prepared).await?;
         self.report.files_indexed += 1;
-        self.report.chunks += stats.chunks;
-        self.totals.chunks += stats.chunks;
-        self.totals.embedded += stats.embedded;
-        self.totals.embed_time += stats.embed_time;
-        self.kept.insert(path.to_string());
+        self.report.chunks += prepared.stats.chunks;
+        self.kept.insert(prepared.path().to_string());
         Ok(())
     }
 

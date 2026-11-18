@@ -427,28 +427,20 @@ async fn delete_during_push(pool: PgPool, tenant: bool) {
     let push = env.start_push(env.gated_router(gate.clone()), false);
     gate.wait().await;
     let id = if tenant { env.tenant } else { env.source };
-    let mut deletion = tokio::spawn(async move {
-        sqlx::query(if tenant {
-            "DELETE FROM tenants WHERE id = $1"
-        } else {
-            "DELETE FROM sources WHERE id = $1"
-        })
-        .bind(id)
-        .execute(&pool)
-        .await
-    });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut deletion)
-            .await
-            .is_err()
-    );
+    // Embedding runs before the push takes the source's row lock, so a delete does not wait
+    // for it. The push then finds its source gone and writes nothing.
+    sqlx::query(if tenant {
+        "DELETE FROM tenants WHERE id = $1"
+    } else {
+        "DELETE FROM sources WHERE id = $1"
+    })
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
     gate.release();
-    assert_eq!(push.await.unwrap().0, StatusCode::OK);
-    tokio::time::timeout(Duration::from_secs(5), deletion)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let (status, body) = push.await.unwrap();
+    assert_ne!(status, StatusCode::OK, "{body}");
     if tenant {
         let (status, _) = send(
             &env.router,
@@ -471,12 +463,12 @@ async fn delete_during_push(pool: PgPool, tenant: bool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn source_delete_cannot_interleave_with_repo_publication(pool: PgPool) {
+async fn source_delete_during_embedding_aborts_the_push(pool: PgPool) {
     delete_during_push(pool, false).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn tenant_cascade_cannot_deadlock_with_repo_publication(pool: PgPool) {
+async fn tenant_delete_during_embedding_aborts_the_push(pool: PgPool) {
     delete_during_push(pool, true).await;
 }
 

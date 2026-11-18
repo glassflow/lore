@@ -576,7 +576,10 @@ const CACHE_INSERT_CHUNK: usize = 1000;
 
 /// Adds vectors to the cache. A key that is already there keeps its row: the same embedder gave
 /// the same text the same vector.
-async fn put_cached_embeddings(pool: &PgPool, entries: &[(&[u8], &Vec<f32>)]) -> sqlx::Result<()> {
+async fn put_cached_embeddings(
+    conn: &mut sqlx::PgConnection,
+    entries: &[(&[u8], &Vec<f32>)],
+) -> sqlx::Result<()> {
     for chunk in entries.chunks(CACHE_INSERT_CHUNK) {
         let mut q =
             sqlx::QueryBuilder::<Postgres>::new("INSERT INTO embedding_cache (key, embedding) ");
@@ -584,19 +587,45 @@ async fn put_cached_embeddings(pool: &PgPool, entries: &[(&[u8], &Vec<f32>)]) ->
             b.push_bind(*key).push_bind(Vector::from((*v).clone()));
         });
         q.push(" ON CONFLICT (key) DO NOTHING");
-        q.build().execute(pool).await?;
+        q.build().execute(&mut *conn).await?;
     }
     Ok(())
 }
 
-/// Fresh exact-key vectors awaiting publication, never written while a repo transaction holds
-/// document/source locks. Dropping this on rollback simply leaves cold cache entries.
+/// Fresh exact-key vectors awaiting publication. They are written on their own connection, never
+/// on the repo transaction, so a rollback keeps whatever was already checkpointed.
 #[derive(Default)]
 pub(crate) struct PendingEmbeddings {
     entries: Vec<([u8; 32], Vec<f32>)>,
 }
 
+/// Staged vectors written to the cache mid-push once this many have built up, so a push that dies
+/// (job time limit, crash) leaves its embeddings behind and the retry does not compute them again.
+const CHECKPOINT_ENTRIES: usize = 256;
+
 impl PendingEmbeddings {
+    /// Mid-push: writes the staged vectors to the cache on a second connection, if one is free
+    /// right now. The cache has no foreign keys, so this takes no lock the repo transaction holds.
+    /// With no free connection (a one-connection pool) the vectors stay staged until `publish`.
+    pub(crate) async fn checkpoint(&mut self, pool: &PgPool) {
+        if self.entries.len() < CHECKPOINT_ENTRIES {
+            return;
+        }
+        let Some(mut conn) = pool.try_acquire() else {
+            return;
+        };
+        let mut entries: Vec<(&[u8], &Vec<f32>)> = self
+            .entries
+            .iter()
+            .map(|(key, vector)| (key.as_slice(), vector))
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        match put_cached_embeddings(&mut conn, &entries).await {
+            Ok(()) => self.entries.clear(),
+            Err(error) => tracing::warn!(%error, "embedding cache checkpoint failed; kept staged"),
+        }
+    }
+
     /// Publish only after the document transaction has committed and released its connection.
     /// A cache error must not report an already-published index as a failed push.
     pub(crate) async fn publish(self, pool: &PgPool) {
@@ -618,7 +647,11 @@ impl PendingEmbeddings {
             .collect();
         // Every INSERT is an independent short statement, with one global lock order.
         entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        if let Err(error) = put_cached_embeddings(pool, &entries).await {
+        let result = match pool.acquire().await {
+            Ok(mut conn) => put_cached_embeddings(&mut conn, &entries).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
             tracing::warn!(%error, "embedding cache publication failed; index is already committed");
         }
     }
@@ -680,8 +713,8 @@ async fn stored_embeddings<'e>(
 /// Exact model/text cache hits and unchanged chunks from this document keep their vectors.
 /// A moved file is embedded again, because its path is part of `embed_text`.
 ///
-/// Standalone indexing embeds before opening its write transaction. Repo pushes instead use
-/// `index_repo_text` and retain one connection until all documents and the commit pointer publish.
+/// Standalone indexing embeds before opening its write transaction. Repo pushes do the same per
+/// push: `prepare_repo_text` for every file first, then `write_repo_text` in one transaction.
 /// `title_for_embed` is the path or title passed to `embed_text`.
 pub async fn index_text(
     state: &AppState,
@@ -742,19 +775,29 @@ pub async fn index_text_with_stats(
     Ok(stats)
 }
 
-/// Repo pushes keep every changed document in the same transaction. Cache and document reads
-/// use that connection; fresh vectors are staged until the entire push commits.
-pub(crate) async fn index_repo_text(
+/// A repo file chunked and embedded, ready to be written by [`write_repo_text`].
+pub(crate) struct PreparedText {
+    doc: NewDocument,
+    indexed: Vec<IndexedChunk>,
+    pub stats: IndexStats,
+}
+
+/// Chunks and embeds one repo file. Repo pushes call this before opening their transaction, so
+/// the slow part (the embedder) never runs while the transaction holds the source's row lock.
+/// Cache and stored-vector reads use `conn`; fresh vectors are staged in `pending` and
+/// checkpointed to the cache on another connection as they build up, so a push that dies keeps
+/// them for its retry.
+pub(crate) async fn prepare_repo_text(
     state: &IndexCtx,
-    tx: &mut Transaction<'_, Postgres>,
+    conn: &mut PgConnection,
     pending: &mut PendingEmbeddings,
     doc: NewDocument,
     chunks: Vec<Chunk>,
-) -> Result<IndexStats> {
+) -> Result<PreparedText> {
     let keys = cache_keys(state, doc.tenant_id, &doc.title, &chunks);
-    let cached = cached_embeddings(&mut **tx, keys.as_deref().unwrap_or_default()).await?;
+    let cached = cached_embeddings(&mut *conn, keys.as_deref().unwrap_or_default()).await?;
     let stored = stored_embeddings(
-        &mut **tx,
+        &mut *conn,
         doc.tenant_id,
         doc.source_id,
         &doc.external_id,
@@ -763,10 +806,30 @@ pub(crate) async fn index_repo_text(
     .await?;
     let (indexed, stats, fresh) =
         prepare_chunks(state, chunks, &doc.title, stored, keys, cached).await?;
-    let id = upsert_document(tx, &doc).await?;
-    replace_chunks(tx, doc.tenant_id, id, &indexed).await?;
     pending.entries.extend(fresh.entries);
-    Ok(stats)
+    pending.checkpoint(&state.pool).await;
+    Ok(PreparedText {
+        doc,
+        indexed,
+        stats,
+    })
+}
+
+impl PreparedText {
+    /// The repo path of the file.
+    pub(crate) fn path(&self) -> &str {
+        &self.doc.external_id
+    }
+}
+
+/// Writes a prepared repo file in the push's transaction.
+pub(crate) async fn write_repo_text(
+    tx: &mut Transaction<'_, Postgres>,
+    prepared: &PreparedText,
+) -> Result<()> {
+    let id = upsert_document(tx, &prepared.doc).await?;
+    replace_chunks(tx, prepared.doc.tenant_id, id, &prepared.indexed).await?;
+    Ok(())
 }
 
 async fn prepare_chunks(
