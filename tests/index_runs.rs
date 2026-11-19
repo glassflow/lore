@@ -112,6 +112,7 @@ fn report(chunks: usize) -> IndexReport {
         files_unchanged: 0,
         files_skipped: 0,
         files_deleted: 0,
+        files_in_index: 0,
         chunks,
     }
 }

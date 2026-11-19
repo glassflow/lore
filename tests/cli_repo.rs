@@ -148,6 +148,7 @@ async fn push_indexes_full_then_incremental_then_nothing(pool: PgPool) {
     assert_eq!(report["files_unchanged"], 0);
     assert_eq!(report["files_skipped"], 1);
     assert_eq!(report["indexed_commit"], first.as_str());
+    assert_eq!(report["files_in_index"], 6);
     assert!(report["chunks"].as_u64().unwrap() > 0);
 
     // A change to one file sends only the new commit: the other files are not even looked at
@@ -159,6 +160,8 @@ async fn push_indexes_full_then_incremental_then_nothing(pool: PgPool) {
     assert_eq!(report["files_unchanged"], 0);
     assert_eq!(report["files_deleted"], 0);
     assert_eq!(report["indexed_commit"], second.as_str());
+    // An edit adds no file: the index holds the same 6.
+    assert_eq!(report["files_in_index"], 6);
 
     // Nothing new: no bundle at all, a report of zeros, and the same commit.
     let out = env.push(&repo, &[]).await;
@@ -170,6 +173,8 @@ async fn push_indexes_full_then_incremental_then_nothing(pool: PgPool) {
     assert_eq!(report["files_deleted"], 0);
     assert_eq!(report["chunks"], 0);
     assert_eq!(report["indexed_commit"], second.as_str());
+    // The report has no bundle to read it from: it says what the repo list says.
+    assert_eq!(report["files_in_index"], 6);
 
     env.assert_no_leftover_bundles();
 }

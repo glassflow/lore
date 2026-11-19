@@ -60,6 +60,9 @@ struct RepoItem {
     name: String,
     indexed_commit: Option<String>,
     web_url_template: Option<String>,
+    /// Missing from an older server.
+    #[serde(default)]
+    files_in_index: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,6 +139,7 @@ async fn push(client: &Client, args: PushArgs) -> Result<()> {
             files_unchanged: 0,
             files_skipped: 0,
             files_deleted: 0,
+            files_in_index: repo.files_in_index,
             chunks: 0,
         }
     } else {
@@ -338,6 +342,7 @@ mod tests {
             files_unchanged: 1,
             files_skipped: 3,
             files_deleted: 2,
+            files_in_index: 7,
             chunks: 40,
         };
         assert_eq!(
@@ -353,6 +358,7 @@ mod tests {
             name: "sample".to_string(),
             indexed_commit: None,
             web_url_template: None,
+            files_in_index: 0,
         };
         assert_eq!(format_repo_line(&r), "sample  -  -");
         r.indexed_commit = Some("0123456789abcdef0123456789abcdef01234567".to_string());

@@ -149,6 +149,41 @@ pub async fn list_sources(
     .await
 }
 
+/// How many files a repo source's index holds: its document rows. A repo's documents are its
+/// indexed files (skipped and deleted files have none), so this is a count of rows, never a walk
+/// of the git tree.
+pub async fn count_source_files(
+    executor: impl sqlx::PgExecutor<'_>,
+    source_id: Uuid,
+) -> sqlx::Result<usize> {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM documents WHERE source_id = $1")
+        .bind(source_id)
+        .fetch_one(executor)
+        .await?;
+    Ok(usize::try_from(n).unwrap_or_default())
+}
+
+/// [`count_source_files`] for every repo source of the tenant at once, in one query. A repo
+/// without documents is absent from the map.
+pub async fn repo_file_totals(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> sqlx::Result<std::collections::HashMap<Uuid, usize>> {
+    let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT d.source_id, count(*) FROM documents d
+         JOIN sources s ON s.id = d.source_id
+         WHERE s.tenant_id = $1 AND s.kind = 'repo'
+         GROUP BY d.source_id",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, n)| (id, usize::try_from(n).unwrap_or_default()))
+        .collect())
+}
+
 /// The id of the tenant's `session` document with this `external_id` (the session id), or `None`.
 /// If several traces sources hold the same session id, the most recently updated one wins.
 pub async fn find_session_document(

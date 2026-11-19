@@ -30,9 +30,9 @@ use crate::config::Config;
 use crate::embed::Embedder;
 use crate::error::AppError;
 use crate::store::{
-    IndexStats, NewDocument, PendingEmbeddings, PreparedText, Source, delete_document,
-    document_hash, get_source, list_external_ids, prepare_repo_text, set_indexed_commit,
-    write_repo_text,
+    IndexStats, NewDocument, PendingEmbeddings, PreparedText, Source, count_source_files,
+    delete_document, document_hash, get_source, list_external_ids, prepare_repo_text,
+    set_indexed_commit, write_repo_text,
 };
 
 pub mod lock;
@@ -85,6 +85,10 @@ pub struct IndexReport {
     pub files_unchanged: usize,
     pub files_skipped: usize,
     pub files_deleted: usize,
+    /// The files whose chunks are in the index after this run: indexed plus unchanged, never
+    /// skipped or deleted ones. Counted from the source's document rows, not from the git tree.
+    #[serde(default)]
+    pub files_in_index: usize,
     pub chunks: usize,
 }
 
@@ -497,6 +501,7 @@ async fn index_commit_staging(
             files_unchanged: 0,
             files_skipped: changes.skipped_paths,
             files_deleted: 0,
+            files_in_index: 0,
             chunks: 0,
         },
         kept: HashSet::new(),
@@ -547,6 +552,10 @@ async fn index_commit_staging(
     if full_mode {
         job.delete_vanished(&mut tx).await?;
     }
+    // The last transaction of the run, the one that sets `indexed_commit`: the batches of a first
+    // index are committed by now, so the count holds them, this transaction's own writes, and
+    // nothing another run writes meanwhile (the source row is locked).
+    job.report.files_in_index = count_source_files(&mut *tx, source.id).await?;
     set_indexed_commit(&mut *tx, source.id, commit).await?;
     tx.commit().await?;
     Ok(job.report)
