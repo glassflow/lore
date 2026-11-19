@@ -41,7 +41,7 @@ curl -X PUT "localhost:8080/v1/repos/<id>/bundle?ref=$(git rev-parse HEAD)&full=
   -H "Authorization: Bearer $LORE_KEY" --data-binary @/tmp/repo.bundle
 ```
 
-`ref` is the full 40 character lowercase sha of the bundle's `HEAD`. With `full=true` the bundle holds the whole history and the tree is re-indexed, deleting documents of files that are gone. With `full=false` the bundle may be incremental (`git bundle create out.bundle <last-sha>..HEAD`) and only changed files are indexed. If the server no longer has the last indexed commit, or the bundle needs commits it lacks, the answer is 409 (`need_full_bundle`) and the client sends a full bundle. The answer is a report with `indexed_commit`, `files_indexed`, `files_unchanged`, `files_skipped`, `files_deleted` and `chunks`.
+`ref` is the full 40 character lowercase sha of the bundle's `HEAD`. With `full=true` the bundle holds the whole history and the tree is re-indexed, deleting documents of files that are gone. With `full=false` the bundle may be incremental (`git bundle create out.bundle <last-sha>..HEAD`) and only changed files are indexed. If the server no longer has the last indexed commit, or the bundle needs commits it lacks, the answer is 409 (`need_full_bundle`) and the client sends a full bundle. The answer is a report with `indexed_commit`, `files_indexed`, `files_unchanged`, `files_skipped`, `files_deleted`, `files_in_index` and `chunks`. The first five count what this push touched; `files_in_index` is how many files the repo's index holds after it (indexed plus unchanged, never skipped or deleted ones), counted from the repo's documents in Postgres. It is not the `files_total` of the progress route, which counts the files a run indexes or deletes. `POST /v1/repos/{id}/sync` answers the same report, and each item of `GET /v1/repos` carries `files_in_index` too.
 
 `DELETE /v1/repos/{id}` needs an `ingest` key and deletes one of the tenant's repos with everything the admin delete of a source removes: the source, its documents and chunks, its mirror and its checkout on the server. The answer is 204. An unknown id, an id of another tenant and an id that is not a repo are all a 404. While a run of the repo is going (a push, a sync, or a `lore index` Job whose run was written in the last 90 seconds) the answer is 409, and nothing is deleted; try again when the run ends. `curl -X DELETE localhost:8080/v1/repos/<id> -H "Authorization: Bearer $LORE_KEY"`.
 
@@ -149,7 +149,7 @@ Two ways to sync without anyone calling the route:
 export LORE_DATABASE_URL=postgres://lore:...@db/lore
 export LORE_INDEX_TOKEN=...        # only for a private remote
 lore index --tenant <tenant id> --repo <source id> --remote https://github.com/acme/app.git
-# {"commit":"3f2a...","files_indexed":212,"files_unchanged":0,"files_skipped":4,"files_deleted":0,"chunks":1480,"chunks_embedded":1480,"embed_ms":61234,"full":true}
+# {"commit":"3f2a...","files_indexed":212,"files_unchanged":0,"files_skipped":4,"files_deleted":0,"files_in_index":212,"chunks":1480,"chunks_embedded":1480,"embed_ms":61234,"full":true}
 ```
 
 | Flag | Meaning |

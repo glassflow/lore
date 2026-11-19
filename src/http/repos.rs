@@ -18,7 +18,9 @@ use crate::http::{AppJson, AppQuery, AppState};
 use crate::repo::progress::{IndexRun, latest_run};
 use crate::repo::sync::{SyncReport, check_remote_url, remote_urls, set_remote_url};
 use crate::repo::{IndexReport, ingest_bundle, is_full_sha};
-use crate::store::{Source, ensure_source, get_source, list_sources};
+use crate::store::{
+    Source, count_source_files, ensure_source, get_source, list_sources, repo_file_totals,
+};
 
 #[derive(Deserialize)]
 pub struct CreateRepo {
@@ -35,16 +37,19 @@ pub struct RepoItem {
     indexed_commit: Option<String>,
     web_url_template: Option<String>,
     remote_url: Option<String>,
+    /// The files whose chunks are in the index now.
+    files_in_index: usize,
 }
 
 impl RepoItem {
-    fn new(s: Source, remote_url: Option<String>) -> Self {
+    fn new(s: Source, remote_url: Option<String>, files_in_index: usize) -> Self {
         Self {
             id: s.id,
             name: s.name,
             indexed_commit: s.indexed_commit,
             web_url_template: s.web_url_template,
             remote_url,
+            files_in_index,
         }
     }
 }
@@ -99,7 +104,8 @@ pub async fn create_repo(
     }
     let mut remotes = remote_urls(&state.pool, caller.tenant_id).await?;
     let remote_url = remotes.remove(&source.id);
-    Ok(Json(RepoItem::new(source, remote_url)))
+    let files_in_index = count_source_files(&state.pool, source.id).await?;
+    Ok(Json(RepoItem::new(source, remote_url, files_in_index)))
 }
 
 pub async fn list_repos(
@@ -109,12 +115,15 @@ pub async fn list_repos(
     caller.require(Scope::Read)?;
     let sources = list_sources(&state.pool, caller.tenant_id, Some("repo")).await?;
     let mut remotes = remote_urls(&state.pool, caller.tenant_id).await?;
+    // One query for every repo of the tenant.
+    let mut totals = repo_file_totals(&state.pool, caller.tenant_id).await?;
     Ok(Json(RepoList {
         repos: sources
             .into_iter()
             .map(|s| {
                 let remote = remotes.remove(&s.id);
-                RepoItem::new(s, remote)
+                let total = totals.remove(&s.id).unwrap_or(0);
+                RepoItem::new(s, remote, total)
             })
             .collect(),
     }))

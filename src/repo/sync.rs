@@ -34,7 +34,7 @@ use super::{
 };
 use crate::error::AppError;
 use crate::http::AppState;
-use crate::store::{Source, get_source};
+use crate::store::{Source, count_source_files, get_source};
 
 /// A fetch that takes longer than this is stopped (git is killed with it).
 const FETCH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -549,6 +549,7 @@ async fn sync_locked(
                 files_unchanged: 0,
                 files_skipped: 0,
                 files_deleted: 0,
+                files_in_index: count_source_files(&state.pool, source.id).await?,
                 chunks: 0,
             },
             up_to_date: true,
