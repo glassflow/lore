@@ -243,7 +243,7 @@ impl LoreMcp {
     }
 
     #[tool(
-        description = "List the indexed sources with their kind, the commit a repo is indexed at, and the number of documents each holds.",
+        description = "List the indexed sources with their kind, the commit a repo is indexed at, and the number of documents each holds. A repo with `partial: true` is still being indexed for the first time: search finds only part of it, so a missing hit there does not mean the code is absent.",
         annotations(read_only_hint = true)
     )]
     async fn list_sources(

@@ -341,7 +341,11 @@ async fn list_sources_has_name_kind_commit_and_count(pool: PgPool) {
     assert!(s["documents"].as_i64().unwrap() >= 4, "{s}");
     let mut keys: Vec<&String> = s.as_object().unwrap().keys().collect();
     keys.sort();
-    assert_eq!(keys, ["documents", "indexed_commit", "kind", "name"]);
+    assert_eq!(
+        keys,
+        ["documents", "indexed_commit", "kind", "name", "partial"]
+    );
+    assert_eq!(s["partial"], false);
     client.cancel().await.unwrap();
 }
 

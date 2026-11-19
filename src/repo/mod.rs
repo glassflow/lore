@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -30,8 +30,9 @@ use crate::config::Config;
 use crate::embed::Embedder;
 use crate::error::AppError;
 use crate::store::{
-    IndexStats, NewDocument, PendingEmbeddings, Source, delete_document, document_hash, get_source,
-    index_repo_text, list_external_ids, set_indexed_commit,
+    IndexStats, NewDocument, PendingEmbeddings, PreparedText, Source, delete_document,
+    document_hash, get_source, list_external_ids, prepare_repo_text, set_indexed_commit,
+    write_repo_text,
 };
 
 pub mod lock;
@@ -93,6 +94,9 @@ pub enum IngestError {
     /// indexed commit). The client must send a full bundle with `full=true`.
     #[error("need a full bundle")]
     NeedFull,
+    /// Another process (a `lore index` Job, another replica) is indexing this source now.
+    #[error("another process is indexing this repo")]
+    Busy,
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error(transparent)]
@@ -115,6 +119,7 @@ impl From<IngestError> for AppError {
     fn from(e: IngestError) -> Self {
         match e {
             IngestError::NeedFull => AppError::Conflict("need_full_bundle".to_string()),
+            IngestError::Busy => AppError::Conflict("index_in_progress".to_string()),
             IngestError::BadRequest(m) => AppError::BadRequest(m),
             // The response says only "internal error"; the cause (git's stderr included) is
             // logged when the error becomes a response.
@@ -144,8 +149,8 @@ pub struct IndexCtx {
     pub source_locks: Arc<SourceLocks>,
 }
 
-/// One lock per source, so two pushes to the same repo never run at once. lore runs as a single
-/// replica, so an in-process lock is enough. An entry is added the first time a source (one that
+/// One lock per source, so two runs of this process on the same repo never run at once. Runs of
+/// other processes (a `lore index` Job) are kept apart by the advisory lock of [`lock`]. An entry is added the first time a source (one that
 /// exists in the database) is ingested and then reused, so the map holds at most one entry per
 /// source.
 #[derive(Default)]
@@ -376,6 +381,7 @@ pub async fn ingest_bundle(
 fn push_error(e: &IngestError) -> String {
     match e {
         IngestError::NeedFull => "need a full bundle (the CLI sends one next)".to_string(),
+        IngestError::Busy => "another process is indexing this repo".to_string(),
         IngestError::BadRequest(m) => m.clone(),
         IngestError::Other(_) => "internal error (see the server log)".to_string(),
     }
@@ -394,9 +400,23 @@ async fn ingest_locked(
     let lock = state.source_locks.get(source.id);
     let _guard = lock.lock().await;
     push.cloning();
+    let across = lock_across_processes(state, source.id).await?;
+    let result = ingest_across_locked(state, source, bundle_arg, expected_ref, full, push).await;
+    across.release().await;
+    result
+}
 
-    // The caller read the source before waiting for the lock, so the last indexed commit may
-    // have moved since.
+/// [`ingest_locked`] under both locks.
+async fn ingest_across_locked(
+    state: &IndexCtx,
+    source: &Source,
+    bundle_arg: &str,
+    expected_ref: &str,
+    full: bool,
+    push: &RunHandle,
+) -> Result<IndexReport, IngestError> {
+    // Read under both locks: the caller read the source before waiting, and another process may
+    // have indexed since. From here only this run moves the indexed commit.
     let source = get_source(&state.pool, source.tenant_id, source.id)
         .await?
         .ok_or_else(|| anyhow!("source {} vanished", source.id))?;
@@ -405,6 +425,18 @@ async fn ingest_locked(
     ensure_mirror(&paths).await?;
     fetch_bundle(&paths, bundle_arg, expected_ref).await?;
     index_commit(state, &source, &paths, expected_ref, full, push).await
+}
+
+/// Takes the source's cross-process lock (the one `lore index` holds) for a run of this server.
+/// Embedding happens before the row lock is taken, so without it a server and a Job would both
+/// embed the same repo at once. `Busy` when another process holds it.
+pub(crate) async fn lock_across_processes(
+    state: &IndexCtx,
+    source_id: Uuid,
+) -> Result<lock::SourceAdvisoryLock, IngestError> {
+    lock::SourceAdvisoryLock::try_acquire_for(&state.pool, source_id)
+        .await?
+        .ok_or(IngestError::Busy)
 }
 
 /// Indexes `commit`, which the mirror already holds, and records it as the source's indexed
@@ -419,6 +451,23 @@ async fn index_commit(
     commit: &str,
     full: bool,
     push: &RunHandle,
+) -> Result<IndexReport, IngestError> {
+    let mut pending = PendingEmbeddings::default();
+    let result = index_commit_staging(state, source, paths, commit, full, push, &mut pending).await;
+    // Also after a failure: the vectors a failed run computed are what its retry needs.
+    pending.publish(&state.pool).await;
+    result
+}
+
+/// [`index_commit`], staging fresh vectors in `pending` for the caller to publish.
+async fn index_commit_staging(
+    state: &IndexCtx,
+    source: &Source,
+    paths: &RepoPaths,
+    commit: &str,
+    full: bool,
+    push: &RunHandle,
+    pending: &mut PendingEmbeddings,
 ) -> Result<IndexReport, IngestError> {
     paths
         .mirror_git(&["update-ref", "refs/heads/lore-indexed", commit])
@@ -435,8 +484,84 @@ async fn index_commit(
 
     refresh_checkout(paths, commit).await?;
 
+    push.indexing(changes.upserts.len() + changes.deleted.len(), full_mode);
+    let mut job = Job {
+        state,
+        pending,
+        source,
+        paths,
+        commit,
+        report: IndexReport {
+            indexed_commit: commit.to_string(),
+            files_indexed: 0,
+            files_unchanged: 0,
+            files_skipped: changes.skipped_paths,
+            files_deleted: 0,
+            chunks: 0,
+        },
+        kept: HashSet::new(),
+        totals: IndexStats::default(),
+    };
+
+    // Chunking and embedding happen before a write transaction opens: embedding is nearly all
+    // of a run's time, and the source's row lock should not be held through it. Fresh vectors
+    // are checkpointed to the cache meanwhile, so a run that dies loses no embedding work.
+    let first_index = source.indexed_commit.is_none();
+    let planned = if first_index {
+        // A first index has no earlier version for search to fall back on, so it publishes as
+        // it goes: every `LORE_FIRST_INDEX_BATCH` files commit on their own, and the repo is
+        // searchable (partially) within minutes. `indexed_commit` is set only by the last
+        // transaction, so until then the source reads as partial. A run that dies keeps its
+        // batches, and the retry finds those files stored with the same hash and skips them. A
+        // retry at a newer head serves the older run's leftovers next to its own batches until
+        // its last transaction deletes what the new tree lacks; `partial` covers that too.
+        for entries in changes.upserts.chunks(state.config.first_index_batch) {
+            let planned = job.plan(entries, push, usize::MAX).await?;
+            let mut tx = lock_source(state, source, paths, full_mode).await?;
+            for plan in planned {
+                job.apply(&mut tx, plan).await?;
+            }
+            tx.commit().await?;
+        }
+        Vec::new()
+    } else {
+        // A later index publishes in one transaction, so search never mixes two commits. Only
+        // the first `LORE_MAX_HELD_CHUNKS` chunks (about 100 MB at the default) keep their
+        // vectors until it; the rest are embedded now, warming the cache, and prepared again in
+        // the transaction from the cache. A chunker version bump on a big repo re-chunks it all.
+        job.plan(&changes.upserts, push, state.config.max_held_chunks)
+            .await?
+    };
+
     // MVCC keeps the old repo visible until every document and the commit pointer are ready.
-    // Keep all lookups on this connection: even a one-connection pool can finish a push.
+    let mut tx = lock_source(state, source, paths, full_mode).await?;
+    for plan in planned {
+        job.apply(&mut tx, plan).await?;
+    }
+    for path in &changes.deleted {
+        if delete_document(&mut tx, source.id, path).await? {
+            job.report.files_deleted += 1;
+        }
+        push.file_done(&job.totals);
+    }
+    if full_mode {
+        job.delete_vanished(&mut tx).await?;
+    }
+    set_indexed_commit(&mut *tx, source.id, commit).await?;
+    tx.commit().await?;
+    Ok(job.report)
+}
+
+/// Opens a write transaction of an index run and locks the tenant and the source row in it.
+/// Every run's transactions do this, so a run never writes past a delete, and two runs (of this
+/// or another process) never write at the same time. Fails with `NeedFull` when the indexed
+/// commit is no longer the one the run started from: another process indexed meanwhile.
+async fn lock_source(
+    state: &IndexCtx,
+    source: &Source,
+    paths: &RepoPaths,
+    full_mode: bool,
+) -> Result<Transaction<'static, Postgres>, IngestError> {
     let mut tx = state.pool.begin().await?;
     // Parent first: a tenant cascade must not lock the tenant while we hold its source and
     // subsequently need a tenant FK lock for newly inserted chunks.
@@ -461,11 +586,13 @@ async fn index_commit(
     let Some((_, locked_commit)) = locked else {
         return Err(anyhow!("source {} vanished", source.id).into());
     };
-    // The diff above was computed from `source.indexed_commit`, read under the in-process lock
-    // only. Another process (`lore index`) may have committed another commit since, and the row
-    // lock is the first point where that is excluded. Applying the diff on top of it would keep
-    // files only that commit had, so ask for a full index instead; nothing is written yet.
-    if !full_mode && locked_commit != source.indexed_commit {
+    // The run read `source.indexed_commit` under the in-process lock only. Another process may
+    // have indexed since. A diff applied on top of that would keep files only that commit had,
+    // and the batches of a first index would mix with it, so ask for a full index instead.
+    // A full index of a source that was already indexed replaces every document in one
+    // transaction, so it may go on.
+    let full_over_indexed = full_mode && source.indexed_commit.is_some();
+    if locked_commit != source.indexed_commit && !full_over_indexed {
         tx.rollback().await?;
         // The mirror's indexed ref and the checkout already moved to `commit`, ahead of the
         // database. Put them back to what the database holds now (the other process's commit),
@@ -480,43 +607,7 @@ async fn index_commit(
         .await;
         return Err(IngestError::NeedFull);
     }
-    let mut job = Job {
-        state,
-        tx,
-        pending: PendingEmbeddings::default(),
-        source,
-        paths,
-        commit,
-        report: IndexReport {
-            indexed_commit: commit.to_string(),
-            files_indexed: 0,
-            files_unchanged: 0,
-            files_skipped: changes.skipped_paths,
-            files_deleted: 0,
-            chunks: 0,
-        },
-        kept: HashSet::new(),
-        totals: IndexStats::default(),
-    };
-    push.indexing(changes.upserts.len() + changes.deleted.len(), full_mode);
-    for entry in &changes.upserts {
-        job.index_entry(entry).await?;
-        push.file_done(&job.totals);
-    }
-    for path in &changes.deleted {
-        if job.delete_doc(path).await? {
-            job.report.files_deleted += 1;
-        }
-        push.file_done(&job.totals);
-    }
-    if full_mode {
-        job.delete_vanished().await?;
-    }
-
-    set_indexed_commit(&mut *job.tx, source.id, commit).await?;
-    job.tx.commit().await?;
-    job.pending.publish(&state.pool).await;
-    Ok(job.report)
+    Ok(tx)
 }
 
 /// Puts the mirror's indexed ref and the checkout back after an index run moved them and then
@@ -697,7 +788,7 @@ async fn checkout_commit(paths: &RepoPaths) -> Option<String> {
 }
 
 /// A path and its git file mode in the new commit.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     path: String,
     mode: String,
@@ -872,11 +963,97 @@ struct DocMetadata<'a> {
     commit: &'a str,
 }
 
+/// What a push does with one added or modified path, decided before its transaction opens.
+enum Planned {
+    /// Not indexed (not a regular file, a skipped path, too big, binary): its document goes.
+    Skip(String),
+    /// The stored document already has this content.
+    Unchanged { entry: Entry, hash: String },
+    /// Chunked and embedded, to be written.
+    Write(Box<PreparedText>),
+    /// Embedded (into the cache) but not held: prepared again when written.
+    Deferred(Entry),
+}
+
+/// Reads one path at `commit` and decides what to do with it, chunking and embedding it when it
+/// changed. Database reads use `conn`.
+async fn plan_entry(
+    state: &IndexCtx,
+    conn: &mut PgConnection,
+    pending: &mut PendingEmbeddings,
+    source: &Source,
+    paths: &RepoPaths,
+    commit: &str,
+    entry: &Entry,
+) -> Result<Planned, IngestError> {
+    let path = entry.path.as_str();
+    let skip = || Ok(Planned::Skip(path.to_string()));
+    // Only regular files: not symlinks (120000), submodules (160000) or anything odd.
+    let regular = matches!(entry.mode.as_str(), "100644" | "100755");
+    if !regular || path_is_skipped(path) {
+        return skip();
+    }
+    // The `<commit>:<path>` form reads the object from the tree. It cannot be taken for an
+    // option and never follows a symlink.
+    let spec = format!("{commit}:{path}");
+    let size = paths.mirror_git(&["cat-file", "-s", &spec]).await?;
+    let size: u64 = String::from_utf8_lossy(&size)
+        .trim()
+        .parse()
+        .context("cat-file -s printed a bad size")?;
+    if size > MAX_FILE_BYTES {
+        return skip();
+    }
+    let blob = paths.mirror_git(&["cat-file", "blob", &spec]).await?;
+    // Postgres text cannot hold a NUL, and binary content is not worth indexing.
+    if blob.contains(&0) {
+        return skip();
+    }
+    let Ok(content) = String::from_utf8(blob) else {
+        return skip();
+    };
+
+    let content_hash = file_hash(&content);
+    let known = document_hash(&mut *conn, source.id, path).await?;
+    if known.as_deref() == Some(content_hash.as_str()) {
+        return Ok(Planned::Unchanged {
+            entry: entry.clone(),
+            hash: content_hash,
+        });
+    }
+
+    let lang = language_for(path);
+    let metadata = serde_json::to_value(DocMetadata {
+        path,
+        language: language_name(lang),
+        commit,
+    })
+    .context("building document metadata")?;
+    let doc = NewDocument {
+        tenant_id: source.tenant_id,
+        source_id: source.id,
+        external_id: path.to_string(),
+        kind: if lang == Language::Markdown {
+            "doc"
+        } else {
+            "code"
+        }
+        .to_string(),
+        title: path.to_string(),
+        uri: None,
+        metadata,
+        content_hash,
+        body: None,
+    };
+    let chunks = chunk_file(path, &content);
+    let prepared = prepare_repo_text(state, conn, pending, doc, chunks).await?;
+    Ok(Planned::Write(Box::new(prepared)))
+}
+
 /// One ingest run: the counters and the paths seen so far.
 struct Job<'a> {
     state: &'a IndexCtx,
-    tx: Transaction<'static, Postgres>,
-    pending: PendingEmbeddings,
+    pending: &'a mut PendingEmbeddings,
     source: &'a Source,
     paths: &'a RepoPaths,
     commit: &'a str,
@@ -888,95 +1065,117 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
-    /// Indexes one added or modified path, or skips it (deleting its old document).
-    async fn index_entry(&mut self, entry: &Entry) -> Result<(), IngestError> {
-        let path = entry.path.as_str();
-        // Only regular files: not symlinks (120000), submodules (160000) or anything odd.
-        let regular = matches!(entry.mode.as_str(), "100644" | "100755");
-        if !regular || path_is_skipped(path) {
-            return self.skip(path).await;
-        }
-        // The `<commit>:<path>` form reads the object from the tree. It cannot be taken for an
-        // option and never follows a symlink.
-        let spec = format!("{}:{path}", self.commit);
-        let size = self.paths.mirror_git(&["cat-file", "-s", &spec]).await?;
-        let size: u64 = String::from_utf8_lossy(&size)
-            .trim()
-            .parse()
-            .context("cat-file -s printed a bad size")?;
-        if size > MAX_FILE_BYTES {
-            return self.skip(path).await;
-        }
-        let blob = self.paths.mirror_git(&["cat-file", "blob", &spec]).await?;
-        // Postgres text cannot hold a NUL, and binary content is not worth indexing.
-        if blob.contains(&0) {
-            return self.skip(path).await;
-        }
-        let Ok(content) = String::from_utf8(blob) else {
-            return self.skip(path).await;
-        };
-
-        let content_hash = file_hash(&content);
-        let known = document_hash(&mut *self.tx, self.source.id, path).await?;
-        if known.as_deref() == Some(content_hash.as_str()) {
-            self.report.files_unchanged += 1;
-            self.kept.insert(path.to_string());
-            return Ok(());
-        }
-
-        let lang = language_for(path);
-        let metadata = serde_json::to_value(DocMetadata {
-            path,
-            language: language_name(lang),
-            commit: self.commit,
-        })
-        .context("building document metadata")?;
-        let doc = NewDocument {
-            tenant_id: self.source.tenant_id,
-            source_id: self.source.id,
-            external_id: path.to_string(),
-            kind: if lang == Language::Markdown {
-                "doc"
-            } else {
-                "code"
+    /// Plans `entries` on a pool connection, outside any transaction. Once `max_held` chunks are
+    /// held, a file that was embedded is kept as `Deferred` instead of with its vectors.
+    async fn plan(
+        &mut self,
+        entries: &[Entry],
+        push: &RunHandle,
+        max_held: usize,
+    ) -> Result<Vec<Planned>, IngestError> {
+        let mut conn = self.state.pool.acquire().await?;
+        let mut held = 0;
+        let mut planned = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut plan = plan_entry(
+                self.state,
+                &mut conn,
+                self.pending,
+                self.source,
+                self.paths,
+                self.commit,
+                entry,
+            )
+            .await?;
+            if let Planned::Write(p) = &plan {
+                self.totals.add(&p.stats);
+                held += p.stats.chunks;
+                if held > max_held {
+                    plan = Planned::Deferred(entry.clone());
+                }
             }
-            .to_string(),
-            title: path.to_string(),
-            uri: None,
-            metadata,
-            content_hash,
-            body: None,
+            planned.push(plan);
+            push.file_done(&self.totals);
+        }
+        Ok(planned)
+    }
+
+    /// Writes one planned path in `tx`.
+    async fn apply(
+        &mut self,
+        tx: &mut Transaction<'static, Postgres>,
+        plan: Planned,
+    ) -> Result<(), IngestError> {
+        let prepared = match plan {
+            Planned::Skip(path) => {
+                self.skip(tx, &path).await?;
+                None
+            }
+            Planned::Unchanged { entry, hash } => {
+                // Read again under the row lock: another writer may have changed the document
+                // since the plan. Then it is prepared again here, on the transaction.
+                let known = document_hash(&mut **tx, self.source.id, &entry.path).await?;
+                if known.as_deref() == Some(hash.as_str()) {
+                    self.report.files_unchanged += 1;
+                    self.kept.insert(entry.path);
+                    return Ok(());
+                }
+                self.replan(tx, entry).await?
+            }
+            Planned::Deferred(entry) => self.replan(tx, entry).await?,
+            Planned::Write(p) => Some(p),
         };
-        let chunks = chunk_file(path, &content);
-        let stats =
-            index_repo_text(self.state, &mut self.tx, &mut self.pending, doc, chunks).await?;
-        self.report.files_indexed += 1;
-        self.report.chunks += stats.chunks;
-        self.totals.chunks += stats.chunks;
-        self.totals.embedded += stats.embedded;
-        self.totals.embed_time += stats.embed_time;
-        self.kept.insert(path.to_string());
+        if let Some(prepared) = prepared {
+            write_repo_text(tx, &prepared).await?;
+            self.report.files_indexed += 1;
+            self.report.chunks += prepared.stats.chunks;
+            self.kept.insert(prepared.path().to_string());
+        }
         Ok(())
     }
 
+    /// Prepares `entry` again inside `tx` (vectors come from the cache the plan warmed). `None`
+    /// when it turned out skipped or unchanged, which this records.
+    async fn replan(
+        &mut self,
+        tx: &mut Transaction<'static, Postgres>,
+        entry: Entry,
+    ) -> Result<Option<Box<PreparedText>>, IngestError> {
+        let (state, source, paths, commit) = (self.state, self.source, self.paths, self.commit);
+        match plan_entry(state, tx, self.pending, source, paths, commit, &entry).await? {
+            Planned::Write(p) => Ok(Some(p)),
+            Planned::Skip(path) => {
+                self.skip(tx, &path).await?;
+                Ok(None)
+            }
+            Planned::Unchanged { entry, .. } | Planned::Deferred(entry) => {
+                self.report.files_unchanged += 1;
+                self.kept.insert(entry.path);
+                Ok(None)
+            }
+        }
+    }
+
     /// Counts the path as skipped and drops its document, if it has one.
-    async fn skip(&mut self, path: &str) -> Result<(), IngestError> {
+    async fn skip(
+        &mut self,
+        tx: &mut Transaction<'static, Postgres>,
+        path: &str,
+    ) -> Result<(), IngestError> {
         self.report.files_skipped += 1;
-        if self.delete_doc(path).await? {
+        if delete_document(tx, self.source.id, path).await? {
             self.report.files_deleted += 1;
         }
         Ok(())
     }
 
-    async fn delete_doc(&mut self, path: &str) -> Result<bool, IngestError> {
-        let deleted = delete_document(&mut self.tx, self.source.id, path).await?;
-        Ok(deleted)
-    }
-
     /// Full mode: deletes the documents of paths that are not in the new tree.
-    async fn delete_vanished(&mut self) -> Result<(), IngestError> {
-        for id in list_external_ids(&mut *self.tx, self.source.id).await? {
-            if !self.kept.contains(&id) && self.delete_doc(&id).await? {
+    async fn delete_vanished(
+        &mut self,
+        tx: &mut Transaction<'static, Postgres>,
+    ) -> Result<(), IngestError> {
+        for id in list_external_ids(&mut **tx, self.source.id).await? {
+            if !self.kept.contains(&id) && delete_document(tx, self.source.id, &id).await? {
                 self.report.files_deleted += 1;
             }
         }
